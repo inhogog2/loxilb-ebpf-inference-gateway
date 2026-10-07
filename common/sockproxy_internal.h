@@ -180,6 +180,13 @@ int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                            const void *buf, size_t len);
 /* The 502 of a request no backend took, framed with its length. */
 int proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail);
+/* Request-header edits on a buffered HTTP/1.1 request (sockproxy_http.c):
+ * set replaces every existing line of `name` with one "name: value" line,
+ * remove strips them. 0 on success; -1 when the header block is not found,
+ * the field is unsafe (CR/LF) or the buffer has no room. */
+int sp_h1_req_header_set(uint8_t *buf, size_t *len, size_t bufsize,
+                         const char *name, const char *value);
+int sp_h1_req_header_remove(uint8_t *buf, size_t *len, const char *name);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                            int retry_body, const char *code, const char *msg);
 /* `keep`: the refusal leaves the connection open for its next request (the

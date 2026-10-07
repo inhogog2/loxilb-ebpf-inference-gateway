@@ -37,6 +37,9 @@
 #include "sockproxy_metrics.h"
 #include "sockproxy_cache.h"    /* cmp_proxy_ent */
 #include "sockproxy_health.h"   /* is_endpoint_healthy */
+#include "sockproxy_ep_health.h" /* ep_health_addr_matches */
+#include "sockproxy_fc.h"        /* fc_ep_acquire */
+#include "sockproxy_pd.h"        /* pd_update_content_length */
 #include "sockproxy_epp.h"
 #include "sockproxy_conn.h"     /* proxy_setup_ep_connect */
 #include "sockproxy_routing.h"  /* find_endpoint_lpm */
@@ -448,7 +451,7 @@ epp_fail(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int status,
 }
 
 static int
-epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
+epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, epp_pending_t **out)
 {
   uint64_t gen = atomic_load_explicit(&pfe->gen, memory_order_acquire);
 
@@ -477,10 +480,9 @@ epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
                r->ncands > 0 ? " [" : "", r->ncands > 0 ? r->cands[0] : "",
                r->ncands > 1 ? ", ..." : "", r->ncands > 0 ? "]" : "",
                r->new_body_len > 0 ? "rewritten" : "unchanged");
-      /* Phase 1 M5 applies the candidates and the mutations here; until
-       * then the rule's own selector routes, the decision being logged. */
-      rc = EPP_STAGE_LADDER;
-      break;
+      /* The caller applies the mutations and pins a candidate (epp_pin). */
+      *out = p;
+      return EPP_STAGE_LADDER;
     case EPP_RES_IMMEDIATE:
       epp_send_immediate(pfe, r);
       rc = EPP_STAGE_ERR;
@@ -526,6 +528,206 @@ epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
     log_debug("[EPP] fd=%d sid=%llu submitted (head %zu, body %zu, subset %d bytes) - parked",
               pfe->fd, (unsigned long long)sid, head, body_len, subset_len);
     return EPP_STAGE_PARKED;
+  }
+}
+
+/* One "name: value\r\n" or "name\r\n" line out of an ABI header list. */
+static int
+epp_next_line(const char **p, const char *end, char *name, size_t ncap,
+              char *value, size_t vcap)
+{
+  const char *line = *p, *eol, *colon;
+  size_t n;
+  if (line >= end) return 0;
+  eol = memchr(line, '\n', (size_t)(end - line));
+  *p = eol ? eol + 1 : end;
+  if (!eol) eol = end;
+  if (eol > line && eol[-1] == '\r') eol--;
+  colon = memchr(line, ':', (size_t)(eol - line));
+  n = (size_t)((colon ? colon : eol) - line);
+  if (n == 0 || n >= ncap) return -1;
+  memcpy(name, line, n);
+  name[n] = '\0';
+  value[0] = '\0';
+  if (colon && value) {
+    const char *v = colon + 1;
+    while (v < eol && *v == ' ') v++;
+    n = (size_t)(eol - v);
+    if (n >= vcap) return -1;
+    memcpy(value, v, n);
+    value[n] = '\0';
+  }
+  return 1;
+}
+
+/* Apply the EPP's request mutations to the buffered request: header
+ * removals, header sets, then the replaced body with its Content-Length.
+ * -1 when the request cannot carry them (no room, malformed). */
+static int
+epp_apply_mutations(proxy_fd_ent_t *pfe, const struct epp_result *r)
+{
+  size_t len = pfe->rcv_off;
+  char name[L7_HDR_NAME_MAX], value[L7_HDR_VALUE_MAX];
+  const char *p, *end;
+  int rc;
+
+  p = r->hdr_del; end = p ? p + r->hdr_del_len : NULL;
+  while (p && (rc = epp_next_line(&p, end, name, sizeof(name), value, sizeof(value))) != 0) {
+    if (rc < 0) continue;
+    if (sp_h1_req_header_remove(pfe->rcvbuf, &len, name) != 0)
+      return -1;
+  }
+  p = r->hdr_set; end = p ? p + r->hdr_set_len : NULL;
+  while (p && (rc = epp_next_line(&p, end, name, sizeof(name), value, sizeof(value))) != 0) {
+    if (rc < 0) {
+      log_warn("[EPP] fd=%d header mutation too long for the data plane; skipped", pfe->fd);
+      continue;
+    }
+    if (sp_h1_req_header_set(pfe->rcvbuf, &len, SP_SOCK_MSG_LEN, name, value) != 0)
+      return -1;
+  }
+  if (r->new_body_len > 0 && r->new_body) {
+    size_t head = epp_head_len(pfe->rcvbuf, len);
+    size_t n = (size_t)r->new_body_len;
+    char cl[24];
+    if (head == 0 || head + n > SP_SOCK_MSG_LEN)
+      return -1;
+    memcpy(pfe->rcvbuf + head, r->new_body, n);
+    len = head + n;
+    pfe->http_content_length = n;
+    snprintf(cl, sizeof(cl), "%zu", n);
+    if (pd_update_content_length(pfe->rcvbuf, &len, SP_SOCK_MSG_LEN, n) != 0 &&
+        sp_h1_req_header_set(pfe->rcvbuf, &len, SP_SOCK_MSG_LEN, "Content-Length", cl) != 0)
+      return -1;
+  }
+  pfe->rcv_off = len;
+  pfe_rcv_note(pfe);
+  return 0;
+}
+
+/* "ip:port" -> index in tepval->eps[], or -1 when the EPP named an
+ * endpoint this rule does not have (decision D7). */
+static int
+epp_resolve_idx(proxy_epval_t *tepval, const char *cand)
+{
+  char ip[INET_ADDRSTRLEN];
+  const char *colon = strrchr(cand, ':');
+  struct in_addr a;
+  uint16_t port;
+  size_t n;
+
+  if (!colon || colon == cand) return -1;
+  n = (size_t)(colon - cand);
+  if (n >= sizeof(ip)) return -1;
+  memcpy(ip, cand, n);
+  ip[n] = '\0';
+  if (inet_pton(AF_INET, ip, &a) != 1) return -1;
+  port = htons((uint16_t)atoi(colon + 1));
+  for (int i = 0; i < tepval->n_eps && i < MAX_PROXY_EP; i++) {
+    if (ep_health_addr_matches(tepval->eps[i].xip, tepval->eps[i].xport, a.s_addr, port))
+      return i;
+  }
+  return -1;
+}
+
+/* Why a candidate the rule does have cannot take the request now, NULL
+ * when it can (configured, not disabled by the controller, healthy by the
+ * prober and the breaker). */
+static const char *
+epp_cand_rejected(proxy_epval_t *tepval, int i)
+{
+  if (tepval->eps[i].inv) return "down";
+  if (PD_CTRL_STATE(atomic_load(&tepval->pd_ctrl_ep[i])) == PD_CTRL_ST_DISABLED)
+    return "disabled";
+  if (!is_endpoint_healthy(tepval, i)) return "unhealthy";
+  return NULL;
+}
+
+enum { EPP_PIN_LADDER = 0, EPP_PIN_OK = 1, EPP_PIN_ERR = -1 };
+
+/* Route on the EPP's decision: apply its mutations, then take its
+ * candidates in order — each must be an endpoint of this rule, pass the
+ * local checks and the capacity gate, and accept the connection; a
+ * candidate that fails any of these is skipped for the next. EPP_PIN_OK:
+ * *sel and ep_sel->ep_cfds[0] are set, the load unit is held as the
+ * single-role KV path holds it. Otherwise the failure mode decides:
+ * EPP_PIN_LADDER (FailOpen) or EPP_PIN_ERR (answered, close). */
+static int
+epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
+        proxy_ep_sel_t *ep_sel, void *ssl_ctx, void **ssl,
+        const void *pp2hdr, int pp2len, int *sel)
+{
+  if (epp_apply_mutations(pfe, r) != 0) {
+    int frc = epp_fail(pfe, tepval, 413, "epp_body_too_large",
+                       "the endpoint picker's request mutation does not fit the request buffer");
+    return frc == EPP_STAGE_LADDER ? EPP_PIN_LADDER : EPP_PIN_ERR;
+  }
+  if (r->ncands == 0) {
+    int frc = epp_fail(pfe, tepval, 503, "epp_no_endpoint",
+                       "the endpoint picker named no endpoint");
+    return frc == EPP_STAGE_LADDER ? EPP_PIN_LADDER : EPP_PIN_ERR;
+  }
+  for (int c = 0; c < r->ncands; c++) {
+    int idx = epp_resolve_idx(tepval, r->cands[c]);
+    const char *why;
+    int fd;
+
+    if (idx < 0) {
+      log_info("[EPP] fd=%d sid=%llu candidate %s: not an endpoint of this rule - skipped",
+               pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c]);
+      continue;
+    }
+    why = epp_cand_rejected(tepval, idx);
+    if (why) {
+      log_info("[EPP] fd=%d sid=%llu candidate %s (ep%d): %s - skipped",
+               pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx, why);
+      continue;
+    }
+    /* The endpoint's capacity ceiling, taken for this endpoint only: a
+     * unit that is not there sends the request to the next candidate, not
+     * to an endpoint the EPP did not name. */
+    if (tepval->ai_gw_mode && pfe->fc.state == FC_P_EXECUTING &&
+        pfe->fc.ep[FC_ROLE_PREFILL] < 0 && pfe->fc.ep[FC_ROLE_DECODE] < 0 &&
+        fc_ep_acquire(&tepval->fc, &pfe->fc, idx, FC_ROLE_NORMAL) == FC_SHED) {
+      log_info("[EPP] fd=%d sid=%llu candidate %s (ep%d): at capacity - skipped",
+               pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx);
+      continue;
+    }
+    fd = proxy_setup_ep_connect(tepval->eps[idx].xip, tepval->eps[idx].xport,
+                                tepval->eps[idx].protocol, ssl_ctx, ssl, pfe,
+                                pp2hdr, pp2len);
+    if (fd < 0) {
+      circuit_breaker_record_failure(tepval, idx);
+      log_info("[EPP] fd=%d sid=%llu candidate %s (ep%d): connect failed - next",
+               pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx);
+      continue;
+    }
+    /* Load unit, the single-role KV shape: one active_conns unit held
+     * on the endpoint until the connect-failure release or pd_cleanup
+     * claims it (kv_sr_load_held, single owner). A keep-alive connection
+     * may still hold the previous request's unit: release it first. */
+    if (__atomic_exchange_n(&pfe->kv_sr_load_held, 0, __ATOMIC_ACQ_REL)) {
+      int prev = pfe->kv_sr_ep_idx;
+      if (prev >= 0 && prev < tepval->n_eps) {
+        uint32_t cur = atomic_load(&tepval->pd_ep_loads[prev].active_conns);
+        if (cur > 0) atomic_fetch_sub(&tepval->pd_ep_loads[prev].active_conns, 1);
+      }
+    }
+    atomic_fetch_add(&tepval->pd_ep_loads[idx].active_conns, 1);
+    pfe->kv_sr_load_held = 1;
+    pfe->kv_sr_ep_idx = idx;
+    if (!pfe->epv) pfe->epv = tepval;
+    ep_sel->ep_cfds[0].ep_cfd = fd;
+    ep_sel->ep_cfds[0].connect_pending = 0;
+    *sel = idx;
+    log_info("[EPP] fd=%d sid=%llu -> %s (ep%d, candidate %d of %d)",
+             pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx, c + 1, r->ncands);
+    return EPP_PIN_OK;
+  }
+  {
+    int frc = epp_fail(pfe, tepval, 503, "epp_no_endpoint",
+                       "no endpoint named by the endpoint picker is usable");
+    return frc == EPP_STAGE_LADDER ? EPP_PIN_LADDER : EPP_PIN_ERR;
   }
 }
 
@@ -735,17 +937,6 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             return -1;
         }
 
-        /* Endpoint Picker stage (Phase 1): submit and park, or route on the
-         * decision the re-drive finds. Only a rule that names an EPP takes
-         * it, so every other rule's dispatch is byte for byte what it was. */
-        if (pfe && tepval->epp_mode != EPP_MODE_OFF) {
-          int epp_rc = epp_stage(pfe, tepval);
-          if (epp_rc == EPP_STAGE_PARKED)
-            return PD_SETUP_PARKED;      /* parked: the caller suspends the client */
-          if (epp_rc < 0)
-            return -1;                   /* answered here; the caller closes */
-        }
-
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
 
@@ -756,6 +947,30 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         int  ns_used_learned = 0;
         char ns_session_key[CONV_POOL_ID_MAX];
         ns_session_key[0] = '\0';
+
+        /* Endpoint Picker stage (Phase 1): submit and park, or route on the
+         * decision the re-drive finds — its mutations applied, its first
+         * usable candidate connected (goto the common success path). With
+         * no usable candidate FailOpen continues into the rule's own
+         * selector below. Only a rule that names an EPP takes it, so every
+         * other rule's dispatch is byte for byte what it was. */
+        if (pfe && tepval->epp_mode != EPP_MODE_OFF) {
+          epp_pending_t *epp_dec = NULL;
+          int epp_rc = epp_stage(pfe, tepval, &epp_dec);
+          if (epp_rc == EPP_STAGE_PARKED)
+            return PD_SETUP_PARKED;      /* parked: the caller suspends the client */
+          if (epp_rc < 0)
+            return -1;                   /* answered here; the caller closes */
+          if (epp_dec) {
+            int pin = epp_pin(pfe, tepval, epp_pending_result(epp_dec), ep_sel,
+                              ssl_ctx, ssl, pp2hdr, pp2len, &sel);
+            epp_pending_free(epp_dec);
+            if (pin == EPP_PIN_OK)
+              goto pd_failover_ok;
+            if (pin < 0)
+              return -1;
+          }
+        }
 
 #ifdef HAVE_DP_GPU_ROUTING
         // Check selection algorithm

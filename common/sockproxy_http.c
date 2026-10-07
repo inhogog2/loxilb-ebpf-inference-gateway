@@ -764,6 +764,21 @@ l7h1_splice_header(uint8_t *msg, size_t *len, size_t bufsize,
   return 0;
 }
 
+int
+sp_h1_req_header_set(uint8_t *buf, size_t *len, size_t bufsize,
+                     const char *name, const char *value)
+{
+  if (!l7h1_strip_header(buf, len, name))
+    return -1;
+  return l7h1_splice_header(buf, len, bufsize, name, value);
+}
+
+int
+sp_h1_req_header_remove(uint8_t *buf, size_t *len, const char *name)
+{
+  return l7h1_strip_header(buf, len, name) ? 0 : -1;
+}
+
 /* Emit-callback context for the H1 path: the mutable request buffer. */
 typedef struct {
   uint8_t *msg;
