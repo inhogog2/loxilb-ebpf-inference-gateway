@@ -1725,6 +1725,18 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         ep_sel->ep_cfds[0].ep_num = sel;
         ep_sel->n_eps = 1;
 
+        /* The endpoint that takes the request, for the EPP's response phase
+         * (x-gateway-destination-endpoint-served) — the pinned candidate or
+         * the rule's own pick on FailOpen alike. */
+        if (pfe && pfe->epp_sid != 0 && sel >= 0 && sel < tepval->n_eps) {
+          struct in_addr sa;
+          char sip[INET_ADDRSTRLEN];
+          sa.s_addr = tepval->eps[sel].xip;
+          if (inet_ntop(AF_INET, &sa, sip, sizeof(sip)))
+            snprintf(pfe->epp_served, sizeof(pfe->epp_served), "%s:%u", sip,
+                     (unsigned)ntohs(tepval->eps[sel].xport));
+        }
+
         /* L7 session-header stickiness: on a fresh selection, persist the binding
          * immediately (so a client-supplied id hits PRIORITY 0 next turn) and mark
          * the connection so a server-issued id (e.g. MCP's Mcp-Session-Id) carried

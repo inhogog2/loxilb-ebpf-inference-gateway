@@ -1535,6 +1535,10 @@ struct proxy_fd_ent {
   uint64_t epp_deadline_ns;
   uint8_t  epp_decided;
   uint8_t  epp_reported;
+  uint8_t  epp_hdrs_reported;        // the response headers went to the EPP
+  char     epp_served[64];           // "ip:port" that took the request (response phase)
+  uint8_t *epp_resp_head;            // response head gathered for the EPP (heap, bounded)
+  uint16_t epp_resp_head_len;
   int      pd_prefill_ep_idx;        // Selected prefill endpoint index
   int      pd_decode_ep_idx;         // Selected decode endpoint index
   uint8_t *pd_saved_body;            // Heap: original request body for decode phase

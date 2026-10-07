@@ -5,6 +5,7 @@
  *
  * Endpoint Picker (EPP) side table and completion wake — see sockproxy_epp.h.
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -283,7 +284,11 @@ epp_send_immediate(proxy_fd_ent_t *pfe, const struct epp_result *r)
 void
 epp_request_end(proxy_fd_ent_t *pfe)
 {
-  if (!pfe || pfe->epp_sid == 0) return;
+  if (!pfe) return;
+  free(pfe->epp_resp_head);
+  pfe->epp_resp_head = NULL;
+  pfe->epp_resp_head_len = 0;
+  if (pfe->epp_sid == 0) return;
   if (!pfe->epp_reported) {
     pfe->epp_reported = 1;
     llb_epp_resp_event(pfe->epp_sid, EPP_EV_ABORT, 0, NULL, 0, NULL, 0);
@@ -293,4 +298,60 @@ epp_request_end(proxy_fd_ent_t *pfe)
   pfe->epp_sid = 0;
   pfe->epp_decided = 0;
   pfe->epp_deadline_ns = 0;
+  pfe->epp_hdrs_reported = 0;
+  pfe->epp_served[0] = '\0';
+}
+
+void
+epp_resp_head_feed(proxy_fd_ent_t *pfe, const void *msg, size_t len)
+{
+  size_t room, n;
+
+  if (!pfe || pfe->epp_sid == 0 || pfe->epp_hdrs_reported || len == 0) return;
+  if (!pfe->epp_resp_head) {
+    pfe->epp_resp_head = malloc(EPP_RESP_HEAD_MAX);
+    if (!pfe->epp_resp_head) return;
+    pfe->epp_resp_head_len = 0;
+  }
+  room = EPP_RESP_HEAD_MAX - pfe->epp_resp_head_len;
+  n = len < room ? len : room;
+  memcpy(pfe->epp_resp_head + pfe->epp_resp_head_len, msg, n);
+  pfe->epp_resp_head_len += (uint16_t)n;
+}
+
+void
+epp_report_resp_headers(proxy_fd_ent_t *pfe, int status)
+{
+  const uint8_t *head = NULL;
+  size_t head_len = 0;
+
+  if (!pfe || pfe->epp_sid == 0 || pfe->epp_hdrs_reported || pfe->epp_reported) return;
+  pfe->epp_hdrs_reported = 1;
+  if (pfe->epp_resp_head) {
+    const uint8_t *end = memmem(pfe->epp_resp_head, pfe->epp_resp_head_len, "\r\n\r\n", 4);
+    head = pfe->epp_resp_head;
+    head_len = end ? (size_t)(end - head) + 2 : pfe->epp_resp_head_len;
+  }
+  llb_epp_resp_event(pfe->epp_sid, EPP_EV_RESP_HEADERS, status,
+                     (char *)head, (int)head_len,
+                     pfe->epp_served, (int)strlen(pfe->epp_served));
+  log_debug("[EPP] fd=%d sid=%llu response headers reported: %d, served %s (%zu head bytes)",
+            pfe->fd, (unsigned long long)pfe->epp_sid, status, pfe->epp_served, head_len);
+  free(pfe->epp_resp_head);
+  pfe->epp_resp_head = NULL;
+  pfe->epp_resp_head_len = 0;
+}
+
+void
+epp_report_resp_eos(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || pfe->epp_sid == 0 || pfe->epp_reported) return;
+  if (!pfe->epp_hdrs_reported) {
+    /* A response that ended before its headers were seen complete
+     * (unframed, cut short): report what there is first, in order. */
+    epp_report_resp_headers(pfe, pfe->metric_response_status);
+  }
+  pfe->epp_reported = 1;
+  llb_epp_resp_event(pfe->epp_sid, EPP_EV_RESP_EOS, 0, NULL, 0, NULL, 0);
+  log_debug("[EPP] fd=%d sid=%llu end of stream reported", pfe->fd, (unsigned long long)pfe->epp_sid);
 }

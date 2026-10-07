@@ -116,4 +116,16 @@ void epp_send_immediate(struct proxy_fd_ent *pfe, const struct epp_result *r);
  * is released. */
 void epp_request_end(struct proxy_fd_ent *pfe);
 
+/* Response phase (M6), on the client entry of a request with a stream id.
+ * The relay feeds the backend's bytes until the head is complete
+ * (epp_resp_head_feed, bounded); the framer's headers-complete callback
+ * reports status, headers and the endpoint that served
+ * (epp_report_resp_headers); the response's end — framed completion,
+ * backend EOF or the SSE terminator — reports end-of-stream once
+ * (epp_report_resp_eos). All three are no-ops without a stream id. */
+void epp_resp_head_feed(struct proxy_fd_ent *pfe, const void *msg, size_t len);
+void epp_report_resp_headers(struct proxy_fd_ent *pfe, int status);
+void epp_report_resp_eos(struct proxy_fd_ent *pfe);
+#define EPP_RESP_HEAD_MAX 8192
+
 #endif /* __SOCKPROXY_EPP_H__ */

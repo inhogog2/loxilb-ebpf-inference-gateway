@@ -2048,6 +2048,9 @@ skip_deferred_masking:
           memmem(window, window_len, PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2)) {
+        /* The EPP hears the end of a stream at its terminator; the framed
+         * completion that may follow reports nothing more (once per sid). */
+        epp_report_resp_eos(rfd_ent);
         /* Step 1: Record stream end timestamp */
         rfd_ent->stream_end_ts = time(NULL);
         /* Step 2: Compute latency from the CLOCK_MONOTONIC activation stamp.
@@ -9918,6 +9921,7 @@ cresp_on_headers_complete(llhttp_t *parser)
   }
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
+  epp_report_resp_headers(pfe, parser->status_code);
   /* A response with neither Content-Length nor chunked framing runs until the
    * backend closes, so its completion arrives as that EOF rather than from
    * llhttp. Record it now, while the flags are the ones for this message. */
@@ -9944,6 +9948,7 @@ cresp_on_message_complete(llhttp_t *parser)
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     hc_resp_done(pfe);
     sp_hold_answer_ended(pfe);
+    epp_report_resp_eos(pfe);
   }
   return 0;
 }
@@ -9989,6 +9994,7 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   if (!client->cresp_parser_inited) {
     cresp_parser_init(client);
   }
+  epp_resp_head_feed(client, msg, len);
   rerr = llhttp_execute(&client->cresp_parser, (const char *)msg, len);
   if (rerr == HPE_PAUSED_UPGRADE) {
     llhttp_resume_after_upgrade(&client->cresp_parser);
@@ -10020,6 +10026,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     hc_resp_done(client);
     sp_hold_answer_ended(client);
+    epp_report_resp_eos(client);
   }
 }
 
