@@ -3045,6 +3045,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * (ca.cidx via llb_conv_nat2proxy), so the stamp just mirrors it into
          * the kv config block. 0 == no identity ⇒ Go keeps the legacy loop. */
         tepval->kv_svc_id = arg->_id;
+        /* Endpoint Picker: mode + deadline from the rule, identity from
+         * arg->_id exactly as kv_svc_id. */
+        tepval->epp_mode = arg->epp_mode;
+        tepval->epp_timeout_ms = arg->epp_timeout_ms;
+        tepval->epp_svc_id = arg->_id;
+        if (tepval->epp_mode != EPP_MODE_OFF) {
+          log_info("[EPP_CONFIG] proxy_add(update): epp_mode=%u epp_timeout_ms=%u epp_svc_id=%u",
+                   tepval->epp_mode, tepval->epp_timeout_ms, tepval->epp_svc_id);
+        }
 
         tepval->pd_session_map = NULL;
         pthread_rwlock_init(&tepval->pd_session_lock, NULL);
@@ -3524,6 +3533,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
            tepval->kv_exact_mode, tepval->kv_hash_algo, tepval->kv_zmq_port,
            tepval->kv_block_size, tepval->kv_warmup_sec,
            tepval->kv_engine_type, tepval->kv_dp_rank_count, tepval->kv_svc_id);
+  /* Endpoint Picker: mode + deadline from the rule, identity from arg->_id
+   * exactly as kv_svc_id. Logged only when set so a rule without an EPP
+   * leaves the log byte-identical. */
+  tepval->epp_mode = arg->epp_mode;
+  tepval->epp_timeout_ms = arg->epp_timeout_ms;
+  tepval->epp_svc_id = arg->_id;
+  if (tepval->epp_mode != EPP_MODE_OFF) {
+    log_info("[EPP_CONFIG] proxy_add(new): epp_mode=%u epp_timeout_ms=%u epp_svc_id=%u",
+             tepval->epp_mode, tepval->epp_timeout_ms, tepval->epp_svc_id);
+  }
 
   tepval->pd_session_map = NULL;
   pthread_rwlock_init(&tepval->pd_session_lock, NULL);
@@ -4974,6 +4993,29 @@ proxy_ct_dump(const char *str, struct dp_ct_key *ctk)
   log_debug("%s %s:%u -> %s:%u:%d", str,
             ab1, ntohs(ctk->dport), ab2, ntohs(ctk->sport), ctk->l4proto);
 #endif
+}
+
+int
+proxy_epp_cfg_get(uint32_t svc_id, uint8_t *mode, uint32_t *timeout_ms)
+{
+  proxy_map_ent_t *node;
+  proxy_epval_t *tepval, *tmp_epval;
+  int matched = 0;
+
+  if (!proxy_struct || svc_id == 0) return 0;
+  PROXY_LOCK();
+  for (node = proxy_struct->head; node; node = node->next) {
+    HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
+      if (tepval->epp_svc_id != svc_id) continue;
+      if (matched == 0) {
+        if (mode) *mode = tepval->epp_mode;
+        if (timeout_ms) *timeout_ms = tepval->epp_timeout_ms;
+      }
+      matched++;
+    }
+  }
+  PROXY_UNLOCK();
+  return matched;
 }
 
 void

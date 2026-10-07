@@ -543,6 +543,14 @@ typedef struct proxy_ent {
   uint16_t nixl_port;  // NIXL side-channel port; 0=use xport
 } proxy_ent_t;
 
+/* epp_mode values (dp_proxy_tacts.epp_mode -> proxy_arg.epp_mode ->
+ * proxy_epval_t.epp_mode): the rule's Endpoint Picker (EPP) and what a
+ * request does when the EPP cannot answer. Mirrored by eppDpMode in
+ * pkg/loxinet/rules.go. */
+#define EPP_MODE_OFF        0
+#define EPP_MODE_FAIL_OPEN  1
+#define EPP_MODE_FAIL_CLOSE 2
+
 /* kv_exact_mode value for the Tier-1.5 single-role decouple
  * seam. Mode 1 (zmq, P/D) semantics are untouched byte-for-byte; value 2 stays
  * reserved for NATS (RESEARCH Pitfall 6) — single-role deliberately takes 3.
@@ -705,6 +713,17 @@ typedef struct proxy_epval {
    * identity" and the Go side keeps today's all-services loop — the seam is
  * independently default-off (kv_weight twin-lockstep precedent). */
   uint32_t kv_svc_id;            // calling rule identity for the Go selector (0 = no identity)
+
+  /* Endpoint Picker (EPP) of the pool's rule. epp_mode is EPP_MODE_*;
+   * epp_timeout_ms is the request-phase decision deadline (resolved by the
+   * Go control plane, nonzero whenever epp_mode != OFF); epp_svc_id is the
+   * rule identity the Go ext_proc client resolves the EPP address and TLS
+   * settings by — stamped from arg->_id at proxy_add_entry exactly as
+   * kv_svc_id (0 = no identity). Nobody reads these until the EPP stage
+   * lands in proxy_setup_ep__ (Phase 1 M4). */
+  uint8_t  epp_mode;
+  uint32_t epp_timeout_ms;
+  uint32_t epp_svc_id;
 
   /* Binding-dataplane contract word:
    *   [ binding_gen:32 | flags:16 | api_mode:8 | eligible:8 ]
@@ -2055,6 +2074,13 @@ struct proxy_arg {
   uint16_t chwbl_mean_load_factor;
   uint16_t chwbl_replication;
 
+  // Endpoint Picker (EPP) of the rule: EPP_MODE_* and the request-phase
+  // deadline in ms. Copied verbatim from dp_proxy_tacts by
+  // llb_conv_nat2proxy and into proxy_epval_t by proxy_add_entry.
+  uint8_t  epp_mode;
+  uint8_t  epp_pad[3];
+  uint32_t epp_timeout_ms;
+
 #ifdef HAVE_MTLS
   // ============================================================================
   // mTLS Configuration 
@@ -2253,6 +2279,13 @@ int proxy_set_chwbl_prefix_config(struct proxy_ent *key,
                                     uint32_t flags,
                                     uint8_t enable_cache_salt);
 void proxy_dump_entry(proxy_info_cb_t);
+
+/* The Endpoint Picker words of the pool(s) a rule installed, by the rule
+ * identity proxy_add_entry stamped (epp_svc_id). Diagnostic: lets the Go
+ * side (tests, M8 status) confirm what the data plane holds for a rule
+ * rather than what was posted. Returns the number of pools that carry
+ * svc_id (0 = none); *mode / *timeout_ms are those of the first match. */
+int proxy_epp_cfg_get(uint32_t svc_id, uint8_t *mode, uint32_t *timeout_ms);
 void proxy_get_entry_stats(uint32_t id, int epid, uint64_t *p, uint64_t *b);
 void pfe_ent_accouting(proxy_fd_ent_t *pfe, uint64_t bc, int txdir);
 int proxy_main(sockmap_cb_t cb, peer_map_cb_t peer_map_cb,

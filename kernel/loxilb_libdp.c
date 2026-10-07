@@ -2919,6 +2919,9 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->pd_bootstrap_port = dat->pd_bootstrap_port;
   // Per-rule prefill timeout (0 ⇒ process default at the reaper) — same hop.
   pval->pd_prefill_timeout_sec = dat->pd_prefill_timeout_sec;
+  // Endpoint Picker mode + request-phase deadline — same hop.
+  pval->epp_mode = dat->epp_mode;
+  pval->epp_timeout_ms = dat->epp_timeout_ms;
 
   // P/D Buffer: runtime-configurable kv_transfer_params limit
   pval->pd_kv_params_max = dat->pd_kv_params_max;

@@ -556,6 +556,16 @@ test_pd_cache: test_pd_cache_aware
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
 	$(CC) -Wall -Wextra -DTEST_KV_EXACT -o $@ $< -I. -lssl -lcrypto
 
+# Phase 1 M2 (EPP): the Endpoint Picker words ride dp_proxy_tacts -> proxy_arg
+# -> proxy_epval_t. Pins the ABI (types, EPP_MODE_* words shared with Go,
+# alignment, proxy_arg <= 4096) and both copy hops against the real structs.
+test_epp_cfg: test_epp_cfg.c llb_dpapi.h sockproxy.h
+	$(CC) -Wall -Wextra -Wno-unused-function -o $@ $< -I. -I../libbpf/src -I../libbpf/include/uapi $(CFLAGS_MTLS)
+
+.PHONY: test_epp
+test_epp: test_epp_cfg
+	./test_epp_cfg
+
 test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h
 	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c -I.
 
