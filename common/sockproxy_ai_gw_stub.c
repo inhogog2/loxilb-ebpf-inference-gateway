@@ -45,6 +45,12 @@
 #include "log.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_ai_bench.h"
+#include "sockproxy_epp.h"
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdatomic.h>
 
 #define AI_GW_STUB_TRIPWIRE(fn_flag)                                        \
     do {                                                                    \
@@ -391,4 +397,95 @@ llb_sockproxy_emit_sync_event(const struct proxy_sync_event *ev)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)ev;
+}
+
+/* ---- Endpoint Picker (EPP) stubs ------------------------------------------
+ * Without the Go bridge a submit is refused (sid 0), so an EPP rule takes
+ * its failure mode at once. For C-level tests of the park/resume path the
+ * stub can instead play a fixed EPP: with LLB_EPP_STUB_CANDS set to an
+ * "ip:port,ip:port" list it accepts the request and, after
+ * LLB_EPP_STUB_DELAY_MS (default 50), hands those candidates back through
+ * proxy_epp_complete from a detached thread - the shape the Go side has. */
+struct epp_stub_job {
+  void *ns; int fd; uint64_t gen; uint64_t sid; unsigned delay_ms;
+};
+
+static void *
+epp_stub_complete(void *arg)
+{
+  struct epp_stub_job *j = arg;
+  struct epp_result r;
+  const char *cands = getenv("LLB_EPP_STUB_CANDS");
+  const char *mode = getenv("LLB_EPP_STUB_MODE");
+  int n = 0;
+
+  usleep(j->delay_ms * 1000);
+  memset(&r, 0, sizeof(r));
+  if (mode && !strcmp(mode, "error")) {
+    r.status = EPP_RES_ERROR;
+  } else if (mode && !strcmp(mode, "immediate")) {
+    r.status = EPP_RES_IMMEDIATE;
+    r.imm_code = 429;
+    r.imm_body = "{\"error\":\"stub_shed\"}";
+    r.imm_body_len = (int)strlen(r.imm_body);
+  } else {
+    char *dup = cands ? strdup(cands) : NULL;
+    char *save = NULL;
+    char *tok = dup ? strtok_r(dup, ",", &save) : NULL;
+    r.status = EPP_RES_OK;
+    while (tok && n < EPP_MAX_CANDS) {
+      strncpy(r.cands[n], tok, EPP_CAND_LEN - 1);
+      n++;
+      tok = strtok_r(NULL, ",", &save);
+    }
+    r.ncands = n;
+    free(dup);
+  }
+  proxy_epp_complete(j->ns, j->fd, j->gen, j->sid, &r);
+  free(j);
+  return NULL;
+}
+
+__attribute__((weak)) uint64_t
+llb_epp_submit(uint32_t svc_id, void *ns, int fd, uint64_t gen,
+               char *req_hdrs, int req_hdrs_len,
+               char *body, int body_len,
+               char *subset, int subset_len)
+{
+  static _Atomic uint64_t next_sid = 1;
+  const char *cands = getenv("LLB_EPP_STUB_CANDS");
+  const char *delay = getenv("LLB_EPP_STUB_DELAY_MS");
+  struct epp_stub_job *j;
+  pthread_t th;
+  pthread_attr_t attr;
+
+  (void)svc_id; (void)req_hdrs; (void)req_hdrs_len; (void)body; (void)body_len;
+  (void)subset; (void)subset_len;
+  if (!cands || !*cands) {
+    AI_GW_STUB_TRIPWIRE(warned);
+    return 0;
+  }
+  j = calloc(1, sizeof(*j));
+  if (!j) return 0;
+  j->ns = ns; j->fd = fd; j->gen = gen;
+  j->sid = atomic_fetch_add(&next_sid, 1);
+  j->delay_ms = delay ? (unsigned)atoi(delay) : 50;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&th, &attr, epp_stub_complete, j) != 0) {
+    pthread_attr_destroy(&attr);
+    free(j);
+    return 0;
+  }
+  pthread_attr_destroy(&attr);
+  return j->sid;
+}
+
+__attribute__((weak)) void
+llb_epp_resp_event(uint64_t sid, int kind, int http_status,
+                   char *resp_hdrs, int resp_hdrs_len,
+                   char *served, int served_len)
+{
+  (void)sid; (void)kind; (void)http_status; (void)resp_hdrs; (void)resp_hdrs_len;
+  (void)served; (void)served_len;
 }

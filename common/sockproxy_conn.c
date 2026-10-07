@@ -54,6 +54,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_epp.h"
 #include "sockproxy_conn.h"
 #include "sockproxy_connect.h"
 #include "sockproxy_cache.h"
@@ -1271,6 +1272,10 @@ pfe_alloc_ex(int with_rcvbuf)
   /* -1 = "not parked" (the memset above zeroes it, but 0 is a valid
    * prefill EP index, so a zeroed park_ep_idx would falsely look parked-on-EP0). */
   pfe->park_ep_idx = -1;
+  pfe->epp_sid = 0;
+  pfe->epp_deadline_ns = 0;
+  pfe->epp_decided = 0;
+  pfe->epp_reported = 0;
 
   return pfe;
 }
@@ -1633,6 +1638,10 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
 {
   proxy_destroy_xmitcache(fd_ent);
   proxy_connect_pending_clear(fd_ent);
+  /* A client that leaves with an EPP stream open: the EPP hears an abort
+   * now, exactly once, and a decision still waiting for it is dropped. */
+  if (fd_ent->odir == 0)
+    epp_request_end(fd_ent);
 
 #ifdef HAVE_DP_GPU_ROUTING
   /* Hand back the CHWBL/WRR_HASH unit this connection took when it routed.

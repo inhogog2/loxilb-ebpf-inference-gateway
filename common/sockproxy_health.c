@@ -50,6 +50,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_epp.h"
 #include "sockproxy_ai_admit.h"   /* the refusal record of a request ended while it waited */
 #include "sockproxy_conn.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
@@ -228,6 +229,12 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"admission_drained\"}", 1, 0),
+  [SP_REAP_EPP_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 503 Service Unavailable\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Content-Length: 86\r\n"
+                   "Connection: close\r\n\r\n"
+                   "{\"error\":\"epp_unavailable\",\"detail\":\"the endpoint picker did not decide in time\"}\r\n", 1, 0),
 };
 
 /* End a client this thread decided against, answering it first.
@@ -1218,7 +1225,7 @@ check_draining_endpoints(void)
         while (pfe) {
           proxy_fd_ent_t *pfe_next = pfe->next;  /* capture BEFORE teardown frees pfe */
 
-          if (pfe->pd_phase == PD_PHASE_PARKED &&
+          if (pfe->pd_phase == PD_PHASE_PARKED && pfe->epp_sid == 0 &&
               pfe->park_start_ts > 0 &&
               mp_now_ns >= pfe->park_start_ts &&
               (mp_now_ns - pfe->park_start_ts) >= max_park_ns) {
@@ -1259,6 +1266,37 @@ check_draining_endpoints(void)
         mp_node = mp_node->next;
       }
     }
+  }
+
+  /* Endpoint Picker deadlines. Go always completes a submitted request
+   * within the rule's eppTimeoutMs, so this pass only fires when that
+   * promise broke (a Go panic, a wake that could not be queued): the client
+   * gets 503 epp_unavailable and the connection ends through the owner
+   * worker, like the other parks. Orphaned decisions in the side table are
+   * swept here as well. */
+  {
+    uint64_t e_now_ns = epp_now_ns();
+    proxy_map_ent_t *e_node = proxy_struct->head;
+
+    while (e_node) {
+      proxy_fd_ent_t *pfe = e_node->val.fdlist;
+      while (pfe) {
+        proxy_fd_ent_t *pfe_next = pfe->next;
+
+        if (pfe->odir == 0 && pfe->epp_sid != 0 && !pfe->epp_decided &&
+            pfe->pd_phase == PD_PHASE_PARKED && pfe->epp_deadline_ns > 0 &&
+            e_now_ns >= pfe->epp_deadline_ns) {
+          log_error("[EPP] fd=%d sid=%llu: no decision by the deadline (+grace) - 503 + teardown",
+                    pfe->fd, (unsigned long long)pfe->epp_sid);
+          pfe->epp_decided = 1;   /* no re-drive routes on a late decision */
+          pfe->pd_phase = PD_PHASE_ERROR;
+          pd_reap_respond(pfe, SP_REAP_EPP_TIMEOUT);
+        }
+        pfe = pfe_next;
+      }
+      e_node = e_node->next;
+    }
+    epp_pending_reap(60ULL * 1000000000ULL);
   }
 
   /* Capacity-queue deadlines. A request parked by the capacity gate sits

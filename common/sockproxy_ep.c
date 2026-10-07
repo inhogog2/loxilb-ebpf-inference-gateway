@@ -36,6 +36,8 @@
 #include "sockproxy_h2_load.h"   /* bounded-load units follow a moved pick */
 #include "sockproxy_metrics.h"
 #include "sockproxy_cache.h"    /* cmp_proxy_ent */
+#include "sockproxy_health.h"   /* is_endpoint_healthy */
+#include "sockproxy_epp.h"
 #include "sockproxy_conn.h"     /* proxy_setup_ep_connect */
 #include "sockproxy_routing.h"  /* find_endpoint_lpm */
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
@@ -387,6 +389,146 @@ strip_port_from_hostname(const char *host_with_port, char *host_only, size_t hos
   }
 }
 
+/* ---- Endpoint Picker (EPP) request stage ---------------------------------
+ * Runs after the capacity gate and before the rule's own selector. First
+ * pass: the whole buffered request goes to Go and the client parks. Second
+ * pass (the owner worker's re-drive after the decision landed): the
+ * decision is taken out of the side table and routed on. Returns
+ * EPP_STAGE_LADDER to go on with the rule's selector (FailOpen, or no
+ * candidate applied yet), EPP_STAGE_PARKED to park, EPP_STAGE_ERR when the
+ * request was answered here (lb_err_body_sent) and the fd should close. */
+enum { EPP_STAGE_LADDER = 0, EPP_STAGE_PARKED = 1, EPP_STAGE_ERR = -1 };
+
+/* Grace the reaper gives Go past the rule's deadline before it answers
+ * 503 itself and ends the connection. */
+#define EPP_REAP_GRACE_NS (2ULL * 1000000000ULL)
+
+static size_t
+epp_head_len(const uint8_t *buf, size_t len)
+{
+  const uint8_t *p;
+  if (!buf || len < 4) return 0;
+  p = memmem(buf, len, "\r\n\r\n", 4);
+  return p ? (size_t)(p - buf) + 4 : 0;
+}
+
+/* "ip:port,ip:port" of the endpoints this proxy would accept right now:
+ * configured, not marked down, healthy by the local prober / breaker. */
+static int
+epp_subset_build(proxy_epval_t *tepval, char *out, size_t cap)
+{
+  size_t off = 0;
+  for (int i = 0; i < tepval->n_eps && i < MAX_PROXY_EP; i++) {
+    struct in_addr a;
+    char ip[INET_ADDRSTRLEN];
+    int n;
+    if (tepval->eps[i].inv) continue;
+    if (!is_endpoint_healthy(tepval, i)) continue;
+    a.s_addr = tepval->eps[i].xip;
+    if (!inet_ntop(AF_INET, &a, ip, sizeof(ip))) continue;
+    n = snprintf(out + off, cap - off, "%s%s:%u", off ? "," : "", ip,
+                 (unsigned)ntohs(tepval->eps[i].xport));
+    if (n < 0 || (size_t)n >= cap - off) break;
+    off += (size_t)n;
+  }
+  return (int)off;
+}
+
+static int
+epp_fail(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int status,
+         const char *code, const char *detail)
+{
+  if (tepval->epp_mode == EPP_MODE_FAIL_OPEN) {
+    log_info("[EPP] fd=%d sid=%llu %s (%s): FailOpen - the rule's own selector decides",
+             pfe->fd, (unsigned long long)pfe->epp_sid, code, detail ? detail : "");
+    return EPP_STAGE_LADDER;
+  }
+  epp_send_error(pfe, status, code, detail);
+  return EPP_STAGE_ERR;
+}
+
+static int
+epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
+{
+  uint64_t gen = atomic_load_explicit(&pfe->gen, memory_order_acquire);
+
+  if (pfe->epp_decided)
+    return EPP_STAGE_LADDER;
+
+  if (pfe->epp_sid != 0) {
+    /* The re-drive after a wake: the decision should be in the table. A
+     * wake for another reason while the EPP is still deciding parks again. */
+    epp_pending_t *p = epp_pending_take(pfe->epp_sid, pfe->fd, gen);
+    const struct epp_result *r;
+    int rc;
+
+    if (!p) {
+      log_debug("[EPP] fd=%d sid=%llu woken without a decision - parked again",
+                pfe->fd, (unsigned long long)pfe->epp_sid);
+      return EPP_STAGE_PARKED;
+    }
+    pfe->epp_decided = 1;
+    pfe->epp_deadline_ns = 0;
+    r = epp_pending_result(p);
+    switch (r->status) {
+    case EPP_RES_OK:
+      log_info("[EPP] fd=%d sid=%llu decision: %d candidate(s)%s%s%s%s, body %s",
+               pfe->fd, (unsigned long long)pfe->epp_sid, r->ncands,
+               r->ncands > 0 ? " [" : "", r->ncands > 0 ? r->cands[0] : "",
+               r->ncands > 1 ? ", ..." : "", r->ncands > 0 ? "]" : "",
+               r->new_body_len > 0 ? "rewritten" : "unchanged");
+      /* Phase 1 M5 applies the candidates and the mutations here; until
+       * then the rule's own selector routes, the decision being logged. */
+      rc = EPP_STAGE_LADDER;
+      break;
+    case EPP_RES_IMMEDIATE:
+      epp_send_immediate(pfe, r);
+      rc = EPP_STAGE_ERR;
+      break;
+    default:
+      rc = epp_fail(pfe, tepval, 503, "epp_unavailable",
+                    "the endpoint picker did not answer");
+      break;
+    }
+    epp_pending_free(p);
+    return rc;
+  }
+
+  /* First pass. The EPP decides on the complete request (decision D5): a
+   * request whose body is not wholly buffered here cannot be submitted. */
+  {
+    size_t head = epp_head_len(pfe->rcvbuf, pfe->rcv_off);
+    size_t body_len;
+    char subset[MAX_PROXY_EP * 24];
+    int subset_len;
+    uint64_t sid;
+
+    if (head == 0)
+      return epp_fail(pfe, tepval, 400, "epp_bad_request", "request head not found");
+    body_len = pfe->rcv_off - head;
+    if (!pfe->http_body_complete || body_len < pfe->http_content_length)
+      return epp_fail(pfe, tepval, 413, "epp_body_too_large",
+                      "the request body exceeds what the endpoint picker path buffers");
+    subset_len = epp_subset_build(tepval, subset, sizeof(subset));
+    sid = llb_epp_submit(tepval->epp_svc_id, proxy_struct->ns, pfe->fd, gen,
+                         (char *)pfe->rcvbuf, (int)head,
+                         (char *)pfe->rcvbuf + head, (int)body_len,
+                         subset, subset_len);
+    if (sid == 0)
+      return epp_fail(pfe, tepval, 503, "epp_unavailable",
+                      "the endpoint picker refused the request");
+    pfe->epp_sid = sid;
+    pfe->epp_decided = 0;
+    pfe->epp_reported = 0;
+    pfe->epp_deadline_ns = epp_now_ns() +
+        (uint64_t)tepval->epp_timeout_ms * 1000000ULL + EPP_REAP_GRACE_NS;
+    pfe->park_start_ts = epp_now_ns();
+    log_debug("[EPP] fd=%d sid=%llu submitted (head %zu, body %zu, subset %d bytes) - parked",
+              pfe->fd, (unsigned long long)sid, head, body_len, subset_len);
+    return EPP_STAGE_PARKED;
+  }
+}
+
 int
 proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                  const char *host_str,
@@ -591,6 +733,17 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             return PD_SETUP_KEPT;        /* refused, answered, connection kept */
           if (fc_rc != 0)
             return -1;
+        }
+
+        /* Endpoint Picker stage (Phase 1): submit and park, or route on the
+         * decision the re-drive finds. Only a rule that names an EPP takes
+         * it, so every other rule's dispatch is byte for byte what it was. */
+        if (pfe && tepval->epp_mode != EPP_MODE_OFF) {
+          int epp_rc = epp_stage(pfe, tepval);
+          if (epp_rc == EPP_STAGE_PARKED)
+            return PD_SETUP_PARKED;      /* parked: the caller suspends the client */
+          if (epp_rc < 0)
+            return -1;                   /* answered here; the caller closes */
         }
 
         // Endpoint selection based on algorithm

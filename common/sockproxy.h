@@ -1523,6 +1523,18 @@ struct proxy_fd_ent {
   // pooled-pfe default) means "not parked". No parallel struct — reuse the pfe.
   int      park_ep_idx;              // prefill EP index this request is parked behind (-1 = not parked)
   uint64_t park_start_ts;            // CLOCK_MONOTONIC ns at park enqueue (max-park reap)
+  /* Endpoint Picker (EPP) request stage, sockproxy_epp.h. epp_sid is the
+   * stream id Go issued for this request (0 = none); the request is parked
+   * (PD_PHASE_PARKED, reads paused) until the decision lands in the side
+   * table and the owner worker re-drives it. epp_decided: the decision was
+   * taken out and routed on, so a re-drive does not submit again.
+   * epp_reported: the response phase (or an abort) reached Go, which must
+   * happen exactly once per sid. epp_deadline_ns: the reaper's backstop for
+   * a decision that never comes. */
+  uint64_t epp_sid;
+  uint64_t epp_deadline_ns;
+  uint8_t  epp_decided;
+  uint8_t  epp_reported;
   int      pd_prefill_ep_idx;        // Selected prefill endpoint index
   int      pd_decode_ep_idx;         // Selected decode endpoint index
   uint8_t *pd_saved_body;            // Heap: original request body for decode phase

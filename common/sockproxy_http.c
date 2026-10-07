@@ -57,6 +57,7 @@
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
+#include "sockproxy_epp.h"
 #include "sockproxy_fdlist.h"
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
@@ -8501,6 +8502,9 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->lb_err_body_sent = 0;
   pfe->ka_reparse = 0;
   pfe->ka_keep_leg = 0;
+  /* The slot carries the next request: the EPP stream of the previous one
+   * must be over (reported) by now; if not, the abort goes out here. */
+  epp_request_end(pfe);
   llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
 }
 
