@@ -84,6 +84,21 @@ extern void llb_epp_resp_event(uint64_t sid, int kind, int http_status,
 int proxy_epp_complete(void *ns, int fd, uint64_t gen, uint64_t sid,
                        const struct epp_result *r);
 
+/* Go -> C, from any thread: the EPP evicted the request during its
+ * response (an ImmediateResponse in the response phase, llm-d-router flow
+ * control). The connection is ended through its owner worker: with the
+ * response headers not yet relayed the client gets `code` (429), else the
+ * relay is cut without writing into the response in progress (risk R8).
+ * 0 = handed to the worker; -2 = the fd is no longer this request. */
+int proxy_epp_evict(void *ns, int fd, uint64_t gen, uint64_t sid, int code);
+
+/* C -> Go metrics (Phase 1 M8; weak stubs for C-only links):
+ * loxilb_ai_epp_requests_total{outcome} for the outcomes decided in C
+ * (ok, refused, no_endpoint, body_too_large) and
+ * loxilb_ai_epp_candidates_rejected_total{reason}. */
+extern void llb_epp_metric_outcome(char *outcome);
+extern void llb_epp_metric_rejected(char *reason);
+
 /* The side table (sockproxy_epp.c). */
 typedef struct epp_pending epp_pending_t;
 /* Take the decision stored for sid out of the table. NULL when none is

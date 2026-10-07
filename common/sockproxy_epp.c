@@ -127,6 +127,33 @@ proxy_epp_complete(void *ns, int fd, uint64_t gen, uint64_t sid,
   return 0;
 }
 
+int
+proxy_epp_evict(void *ns, int fd, uint64_t gen, uint64_t sid, int code)
+{
+  proxy_fd_ent_t *pfe;
+  uint64_t reg_gen = 0;
+  int rc = -2;
+
+  if (!ns || fd <= 0 || sid == 0) return -1;
+  PROXY_LOCK();
+  pfe = (proxy_fd_ent_t *)notify_priv_of_fd(ns, fd, &reg_gen);
+  if (pfe && pfe->fd == fd && reg_gen == gen && pfe->epp_sid == sid &&
+      pfe->pd_phase != PD_PHASE_ERROR && !pfe->epp_reported) {
+    /* The EPP ended the stream with its answer: nothing more goes to it. */
+    pfe->epp_reported = 1;
+    pfe->pd_phase = PD_PHASE_ERROR;   /* out of every reaper pass */
+    log_info("[EPP] fd=%d sid=%llu evicted by the EPP (%d) %s", fd,
+             (unsigned long long)sid, code,
+             pfe->epp_hdrs_reported ? "mid-response: cutting the relay"
+                                    : "before the response: answering 429");
+    sp_reap_request(pfe, pfe->epp_hdrs_reported ? SP_REAP_EPP_EVICT_CUT
+                                                : SP_REAP_EPP_EVICT_429);
+    rc = 0;
+  }
+  PROXY_UNLOCK();
+  return rc;
+}
+
 epp_pending_t *
 epp_pending_take(uint64_t sid, int fd, uint64_t gen)
 {

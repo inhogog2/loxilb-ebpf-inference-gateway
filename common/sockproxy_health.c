@@ -235,6 +235,13 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Content-Length: 86\r\n"
                    "Connection: close\r\n\r\n"
                    "{\"error\":\"epp_unavailable\",\"detail\":\"the endpoint picker did not decide in time\"}\r\n", 1, 0),
+  [SP_REAP_EPP_EVICT_429] =
+      SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Content-Length: 80\r\n"
+                   "Connection: close\r\n\r\n"
+                   "{\"error\":\"epp_evicted\",\"detail\":\"the endpoint picker shed this request\"}\r\n", 1, 0),
+  [SP_REAP_EPP_EVICT_CUT] = { NULL, 0, 1, 0 },
 };
 
 /* End a client this thread decided against, answering it first.

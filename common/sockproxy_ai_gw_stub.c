@@ -489,3 +489,15 @@ llb_epp_resp_event(uint64_t sid, int kind, int http_status,
   (void)sid; (void)kind; (void)http_status; (void)resp_hdrs; (void)resp_hdrs_len;
   (void)served; (void)served_len;
 }
+
+__attribute__((weak)) void
+llb_epp_metric_outcome(char *outcome)
+{
+  (void)outcome;
+}
+
+__attribute__((weak)) void
+llb_epp_metric_rejected(char *reason)
+{
+  (void)reason;
+}

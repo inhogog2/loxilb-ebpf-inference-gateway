@@ -215,6 +215,8 @@ enum sp_reap_resp {
   SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
   SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
   SP_REAP_EPP_TIMEOUT,          /* 503 epp_unavailable (no decision); teardown */
+  SP_REAP_EPP_EVICT_429,        /* 429 epp_evicted before any response byte; teardown */
+  SP_REAP_EPP_EVICT_CUT,        /* evicted mid-response: no text, teardown */
   SP_REAP_KINDS,
 };
 void sp_reap_finish(proxy_fd_ent_t *pfe);

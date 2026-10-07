@@ -441,6 +441,15 @@ static int
 epp_fail(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int status,
          const char *code, const char *detail)
 {
+  /* The request-phase outcome, when C decides it (Go counts the decisions
+   * it received: immediate, error). "epp_unavailable" before a stream id
+   * is a refused submit; after one it is Go's error, counted there. */
+  if (!strcmp(code, "epp_no_endpoint"))
+    llb_epp_metric_outcome((char *)"no_endpoint");
+  else if (!strcmp(code, "epp_body_too_large"))
+    llb_epp_metric_outcome((char *)"body_too_large");
+  else if (!strcmp(code, "epp_unavailable") && pfe->epp_sid == 0)
+    llb_epp_metric_outcome((char *)"refused");
   if (tepval->epp_mode == EPP_MODE_FAIL_OPEN) {
     log_info("[EPP] fd=%d sid=%llu %s (%s): FailOpen - the rule's own selector decides",
              pfe->fd, (unsigned long long)pfe->epp_sid, code, detail ? detail : "");
@@ -675,12 +684,14 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
     if (idx < 0) {
       log_info("[EPP] fd=%d sid=%llu candidate %s: not an endpoint of this rule - skipped",
                pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c]);
+      llb_epp_metric_rejected((char *)"unknown");
       continue;
     }
     why = epp_cand_rejected(tepval, idx);
     if (why) {
       log_info("[EPP] fd=%d sid=%llu candidate %s (ep%d): %s - skipped",
                pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx, why);
+      llb_epp_metric_rejected((char *)why);
       continue;
     }
     /* The endpoint's capacity ceiling, taken for this endpoint only: a
@@ -691,6 +702,7 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
         fc_ep_acquire(&tepval->fc, &pfe->fc, idx, FC_ROLE_NORMAL) == FC_SHED) {
       log_info("[EPP] fd=%d sid=%llu candidate %s (ep%d): at capacity - skipped",
                pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx);
+      llb_epp_metric_rejected((char *)"capacity");
       continue;
     }
     fd = proxy_setup_ep_connect(tepval->eps[idx].xip, tepval->eps[idx].xport,
@@ -700,6 +712,7 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
       circuit_breaker_record_failure(tepval, idx);
       log_info("[EPP] fd=%d sid=%llu candidate %s (ep%d): connect failed - next",
                pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx);
+      llb_epp_metric_rejected((char *)"connect");
       continue;
     }
     /* Load unit, the single-role KV shape: one active_conns unit held
@@ -722,6 +735,7 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
     *sel = idx;
     log_info("[EPP] fd=%d sid=%llu -> %s (ep%d, candidate %d of %d)",
              pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx, c + 1, r->ncands);
+    llb_epp_metric_outcome((char *)"ok");
     return EPP_PIN_OK;
   }
   {
