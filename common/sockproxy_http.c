@@ -10855,6 +10855,16 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   pfe->ka_reparse = 0;
   pfe->ka_keep_leg = 0;
 
+  /* An EPP rule decides every request: the kept backend leg of the previous
+   * request would carry this one to the same endpoint behind the EPP's
+   * back. Give the leg up and take the setup path, where the EPP stage is. */
+  if (ka_keep_leg && pfe->epv &&
+      ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF) {
+    log_debug("[EPP] fd=%d keep-alive request on an EPP rule: releasing the kept leg", pfe->fd);
+    proxy_release_rfd_ctx(pfe);
+    ka_keep_leg = 0;
+  }
+
   if (ka_keep_leg) {
 #ifdef HAVE_HTTP_TRACE
     /* The leg carries the request's trace identity and start time (copied at
@@ -11945,6 +11955,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           log_debug("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
                    "request (n_rfd=%d rfd0=%d) — reframe",
                    pfe->fd, pfe->n_rfd, pfe->rfd[0]);
+          proxy_release_rfd_ctx(pfe);
+        } else if (pfe->epv && ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF) {
+          /* EPP arm: the Endpoint Picker decides every request, so the next
+           * one must be framed and dispatched afresh — the leg to the last
+           * decision's endpoint is given up (one backend connect per request;
+           * the P/D arm's trade). */
+          log_debug("[EPP] fd=%d keep-alive boundary on an EPP rule: releasing the backend leg "
+                    "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
         } else if (ai_gw_boundary) {
           log_trace("[KA_FIX] fd=%d gate re-arm on live backend leg "

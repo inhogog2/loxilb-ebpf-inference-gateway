@@ -464,8 +464,14 @@ epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, epp_pending_t **out)
 {
   uint64_t gen = atomic_load_explicit(&pfe->gen, memory_order_acquire);
 
-  if (pfe->epp_decided)
-    return EPP_STAGE_LADDER;
+  if (pfe->epp_decided) {
+    /* A decided stream id on entry is the previous request of this
+     * keep-alive connection: its response ended (reported) before the
+     * client sent this one. Close its EPP bookkeeping (an abort when the
+     * end never got reported — pipelined requests are not a Phase 1 path)
+     * and start this request fresh. */
+    epp_request_end(pfe);
+  }
 
   if (pfe->epp_sid != 0) {
     /* The re-drive after a wake: the decision should be in the table. A
