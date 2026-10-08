@@ -53,6 +53,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include "sockproxy_fc.h"  /* pd_select_prefill reads tepval->fc.cfg.telemetry_stale_ms */
 #include <limits.h>
 #include <time.h>
 #include <errno.h>
@@ -206,6 +207,11 @@ typedef struct proxy_epval {
 
   pd_session_mapping_t *pd_session_map;
   pthread_rwlock_t      pd_session_lock;
+
+  /* capacity admission state (sockproxy.h): pd_select_prefill reads
+   * fc.cfg.telemetry_stale_ms for the queue-depth freshness window;
+   * memset-0 == the default window. */
+  fc_state_t fc;
 
   UT_hash_handle hh;
 } proxy_epval_t;
