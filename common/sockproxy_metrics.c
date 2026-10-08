@@ -281,6 +281,26 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     hc_metrics_fill(&snapshot);
     sp_hold_metrics_fill(&snapshot);
 
+    /* Tier-1.5 per-stage cost and match depth (cumulative le buckets,
+     * populated by record_kv_stage / record_kv_blocks). */
+    for (int s = 0; s < KV_N_STAGES; s++) {
+        for (int o = 0; o < KV_N_STAGE_OUTCOMES; o++) {
+            for (int i = 0; i < KV_STAGE_N_BUCKETS; i++) {
+                snapshot.kv_stage_bucket[s][o][i] =
+                    atomic_load(&global_stats.kv_stage_buckets[s][o][i]);
+            }
+            snapshot.kv_stage_sum_us[s][o] = atomic_load(&global_stats.kv_stage_sum_us[s][o]);
+            snapshot.kv_stage_count[s][o]  = atomic_load(&global_stats.kv_stage_count[s][o]);
+        }
+    }
+    for (int k = 0; k < KV_N_BLOCKS_KINDS; k++) {
+        for (int i = 0; i < KV_BLOCKS_N_BUCKETS; i++) {
+            snapshot.kv_blocks_bucket[k][i] = atomic_load(&global_stats.kv_blocks_bucket[k][i]);
+        }
+        snapshot.kv_blocks_sum[k]   = atomic_load(&global_stats.kv_blocks_sum[k]);
+        snapshot.kv_blocks_count[k] = atomic_load(&global_stats.kv_blocks_count[k]);
+    }
+
     return snapshot;
 }
 
@@ -502,4 +522,31 @@ void record_kv_stage(int stage, int is_hit, uint64_t latency_us) {
     }
     atomic_fetch_add(&global_stats.kv_stage_sum_us[stage][outcome], latency_us);
     atomic_fetch_add(&global_stats.kv_stage_count[stage][outcome], 1);
+}
+
+/* Match-depth bucket upper bounds in BLOCKS (must match kvBlocksBounds in
+ * api/prometheus/kv_exact_metrics.go). Powers of two from one block to the
+ * 2048-block chain a 32k-token prompt makes at block size 16; the 4096-token
+ * KV_MAX_TOKENS cap puts every prompt at or under 256 for block size 16, the
+ * wider bounds cover smaller block sizes and future caps. */
+static const uint64_t kv_blocks_bucket_bounds[KV_BLOCKS_N_BUCKETS] = {
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+};
+
+static void record_kv_blocks_one(int kind, uint64_t blocks) {
+    for (int i = 0; i < KV_BLOCKS_N_BUCKETS; i++) {
+        if (blocks <= kv_blocks_bucket_bounds[i]) {
+            atomic_fetch_add(&global_stats.kv_blocks_bucket[kind][i], 1);
+        }
+    }
+    atomic_fetch_add(&global_stats.kv_blocks_sum[kind], blocks);
+    atomic_fetch_add(&global_stats.kv_blocks_count[kind], 1);
+}
+
+void record_kv_blocks(int prompt_blocks, int overlap_blocks) {
+    if (prompt_blocks < 0) return;
+    if (overlap_blocks < 0) overlap_blocks = 0;
+    if (overlap_blocks > prompt_blocks) overlap_blocks = prompt_blocks;
+    record_kv_blocks_one(KV_BLOCKS_PROMPT, (uint64_t)prompt_blocks);
+    record_kv_blocks_one(KV_BLOCKS_OVERLAP, (uint64_t)overlap_blocks);
 }

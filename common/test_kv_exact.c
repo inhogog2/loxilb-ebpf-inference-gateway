@@ -181,6 +181,10 @@ typedef struct proxy_global_stats {
   _Atomic uint64_t kv_stage_buckets[KV_N_STAGES][KV_N_STAGE_OUTCOMES][KV_STAGE_N_BUCKETS];
   _Atomic uint64_t kv_stage_sum_us[KV_N_STAGES][KV_N_STAGE_OUTCOMES];
   _Atomic uint64_t kv_stage_count[KV_N_STAGES][KV_N_STAGE_OUTCOMES];
+  /* match depth mirror (sockproxy.h kv_blocks_*) */
+  _Atomic uint64_t kv_blocks_bucket[KV_N_BLOCKS_KINDS][KV_BLOCKS_N_BUCKETS];
+  _Atomic uint64_t kv_blocks_sum[KV_N_BLOCKS_KINDS];
+  _Atomic uint64_t kv_blocks_count[KV_N_BLOCKS_KINDS];
 } proxy_global_stats_t;
 
 static proxy_global_stats_t global_stats;
@@ -1307,6 +1311,26 @@ void record_kv_stage(int stage, int is_hit, uint64_t latency_us) {
     atomic_fetch_add(&global_stats.kv_stage_count[stage][outcome], 1);
 }
 
+/* Match-depth recorder mirror (sockproxy_metrics.c record_kv_blocks). */
+static const uint64_t kv_test_blocks_bounds[KV_BLOCKS_N_BUCKETS] = {
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+};
+void record_kv_blocks(int prompt_blocks, int overlap_blocks) {
+    if (prompt_blocks < 0) return;
+    if (overlap_blocks < 0) overlap_blocks = 0;
+    if (overlap_blocks > prompt_blocks) overlap_blocks = prompt_blocks;
+    uint64_t v[KV_N_BLOCKS_KINDS] = { (uint64_t)prompt_blocks, (uint64_t)overlap_blocks };
+    for (int k = 0; k < KV_N_BLOCKS_KINDS; k++) {
+        for (int i = 0; i < KV_BLOCKS_N_BUCKETS; i++) {
+            if (v[k] <= kv_test_blocks_bounds[i]) {
+                atomic_fetch_add(&global_stats.kv_blocks_bucket[k][i], 1);
+            }
+        }
+        atomic_fetch_add(&global_stats.kv_blocks_sum[k], v[k]);
+        atomic_fetch_add(&global_stats.kv_blocks_count[k], 1);
+    }
+}
+
 /* ===========================================================================
  * Task 1: per-stage µs histogram accumulation.
  *
@@ -1378,6 +1402,61 @@ static void test_kv_stage_histogram(void) {
   record_kv_stage(KV_STAGE_SCAN, 9, lat_hit);
   ASSERT_EQ((int)atomic_load(&global_stats.kv_stage_count[KV_STAGE_SCAN][KV_STAGE_OUTCOME_HIT]),
             1, "kv_stage is_hit=9 coerces to HIT cell");
+}
+
+/* ===========================================================================
+ * Match-depth histograms: record_kv_blocks(prompt, overlap) feeds the two
+ * cumulative le histograms the metrics snapshot exports (kv_blocks_*).
+ *
+ * Asserts:
+ *   - a (200, 150) lookup lands prompt in the 256 bucket and overlap in the
+ *     256 bucket but NOT the 128 one, with exact sum/count;
+ *   - a no_worker miss (overlap 0) counts against the prompt with 0 overlap,
+ *     so overlap/prompt reads as the cached share;
+ *   - overlap is clamped to the prompt and negatives are no-ops / zeroed.
+ * =========================================================================== */
+static void test_kv_blocks_histogram(void) {
+  memset(&global_stats, 0, sizeof(global_stats));
+
+  record_kv_blocks(200, 150);   /* prompt idx 8 (256), overlap idx 8 (256) */
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_count[KV_BLOCKS_PROMPT]), 1,
+            "kv_blocks prompt count == 1");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_count[KV_BLOCKS_OVERLAP]), 1,
+            "kv_blocks overlap count == 1");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_sum[KV_BLOCKS_PROMPT]), 200,
+            "kv_blocks prompt sum == 200");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_sum[KV_BLOCKS_OVERLAP]), 150,
+            "kv_blocks overlap sum == 150");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_bucket[KV_BLOCKS_OVERLAP][7]), 0,
+            "overlap 150 is NOT in the le=128 bucket");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_bucket[KV_BLOCKS_OVERLAP][8]), 1,
+            "overlap 150 is in the le=256 bucket");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_bucket[KV_BLOCKS_OVERLAP][11]), 1,
+            "cumulative: the last bucket carries it too");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_bucket[KV_BLOCKS_PROMPT][8]), 1,
+            "prompt 200 is in the le=256 bucket");
+
+  /* a no_worker miss: 0 overlap against a 40-block prompt */
+  record_kv_blocks(40, 0);
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_count[KV_BLOCKS_OVERLAP]), 2,
+            "a miss still counts one overlap sample (0)");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_bucket[KV_BLOCKS_OVERLAP][0]), 1,
+            "overlap 0 lands in the le=1 bucket");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_sum[KV_BLOCKS_OVERLAP]), 150,
+            "overlap sum unchanged by a 0 sample");
+
+  /* clamp and guards */
+  record_kv_blocks(10, 99);     /* overlap clamped to the prompt */
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_sum[KV_BLOCKS_OVERLAP]), 160,
+            "overlap above the prompt is clamped to it");
+  record_kv_blocks(-1, 5);      /* negative prompt: no-op */
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_count[KV_BLOCKS_PROMPT]), 3,
+            "a negative prompt count is a no-op");
+  record_kv_blocks(8, -3);      /* negative overlap: zeroed */
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_sum[KV_BLOCKS_OVERLAP]), 160,
+            "a negative overlap records 0");
+  ASSERT_EQ((int)atomic_load(&global_stats.kv_blocks_count[KV_BLOCKS_OVERLAP]), 4,
+            "... but still counts");
 }
 
 /* ===========================================================================
@@ -2436,6 +2515,7 @@ main(int argc, char **argv)
   test_c2_capacity_skew_cap();
   test_c2_num_gpu_blocks_zero_safe();
   test_kv_stage_histogram();
+  test_kv_blocks_histogram();
   test_hash_vectors_from_json();
   test_block_boundary_special_token();
   test_block_boundary_chat();

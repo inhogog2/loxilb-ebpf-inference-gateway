@@ -1050,6 +1050,9 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
       n_ep_slots, tepval->kv_svc_id, tepval->kv_exact_mode, &score);
   stage_us[KV_STAGE_CGO] = kv_now_us() - _t2;
   measured[KV_STAGE_CGO] = 1;
+  /* Match depth of this lookup, hit or no_worker alike (score is in blocks;
+   * a miss records 0 overlap against the prompt's block count). */
+  record_kv_blocks(n_hashes, (best_ep < 0 || score < 0) ? 0 : score);
 
   /* GUARD G: differentiate no-worker vs excluded/unhealthy/CB-open.
    * best_ep<0 or score<=0  → no candidate returned by inventory.

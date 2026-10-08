@@ -229,6 +229,15 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t kv_stage_buckets[4][2][12];
     _Atomic uint64_t kv_stage_sum_us[4][2];
     _Atomic uint64_t kv_stage_count[4][2];
+    // Tier-1.5 match depth, per lookup that reached the scorer: [0] = blocks
+    // the prompt hashed to (the chain the scorer saw, capped by KV_MAX_TOKENS),
+    // [1] = blocks of the chosen endpoint's inventory that overlapped it (0 on a
+    // no_worker miss). Cumulative le buckets over kv_blocks_bucket_bounds
+    // (sockproxy_metrics.c); populated by record_kv_blocks. Same literal-dims
+    // discipline as kv_stage_* above.
+    _Atomic uint64_t kv_blocks_bucket[2][12];
+    _Atomic uint64_t kv_blocks_sum[2];
+    _Atomic uint64_t kv_blocks_count[2];
 #ifdef HAVE_PII_DETECTION
     // PII Detection metrics (atomic for thread-safety)
     _Atomic uint64_t pii_requests_scanned;
