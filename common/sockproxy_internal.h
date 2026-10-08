@@ -28,11 +28,24 @@
  * ========================================================================= */
 
 /*
- * PROXY_MAX_THREADS - number of per-thread epoll / FD-mapping slots.
- * Used in proxy_mapfd_t mapfd[PROXY_MAX_THREADS] inside proxy_struct_t.
+ * PROXY_MAX_THREADS - the MOST relay workers the proxy can run: the size of
+ * every per-worker table (proxy_mapfd_t mapfd[], the trace rings, the
+ * notifier's shards). How many actually run is proxy_num_workers(), read
+ * once from LLB_PROXY_WORKERS (default PROXY_DEFAULT_THREADS, the count the
+ * proxy always ran with before the knob existed). The relay is sharded by
+ * fd modulo the worker count with both legs of a connection pinned to one
+ * worker, so the count only sets how many cores the relay may use; nothing
+ * else keys on it.
  * See also: PROXY_NUM_BURST_RX (remains in sockproxy.c – cache/I/O concern).
  */
-#define PROXY_MAX_THREADS           4
+#define PROXY_MAX_THREADS           32
+#define PROXY_DEFAULT_THREADS       4
+#define PROXY_WORKERS_ENV           "LLB_PROXY_WORKERS"
+
+/* The relay worker count in force (1..PROXY_MAX_THREADS). Resolved on first
+ * call from PROXY_WORKERS_ENV; garbage or out of range falls back to the
+ * default with one log line. Safe to call from any thread after that. */
+int proxy_num_workers(void);
 
 /* FD mapping pool constants */
 #define PROXY_START_MAPFD           500

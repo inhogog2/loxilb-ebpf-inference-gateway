@@ -8,6 +8,11 @@
 
 #include <stdint.h>
 
+/* The most relay shards a context may run (plus one listener shard). The
+ * proxy's PROXY_MAX_THREADS must not exceed it; sockproxy_notifier.c holds
+ * the two together at compile time. */
+#define NOTIFY_MAX_RELAY_SHARDS 32
+
 typedef enum {
   NOTI_TYPE_IN     = 0x1 << 0,
   NOTI_TYPE_HUP    = 0x1 << 1,
