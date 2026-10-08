@@ -10857,9 +10857,13 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 
   /* An EPP rule decides every request: the kept backend leg of the previous
    * request would carry this one to the same endpoint behind the EPP's
-   * back. Give the leg up and take the setup path, where the EPP stage is. */
+   * back. Give the leg up and take the setup path, where the EPP stage is.
+   * Only for a NEXT request (the previous one's EPP phase is reported):
+   * a leg whose connect just completed re-enters here for the SAME request
+   * (proxy_backend_connect_event) and must ride on. */
   if (ka_keep_leg && pfe->epv &&
-      ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF) {
+      ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF &&
+      (pfe->epp_sid == 0 || pfe->epp_reported)) {
     log_debug("[EPP] fd=%d keep-alive request on an EPP rule: releasing the kept leg", pfe->fd);
     proxy_release_rfd_ctx(pfe);
     ka_keep_leg = 0;
@@ -11956,11 +11960,13 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                    "request (n_rfd=%d rfd0=%d) — reframe",
                    pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
-        } else if (pfe->epv && ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF) {
+        } else if (pfe->epv && ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF &&
+                   (pfe->epp_sid == 0 || pfe->epp_reported)) {
           /* EPP arm: the Endpoint Picker decides every request, so the next
            * one must be framed and dispatched afresh — the leg to the last
            * decision's endpoint is given up (one backend connect per request;
-           * the P/D arm's trade). */
+           * the P/D arm's trade). Only once the previous request's EPP phase
+           * is over (reported): never under a response still in flight. */
           log_debug("[EPP] fd=%d keep-alive boundary on an EPP rule: releasing the backend leg "
                     "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
