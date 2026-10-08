@@ -34,6 +34,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdint.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -43,8 +44,26 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 
 #include "notify.h"
+
+/* The notifier registers a fd with epoll at notify_add_ent, so every fd a
+ * case registers must be a real open descriptor: poll(2) tolerated a made-up
+ * number until its next round (POLLNVAL), epoll_ctl refuses it at once. The
+ * placement cases need specific fd NUMBERS (the shard is fd modulo the relay
+ * count), so each one is a socket dup2'd onto that number. */
+static int
+real_fd(int n)
+{
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+
+  if (s < 0 || dup2(s, n) < 0) {
+    return -1;
+  }
+  close(s);
+  return n;
+}
 
 /* notify.c marks its workers fail-loud through this thread-local, which the
  * proxy core defines; no worker is started here. */
@@ -314,7 +333,23 @@ listener_pause_cases(void)
 int
 main(void)
 {
-  void *ns = notify_ctx_new(NULL, N_RELAY);
+  void *ns;
+  struct rlimit rl;
+
+  /* fd 65534 below needs the table to reach that far */
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 65536) {
+    rl.rlim_cur = rl.rlim_max < 65536 ? rl.rlim_max : 65536;
+    setrlimit(RLIMIT_NOFILE, &rl);
+  }
+  for (int n = 20; n <= 23; n++) {
+    check("a real socket on the listener fd", real_fd(n) == n, n, n);
+  }
+  check("a real socket on fd 101", real_fd(101) == 101, 101, 101);
+  check("a real socket on fd 102", real_fd(102) == 102, 102, 102);
+  check("a real socket on fd 103", real_fd(103) == 103, 103, 103);
+  check("a real socket on fd 205", real_fd(205) == 205, 205, 205);
+
+  ns = notify_ctx_new(NULL, N_RELAY);
 
   check("context with 4 relay shards", ns != NULL, ns != NULL, 1);
   check("listener shard follows the relay shards", notify_listener_thr(ns) == N_RELAY,
@@ -349,7 +384,15 @@ main(void)
   {
     int priv;
     check("fd 65535 is refused", notify_add_ent(ns, 65535, NOTI_TYPE_IN, &priv, 1) < 0, 0, 0);
-    check("fd 65534 is accepted", notify_add_ent(ns, 65534, NOTI_TYPE_IN, &priv, 1) == 0, 0, 0);
+    if (real_fd(65534) == 65534) {
+      check("fd 65534 is accepted", notify_add_ent(ns, 65534, NOTI_TYPE_IN, &priv, 1) == 0, 0, 0);
+    } else {
+      printf("skip fd 65534 is accepted (RLIMIT_NOFILE too low)\n");
+    }
+    /* epoll registers at add time: a number that is not an open fd is
+     * refused here instead of surfacing as POLLNVAL on the next round */
+    check("a closed fd is refused", notify_add_ent(ns, 60000, NOTI_TYPE_IN, &priv, 1) == -EBADF,
+          notify_add_ent(ns, 60000, NOTI_TYPE_IN, &priv, 1), -EBADF);
   }
 
   /* the shard count is bounded by the thread table, listener shard included */
