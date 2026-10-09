@@ -19,6 +19,7 @@
 #include "sockproxy_qos.h"  /* Tier-1 byte-shaper config + bucket (proxy_map_ent members) */
 #include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
+#include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
@@ -238,6 +239,9 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t kv_blocks_bucket[2][12];
     _Atomic uint64_t kv_blocks_sum[2];
     _Atomic uint64_t kv_blocks_count[2];
+    // Streams that ended before their terminator, by reason, with the age
+    // at the end (sockproxy_abandon.h); filled by abandon_record.
+    abandon_stats_t stream_abandon;
 #ifdef HAVE_PII_DETECTION
     // PII Detection metrics (atomic for thread-safety)
     _Atomic uint64_t pii_requests_scanned;
@@ -1485,6 +1489,12 @@ struct proxy_fd_ent {
   uint8_t  sse_active;                // 1=SSE stream detected and active (Content-Type: text/event-stream seen)
   time_t   stream_start_ts;           // Wall-clock time when SSE stream was activated (time(NULL))
   time_t   stream_end_ts;             // Wall-clock time when data:[DONE] was received
+  time_t   bp_since;                  // health tick that first saw this client's relay cache at the
+                                      // high-water mark while a stream was active (0 = draining);
+                                      // the stalled-client policy (sockproxy_abandon.h) keys on it
+  uint8_t  abandon_reason;            // enum abandon_reason + 1 when the end of an open stream is
+                                      // already attributed (backend died, stall abort); 0 = a
+                                      // teardown with the stream open is the client leaving
   uint64_t stream_start_mono_ns;      // CLOCK_MONOTONIC stamp at SSE activation; latency source for
                                       // llb_ai_record_request (wall-clock seconds truncated sub-second
                                       // streams to 0 and NTP steps could skew/negate the delta)

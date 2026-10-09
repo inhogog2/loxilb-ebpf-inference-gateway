@@ -228,6 +228,8 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"admission_drained\"}", 1, 0),
+  [SP_REAP_SSE_STALL] =
+      SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
 };
 
 /* End a client this thread decided against, answering it first.
@@ -420,6 +422,37 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
  * i.e. the conc=128 corruption fix — can be exercised DETERMINISTICALLY under load in
  * validation (e.g. =3 so saturated prefills time out and the reaper fires every tick),
  * instead of relying on prefill stochastically exceeding 30s. Cached (getenv once). */
+/* LLB_SSE_STALL_ABORT_SEC: how long a streamed response's client may sit at
+ * the relay cache's high-water mark before the gateway ends the stream
+ * (sockproxy_abandon.h). 0 (the default) never aborts: the behaviour the
+ * proxy always had. Bounded at a day; garbage keeps 0. Cached (getenv once). */
+uint32_t
+sp_sse_stall_abort_sec(void)
+{
+  static uint32_t cached = 0;      /* 0 = not yet resolved */
+  static int resolved = 0;
+  if (__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) {
+    return cached;
+  }
+  uint32_t v = 0;
+  const char *e = getenv("LLB_SSE_STALL_ABORT_SEC");
+  if (e && *e) {
+    char *end = NULL;
+    long n = strtol(e, &end, 10);
+    if (end && *end == '\0' && n > 0 && n <= 86400) {
+      v = (uint32_t)n;
+    } else {
+      log_error("LLB_SSE_STALL_ABORT_SEC=%s is not in 1..86400, stalled-client abort stays off", e);
+    }
+  }
+  cached = v;
+  __atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
+  if (v) {
+    log_info("sockproxy: streams whose client stops reading for %u s are ended (LLB_SSE_STALL_ABORT_SEC)", v);
+  }
+  return cached;
+}
+
 static uint32_t
 pd_prefill_timeout_default(void)
 {
@@ -896,6 +929,35 @@ check_draining_endpoints(void)
       proxy_fd_ent_t *pfe = sse_node->val.fdlist;
       while (pfe) {
         proxy_fd_ent_t *pfe_next = pfe->next;
+
+        /* Stalled client: the relay cache for this stream has sat at the
+         * high-water mark since bp_since (backpressure paused the backend
+         * reads; the engine keeps generating into its own buffer). With the
+         * knob set, end the stream once the stall has lasted that long —
+         * the same shape as the duration cap below. The decision itself is
+         * the pure function in sockproxy_abandon.h. */
+        if (pfe->sse_active == 1 && pfe->stream_end_ts == 0) {
+          int stall_abort = 0;
+          pfe->bp_since = (time_t)abandon_stall_tick(pfe->cache_backpressure,
+                                                     (long)pfe->bp_since, (long)now,
+                                                     (long)sp_sse_stall_abort_sec(),
+                                                     &stall_abort);
+          if (stall_abort) {
+            log_warn("[SSE_STALL] fd=%d: client has not drained its stream for %lds "
+                     "(cache %zu bytes), ending it", pfe->fd, (long)(now - pfe->bp_since),
+                     pfe->cache_total_size);
+            abandon_record(&global_stats.stream_abandon, ABANDON_STALL_ABORT,
+                           pfe->stream_start_ts > 0 ? (long)(now - pfe->stream_start_ts) : 0);
+            pfe->abandon_reason = ABANDON_STALL_ABORT + 1;
+            llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
+            pfe->stream_end_ts = now;
+            pfe->sse_active = 0;
+            pfe->bp_since = 0;
+            pd_reap_respond(pfe, SP_REAP_SSE_STALL);
+            pfe = pfe_next;
+            continue;
+          }
+        }
 
         if (pfe->sse_active == 1 && pfe->stream_end_ts == 0 &&
             pfe->stream_start_ts > 0) {

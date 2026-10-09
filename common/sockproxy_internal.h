@@ -207,8 +207,15 @@ enum sp_reap_resp {
   SP_REAP_PD_IDLE_TIMEOUT,      /* 504 pd_idle_timeout; teardown */
   SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
   SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
+  SP_REAP_SSE_STALL,            /* SSE error event: client stopped reading; shutdown */
   SP_REAP_KINDS,
 };
+
+/* The stalled-client abort window in seconds (LLB_SSE_STALL_ABORT_SEC, read
+ * once; 0 = off, the default). A streamed response whose client has left
+ * its relay cache at the high-water mark for this long is ended by the
+ * gateway (sockproxy_abandon.h). */
+uint32_t sp_sse_stall_abort_sec(void);
 void sp_reap_finish(proxy_fd_ent_t *pfe);
 /* Hand a response of `kind` to the connection's owner worker and end the
  * connection there (sockproxy_health.c; the reaper's own entry point). The

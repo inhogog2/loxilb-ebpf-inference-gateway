@@ -301,6 +301,18 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
         snapshot.kv_blocks_count[k] = atomic_load(&global_stats.kv_blocks_count[k]);
     }
 
+    /* Unfinished streams by reason, with age at the end. */
+    for (int r = 0; r < ABANDON_REASONS; r++) {
+        snapshot.stream_abandon_total[r] = atomic_load(&global_stats.stream_abandon.total[r]);
+        for (int i = 0; i < ABANDON_N_BUCKETS; i++) {
+            snapshot.stream_abandon_age_bucket[r][i] =
+                atomic_load(&global_stats.stream_abandon.age_bucket[r][i]);
+        }
+        snapshot.stream_abandon_age_sum_s[r] = atomic_load(&global_stats.stream_abandon.age_sum_s[r]);
+        snapshot.stream_abandon_age_count[r] = atomic_load(&global_stats.stream_abandon.age_count[r]);
+    }
+    snapshot.stream_stall_abort_sec = sp_sse_stall_abort_sec();
+
     return snapshot;
 }
 

@@ -444,6 +444,10 @@ test_l7hdr: test_l7hdr_guard
 test_sockmap_gate: test_sockmap_gate.c sockproxy_sockmap_gate.h
 	$(CC) -Wall -Wextra -o $@ $< -I.
 
+# Unfinished-stream accounting and the stalled-client policy (pure header).
+test_abandon: test_abandon.c sockproxy_abandon.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
 .PHONY: test_smgate
 test_smgate: test_sockmap_gate
 	./test_sockmap_gate
