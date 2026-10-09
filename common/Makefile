@@ -445,8 +445,13 @@ test_sockmap_gate: test_sockmap_gate.c sockproxy_sockmap_gate.h
 	$(CC) -Wall -Wextra -o $@ $< -I.
 
 # Unfinished-stream accounting and the stalled-client policy (pure header).
-test_abandon: test_abandon.c sockproxy_abandon.h
+# `make test_abandon` builds AND runs it (the gate target must be able to fail).
+test_abandon_bin: test_abandon.c sockproxy_abandon.h
 	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_abandon
+test_abandon: test_abandon_bin
+	./test_abandon_bin
 
 .PHONY: test_smgate
 test_smgate: test_sockmap_gate

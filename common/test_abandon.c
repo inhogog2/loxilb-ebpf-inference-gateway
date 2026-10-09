@@ -4,7 +4,7 @@
  * (sockproxy_abandon.h), driven as plain integers.
  *
  * Build (wired into `make test_abandon`):
- *   gcc -Wall -Wextra -Werror -o test_abandon test_abandon.c -I.
+ *   gcc -Wall -Wextra -Werror -o test_abandon_bin test_abandon.c -I.
  */
 #include <stdio.h>
 #include <string.h>
