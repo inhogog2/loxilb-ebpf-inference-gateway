@@ -286,7 +286,13 @@ listener_pause_cases(void)
   rc = notify_rearm_paused(g_vns, gate_open);
   check("valve: the updated listener is re-armed", rc == 1, rc, 1);
   n = dispatches_over(50);
-  check("valve: ... with its updated mask (hang-ups only)", n == 0, n, 0);
+  /* notify.h: "One event polled before the pause may still dispatch after
+   * it" -- a batch a worker collected before the pause's EPOLL_CTL_MOD is
+   * dispatched against the entry as it is then. So exactly one stray
+   * dispatch is within the contract (the sibling checks above tolerate the
+   * same one); the defect this guards, the re-arm handing the listener its
+   * old IN mask, shows as a spinning level-triggered listener (n > 20). */
+  check("valve: ... with its updated mask (hang-ups only)", n <= 1, n, 1);
   check("valve: in-place update back to IN|HUP",
         notify_add_ent_listener(g_vns, g_lfd, NOTI_TYPE_IN | NOTI_TYPE_HUP, &lpriv, 1) == 0, 0, 0);
   n = dispatches_over(50);
@@ -323,7 +329,9 @@ listener_pause_cases(void)
   check("valve: ... and nothing is left paused", notify_paused_count(g_vns) == 0,
         notify_paused_count(g_vns), 0);
   n = dispatches_over(50);
-  check("valve: the new registration keeps its own events", n == 0, n, 0);
+  /* same contract as above: the one event polled before the pause may land
+   * on the new registration; a re-arm defect would spin it (n > 20) */
+  check("valve: the new registration keeps its own events", n <= 1, n, 1);
 
   close(client2);
   close(lfd2);
