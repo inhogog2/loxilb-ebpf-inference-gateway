@@ -39,17 +39,11 @@ int  proxy_xmit_cache(proxy_fd_ent_t *ent);
 void proxy_check_release_backpressure(proxy_fd_ent_t *ent);
 
 /*
- * Cache backpressure thresholds.
- * Originally defined in sockproxy.c; moved here in so that
- * sockproxy_cache.c and any future consumer can reference them via this header.
- *
- * ADAPTIVE BACKPRESSURE: Different thresholds for chunked vs non-chunked.
- * Chunked encoding (text/JS/CSS): Lower threshold to prevent SSL timeout.
- * Binary transfers (images/videos): Higher threshold for performance.
+ * Cache backpressure thresholds and the mark selection live in
+ * sockproxy_cache_mark.h (included after proxy_fd_ent_t is complete). The
+ * mark is resolved over the entry and its legs -- see that header for why
+ * the entry's own flag was never enough on the response path.
  */
-#define PROXY_CACHE_HIGH_WATER_CHUNKED (768 * 1024)       /* 768KB for chunked */
-#define PROXY_CACHE_LOW_WATER_CHUNKED  (384 * 1024)       /* 384KB resume */
-#define PROXY_CACHE_HIGH_WATER         (12 * 1024 * 1024) /* 12MB binary */
-#define PROXY_CACHE_LOW_WATER          (4 * 1024 * 1024)  /* 4MB resume */
+#include "sockproxy_cache_mark.h"
 
 #endif /* __SOCKPROXY_CACHE_H__ */
