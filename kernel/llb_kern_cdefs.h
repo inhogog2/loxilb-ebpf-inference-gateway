@@ -704,7 +704,7 @@ struct security_rate_stats_map_d {
     __uint(type,        BPF_MAP_TYPE_ARRAY);
     __type(key,         __u32);  // Stat type (see indices above)
     __type(value,       __u64);  // Counter value
-    __uint(max_entries, 11);     // Increased from 8 to 11 for UDP stats (indices 0-10)
+    __uint(max_entries, 16);     // Existing indices 0-10; aggregate drop attribution 11-13, tracking errors 14; unsupported protected IPv6 packets 15
 } sec_rate_stats SEC(".maps");
 
 /*
@@ -765,12 +765,17 @@ struct dp_security_rate_config {
     __u32 udp_enabled;              // 1 = UDP flood protection enabled
     
     __u32 reserved;                 // Future expansion
+    __u32 aggregate_syn_threshold;
+    __u32 aggregate_conn_rate_threshold;
+    __u32 aggregate_udp_pkt_threshold;
+    __u32 aggregate_udp_bandwidth_threshold;
+
 } __attribute__((packed));
 
 /* ABI freeze: Go mirrors this layout field-for-field in
- * DpSecurityRateConfigSet (dpSecurityRateConfig, 10 x uint32 = 40 bytes).
+ * DpSecurityRateConfigSet (dpSecurityRateConfig, 14 x uint32 = 56 bytes).
  * A size skew here is exactly the P0-1 stack-overflow bug class. */
-_Static_assert(sizeof(struct dp_security_rate_config) == 40,
+_Static_assert(sizeof(struct dp_security_rate_config) == 56,
                "dp_security_rate_config ABI changed - update Go dpSecurityRateConfig");
 
 /* Configuration Map (Runtime modifiable from Go)
