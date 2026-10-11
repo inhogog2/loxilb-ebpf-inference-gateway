@@ -79,7 +79,14 @@ int  xdp_packet_func(struct xdp_md *ctx)
   }
   memset(xf, 0, sizeof *xf);
 
+  /* Security consumes the parsed IPv6 identity and transport flags too.
+   * Skipping v6 here silently bypasses both IPv6 CIDR filtering and rates,
+   * even though their maps and control-plane policies are installed. */
+#if defined(HAVE_DP_IP_FILTER) || defined(HAVE_DP_SECURITY_RATE_LIMIT)
+  int parse_ret = dp_parse_depth0(ctx, xf, 0);
+#else
   int parse_ret = dp_parse_depth0(ctx, xf, 1);
+#endif
   (void)parse_ret; /* Used only in debug builds */
   BPF_DBG_PRINTK("[XDP-DEBUG] Parse result: ret=%d, dl_type=0x%x, valid=%d, saddr4=0x%x",
                  parse_ret, bpf_ntohs(xf->l2m.dl_type), xf->l34m.valid, xf->l34m.saddr4);
