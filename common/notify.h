@@ -52,13 +52,13 @@ int notify_delete_ent(void *ctx, int fd, int evict);
 int notify_deregister_ent(void *ctx, int fd);
 /* Disarm poll events for a registered fd WITHOUT removing its entry: the fd
  * stays owned/tracked (the evict-based final cleanup still works) but poll
- * stops watching IN/OUT/RDHUP for it. poll(2) still reports POLLHUP/POLLERR
+ * stops watching IN/OUT/RDHUP for it. epoll still reports EPOLLHUP/EPOLLERR
  * regardless of the requested mask, so a hard peer reset is never missed.
  * Used to park a half-closed source whose reads are backpressure-paused: a
  * level-triggered POLLRDHUP would otherwise spin the worker. Re-arm with
  * notify_add_ent (same priv updates the mask in place). */
 int notify_disarm_ent(void *ctx, int fd);
-/* Pause a registered fd: poll stops reporting it (POLLHUP/POLLERR still come
+/* Pause a registered fd: the worker stops reporting it (HUP/ERR still come
  * through) until notify_rearm_paused restores its events. The accept valve
  * pauses a listener at its bound, where a readable backlog it will not accept
  * would otherwise be reported on every poll round. `gate` answers whether the
