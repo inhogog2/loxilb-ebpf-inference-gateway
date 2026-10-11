@@ -41,6 +41,7 @@
 
 #include <stdint.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
 
 enum abandon_reason {
   ABANDON_CLIENT_GONE = 0,
@@ -108,6 +109,35 @@ abandon_stall_tick(int backpressure, long bp_since, long now, long stall_sec, in
     *abort = 1;
   }
   return bp_since;
+}
+
+/* Whether a backend leg being let go must be reset rather than closed in
+ * order. A leg whose reads were paused when its client's teardown releases
+ * it still holds response bytes that now have no reader, and the engine has
+ * more queued behind the zero window those bytes left. The orderly close
+ * that follows reads them out and sends only a FIN: the window is not
+ * reopened on a socket whose read side is shut, so the engine can neither
+ * send nor learn that its peer is gone, and it generates to the end of the
+ * request. `releaser_odir` is the direction of the entry doing the release
+ * (0 = a client), `leg_odir` the leg's (1 = a backend), `leg_read_paused`
+ * the leg's flag as it stands BEFORE the release clears it. */
+static inline int
+abandon_leg_wants_reset(int releaser_odir, int leg_odir, int leg_read_paused)
+{
+  return releaser_odir == 0 && leg_odir == 1 && leg_read_paused != 0;
+}
+
+/* Make the eventual close of `fd` a reset, whatever is read from it or shut
+ * on it in between. The owner's ordinary teardown still does the close. */
+static inline int
+abandon_leg_arm_reset(int fd)
+{
+  struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+
+  if (fd <= 0) {
+    return -1;
+  }
+  return setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 }
 
 #endif /* __SOCKPROXY_ABANDON_H__ */

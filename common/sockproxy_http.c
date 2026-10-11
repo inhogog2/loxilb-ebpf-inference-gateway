@@ -5569,6 +5569,10 @@ proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
     if (fd_ent) {
       PROXY_ENT_LOCK(fd_ent);
       log_trace("sockproxy rfd %d release", fd_ent->fd);
+      /* Decided here, before the release clears the pause. */
+      if (abandon_leg_wants_reset(pfe->odir, fd_ent->odir, fd_ent->read_paused)) {
+        abandon_leg_arm_reset(fd_ent->fd);
+      }
       proxy_release_fd_ctx(fd_ent, 0);
       notify_delete_ent(proxy_struct->ns, fd_ent->fd, 1);
       pfe->rfd_ent[i] = NULL;
