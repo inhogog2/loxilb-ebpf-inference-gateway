@@ -196,6 +196,20 @@ typedef struct proxy_metrics_snapshot {
     uint64_t hold_empty_out;
     uint64_t hold_accel_skipped;
     uint64_t hold_default_mode;
+
+    /* Tier-1.5 routing cost and match depth (sockproxy_kv_exact.c). Stage
+     * histograms are [stage][outcome][bound]: stage = enum kv_stage
+     * (tokenize, hash, cgo, scan), outcome = miss, hit; bounds are
+     * latency_bucket_bounds_us. Block histograms are [kind][bound]: kind =
+     * prompt blocks, overlap blocks; bounds are kv_blocks_bucket_bounds.
+     * Cumulative le buckets; count includes samples past the last bound.
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t kv_stage_bucket[4][2][12];
+    uint64_t kv_stage_sum_us[4][2];
+    uint64_t kv_stage_count[4][2];
+    uint64_t kv_blocks_bucket[2][12];
+    uint64_t kv_blocks_sum[2];
+    uint64_t kv_blocks_count[2];
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
