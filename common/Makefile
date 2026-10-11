@@ -804,6 +804,10 @@ test_notify_shard: test_notify_shard.c notify.c log.c notify.h
 test_notify_epoll: test_notify_epoll.c notify.c log.c notify.h
 	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c log.c -I. -lpthread
 
+# Notifier throughput vs relay worker count (sizing LLB_PROXY_WORKERS); not a test.
+bench_notify_scale: bench_notify_scale.c notify.c log.c notify.h
+	$(CC) -O2 -Wall -Wextra -Werror -o $@ bench_notify_scale.c notify.c log.c -I. -lpthread
+
 .PHONY: test_shard
 test_shard: test_notify_shard test_notify_epoll
 	./test_notify_shard

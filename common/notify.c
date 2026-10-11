@@ -44,7 +44,8 @@
 /* How many ready events one epoll_wait returns at most. Level-triggered, so
  * whatever is still ready after this batch is returned by the next call. */
 #define MAX_NOTIFY_EVENTS 1024
-#define MAX_NOTIFY_THREADS (8)
+/* Relay shards plus the listener shard (NOTIFY_MAX_RELAY_SHARDS, notify.h). */
+#define MAX_NOTIFY_THREADS (NOTIFY_MAX_RELAY_SHARDS + 1)
 #define MAX_NOTIFY_POLL_TIMEO (10)
 
 /* (R1): bound on the per-worker resume-pending MPSC ring. A parked conn
@@ -79,6 +80,11 @@ typedef struct notify_ent {
 } notify_ent_t;
 
 #define NOTI_LOCK(C) pthread_rwlock_wrlock(&(C)->lock)
+/* The read side, for lookups that change nothing: the dispatch of every
+ * event takes it to pair a fd with its registration, so with one write lock
+ * every worker's dispatch serialized against every other's. Readers run
+ * together; a registration change still waits for them and excludes them. */
+#define NOTI_RDLOCK(C) pthread_rwlock_rdlock(&(C)->lock)
 #define NOTI_UNLOCK(C) pthread_rwlock_unlock(&(C)->lock)
 
 typedef struct notify_thr {
@@ -264,7 +270,7 @@ notify_owner_thr(void *ctx, int fd)
     return -1;
   }
   int thr;
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   if (nctx->earr[fd].fd > 0) {
     thr = nctx->earr[fd].thr_id;       /* registered (possibly pinned) owner */
   } else {
@@ -287,7 +293,7 @@ notify_priv_of_fd(void *ctx, int fd, uint64_t *gen_out)
   if (!nctx || fd <= 0 || fd >= MAX_NOTIFY_FDS) {
     return NULL;
   }
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   if (nctx->earr[fd].fd > 0) {
     priv = nctx->earr[fd].priv;
     if (gen_out) *gen_out = nctx->earr[fd].gen;
@@ -344,7 +350,7 @@ notify_check_slot(void *ctx, int fd)
     return 0;
   }
 
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   ent = &nctx->earr[fd];
   if (ent->fd > 0) {
     NOTI_UNLOCK(nctx);
@@ -499,7 +505,7 @@ notify_ent_thr(void *ctx, int fd)
   if (!nctx || fd <= 0 || fd >= MAX_NOTIFY_FDS) {
     return -1;
   }
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   if (nctx->earr[fd].fd > 0) {
     thr = nctx->earr[fd].thr_id;
   }
@@ -1073,7 +1079,10 @@ notify_run(void *ctx, int thread)
         continue;
       }
 
-      NOTI_LOCK(nctx);
+      /* Read side: the lookup pairs the fd with its live registration and
+       * captures priv + gen; nothing is written. Registration changes take
+       * the write side and wait for in-flight lookups, as before. */
+      NOTI_RDLOCK(nctx);
       ent = &nctx->earr[fd];
       if (ent->fd <= 0) {
         /* Released after this batch was collected (its delete already

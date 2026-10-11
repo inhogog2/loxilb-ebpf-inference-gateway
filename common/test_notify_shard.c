@@ -403,9 +403,12 @@ main(void)
           notify_add_ent(ns, 60000, NOTI_TYPE_IN, &priv, 1), -EBADF);
   }
 
-  /* the shard count is bounded by the thread table, listener shard included */
-  check("8 relay shards leave no room for the listener shard", notify_ctx_new(NULL, 8) == NULL, 0, 0);
-  check("7 relay shards fit", notify_ctx_new(NULL, 7) != NULL, 1, 1);
+  /* the shard count is bounded by the thread table, listener shard included:
+   * NOTIFY_MAX_RELAY_SHARDS relay shards fit, one more does not */
+  check("one relay shard past the bound leaves no room for the listener shard",
+        notify_ctx_new(NULL, NOTIFY_MAX_RELAY_SHARDS + 1) == NULL, 0, 0);
+  check("the bound's worth of relay shards fit", notify_ctx_new(NULL, NOTIFY_MAX_RELAY_SHARDS) != NULL, 1, 1);
+  check("the former 8-shard table is no longer the limit", notify_ctx_new(NULL, 8) != NULL, 1, 1);
 
   listener_pause_cases();
 

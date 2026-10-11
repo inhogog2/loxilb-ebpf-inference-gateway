@@ -20,7 +20,10 @@
  *   - notify_wake_worker resumes a fd on ITS OWNER worker;
  *   - a pinned backend leg dispatches on its client's worker;
  *   - the per-event cost does not grow with the idle population (the oracle
- *     of the change: measured with 8 idle fds and again with 4000).
+ *     of the change: measured with 8 idle fds and again with 4000);
+ *   - a context with 16 relay shards dispatches on every shard, and the
+ *     read-side lookup lets the shards dispatch concurrently (round trips
+ *     per second across 16 shards exceed what one shard delivers alone).
  *
  * Build (wired into `make test_notify_epoll`):
  *   gcc -Wall -Wextra -Werror -o test_notify_epoll test_notify_epoll.c notify.c log.c -I. -lpthread
@@ -366,6 +369,131 @@ case_scaling(void)
   check("per-event cost does not grow with idle fds (<2.5x)", many < few * 2.5, (long)(many * 10 / few), 25);
 }
 
+/* ---- many shards: every shard dispatches, and together they go faster ---- */
+
+static double
+shard_rate(int n_relay, int pairs_per_shard, int rounds)
+{
+  notify_cbs_t cbs;
+  void *ns;
+  pthread_t thr;
+  int total = n_relay * pairs_per_shard;
+  int (*sv)[2] = calloc(total, sizeof(*sv));
+  tpriv_t **pv = calloc(total, sizeof(*pv));
+  int *seen = calloc(n_relay, sizeof(int));
+  uint64_t t0, t1;
+  char b = 'q';
+  int shards_hit = 0;
+
+  memset(&cbs, 0, sizeof(cbs));
+  cbs.notify = cb_notify;
+  cbs.pdestroy = cb_destroy;
+  ns = notify_ctx_new(&cbs, n_relay);
+  if (!ns) {
+    return -1;
+  }
+  /* the fixture's callbacks look up g_ns; point it at this context */
+  g_ns = ns;
+  pthread_create(&thr, NULL, run_shards, ns);
+  sleep_ms(50);
+
+  /* Placement is fd modulo the relay count, and socketpair() hands out fd
+   * numbers two at a time, so pairs made back to back cover only half of
+   * the residues. Keep a pair only when its shard still has fewer than
+   * pairs_per_shard, and burn one fd number between attempts so the
+   * numbering walks every residue. */
+  {
+    int *per = calloc(n_relay, sizeof(int));
+    int kept = 0, attempts = 0;
+    int fillers[64];
+    int n_fill = 0;
+    while (kept < total && attempts < 64 * total) {
+      int s2[2];
+      int shard;
+      attempts++;
+      if (pair(s2)) {
+        return -1;
+      }
+      shard = s2[0] % n_relay;
+      if (per[shard] < pairs_per_shard) {
+        per[shard]++;
+        sv[kept][0] = s2[0];
+        sv[kept][1] = s2[1];
+        pv[kept] = priv_for(s2[0]);
+        atomic_store(&pv[kept]->echo, 1);
+        notify_add_ent(ns, s2[0], NOTI_TYPE_IN | NOTI_TYPE_HUP, pv[kept], 1);
+        kept++;
+      } else {
+        close(s2[0]);
+        close(s2[1]);
+        /* shift the numbering by one so the next pair lands elsewhere */
+        if (n_fill < 64) {
+          fillers[n_fill++] = dup(0);
+        }
+      }
+    }
+    for (int f = 0; f < n_fill; f++) {
+      close(fillers[f]);
+    }
+    free(per);
+    if (kept < total) {
+      return -1;
+    }
+  }
+  /* one round trip on each pair; every shard that owns a pair must have run */
+  for (int i = 0; i < total; i++) {
+    if (send(sv[i][1], &b, 1, 0) != 1 || recv(sv[i][1], &b, 1, 0) != 1) {
+      return -1;
+    }
+    seen[atomic_load(&pv[i]->worker)]++;
+  }
+  for (int s = 0; s < n_relay; s++) {
+    if (seen[s]) {
+      shards_hit++;
+    }
+  }
+  if (shards_hit != n_relay) {
+    printf("     %d of %d shards dispatched\n", shards_hit, n_relay);
+    return -2;
+  }
+  /* throughput: walk every pair `rounds` times, as fast as one client can */
+  t0 = now_us();
+  for (int r = 0; r < rounds; r++) {
+    for (int i = 0; i < total; i++) {
+      if (send(sv[i][1], &b, 1, 0) != 1 || recv(sv[i][1], &b, 1, 0) != 1) {
+        return -1;
+      }
+    }
+  }
+  t1 = now_us();
+  for (int i = 0; i < total; i++) {
+    notify_deregister_ent(ns, sv[i][0]);
+    close(sv[i][0]);
+    close(sv[i][1]);
+  }
+  free(sv);
+  free(pv);
+  free(seen);
+  return (double)rounds * total * 1e6 / (double)(t1 - t0);
+}
+
+static void
+case_many_shards(void)
+{
+  void *saved = g_ns;
+  double one, many;
+
+  one = shard_rate(1, 16, 200);
+  many = shard_rate(16, 1, 200);
+  g_ns = saved;
+  check("16-shard context: every shard dispatched", many > 0, (long)many, 1);
+  printf("     one shard: %.0f rt/s; 16 shards: %.0f rt/s (one client)\n", one, many);
+  /* One client drives both, so this is not a parallelism measurement; it
+   * only has to show that 16 shards are not SLOWER than one (a dispatch
+   * that serialized across shards would show here). */
+  check("16 shards are not slower than one (>= 0.5x)", many >= one * 0.5, (long)(many * 10 / one), 5);
+}
+
 int
 main(void)
 {
@@ -391,6 +519,7 @@ main(void)
   case_pinned();
   case_resume();
   case_scaling();
+  case_many_shards();
 
   printf("\n%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;

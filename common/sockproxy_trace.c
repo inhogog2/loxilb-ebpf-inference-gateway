@@ -106,8 +106,8 @@ int lxb_trace_enable(void) {
 
   // Lazy initialize ring buffers if not already done
   if (!lxb_ring_is_initialized()) {
-    log_info("[HTTP_TRACE] Lazy initializing ring buffers for %d workers", PROXY_MAX_THREADS);
-    int ret = lxb_ring_init(PROXY_MAX_THREADS);
+    log_info("[HTTP_TRACE] Lazy initializing ring buffers for %d workers", proxy_num_workers());
+    int ret = lxb_ring_init(proxy_num_workers());
     if (ret < 0) {
       log_error("[HTTP_TRACE] Failed to initialize trace rings: %d", ret);
       return ret;
