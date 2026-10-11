@@ -75,6 +75,16 @@ int main(void)
     if (ep==2) a++; else { assert(ep==31); b++; }
   }
   assert(a==25500 && b==25400);
+  /* Eligible zero weights retain the existing default weight of one.
+   * Exclusion comes from eligibility, never from a zero weight. */
+  weights[2]=0; weights[31]=1; a=0; b=0;
+  for (unsigned i=0;i<10000;i++) {
+    int ep=sp_mcp_wrr_index(&weighted,(UINT32_C(1)<<2)|(UINT32_C(1)<<31),weights);
+    if (ep==2) a++; else { assert(ep==31); b++; }
+  }
+  assert(a==5000 && b==5000);
+  assert(weighted.weights[2]==1);
+  for (unsigned i=0;i<100;i++) assert(sp_mcp_wrr_index(&weighted,UINT32_C(1)<<31,weights)==31);
   for (unsigned i=0;i<32;i++) assert(weighted.current[i]>-10000 && weighted.current[i]<10000);
   for (unsigned i=0;i<8;i++) assert(!pthread_create(&threads[i],NULL,replacement_requests,(void *)(uintptr_t)i));
   for (unsigned i=0;i<8;i++) assert(!pthread_join(threads[i],NULL));
