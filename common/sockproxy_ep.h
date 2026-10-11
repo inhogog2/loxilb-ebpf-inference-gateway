@@ -47,6 +47,10 @@ int proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                      proxy_fd_ent_t *pfe,
                      const void *pp2hdr, int pp2len);
 
+int proxy_setup_mcp_retry(proxy_fd_ent_t *pfe, proxy_ep_sel_t *out,
+                          proxy_epval_t **epv, uint32_t *rid,
+                          const void *pp2hdr, int pp2len);
+
 /* Conversation mapping cleanup background thread */
 void *proxy_conversation_cleanup_thread(void *arg);
 

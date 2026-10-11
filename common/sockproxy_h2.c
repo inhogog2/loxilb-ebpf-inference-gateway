@@ -32,7 +32,10 @@
 #include "sockproxy_ai_gw.h"      /* settle-path ladder calls */
 #include "sockproxy_pd.h"         /* dialect ops for usage extraction */
 #include "sockproxy_json.h"
+#include "sockproxy_mcp_capture.h"
 #include "sockproxy_lb.h"
+#define SP_MCP_PROXY_SELECTOR
+#include "sockproxy_mcp_rr.h"
 #include "sockproxy_h2_load.h"    /* per-stream bounded-load units */
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "sockproxy_l7hdr_guard.h" /* same field guard as the H1 splice */
@@ -52,6 +55,10 @@ extern uint64_t get_timestamp_ns(void);
 extern void emit_trace_event(proxy_fd_ent_t *pfe, uint8_t event_type, uint32_t duration_us);
 extern int is_tracing_enabled(void);
 #endif
+
+static int proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+    int status_code, int retry_after, int retry_body,
+    const char *error_code, const char *error_msg);
 
 // ============================================================================
 // HTTP/2 BACKPRESSURE WATERMARKS (same pattern as HTTP/1.1)
@@ -442,6 +449,12 @@ h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
    * (response complete, client reset, session teardown), so this is the
    * release that always runs. Idempotent with the refusal path. */
   fc_permit_release(&stream->fc);
+  backend_h2_session_t *bridge, *bridge_tmp;
+  HASH_ITER(hh,session->backend_sessions,bridge,bridge_tmp) {
+    if (!bridge->bridge_h1) continue;
+    stream_mapping_t *m=NULL;HASH_FIND_INT(bridge->stream_map,&stream->stream_id,m);
+    if (m) {bridge->bridge_cancelled=1;shutdown(bridge->backend_fd,SHUT_RDWR);}
+  }
 
   /* Release the AI-deny response body if the stream still owns one (a client
    * reset before nghttp2 drained it never reached the read callback's EOF). */
@@ -697,6 +710,35 @@ proxy_h2_on_header_callback(nghttp2_session *session,
     }
   }
   
+  proxy_map_ent_t *mcp_head = pfe->head;
+  if (mcp_head && mcp_head->val.ephash && mcp_head->val.ephash->mcp_stateless) {
+    if (stream->response_sent) return 0;
+    /* These operands are used for selection, while the original HPACK fields
+     * are forwarded. Never select from a truncated prefix of the request. */
+    int pseudo_oversize =
+      (namelen==7 && !memcmp(name,":method",7) && valuelen>=sizeof(stream->method)) ||
+      (namelen==5 && !memcmp(name,":path",5) &&
+       (valuelen>=sizeof(stream->path) || valuelen>=sizeof(pfe->request_path) ||
+        valuelen>=sizeof(pfe->url_path))) ||
+      (namelen==10 && !memcmp(name,":authority",10) &&
+       (valuelen>=sizeof(stream->authority) || valuelen>=sizeof(pfe->host_url)));
+    if (pseudo_oversize) {
+      proxy_h2_send_ai_deny(pfe,stream,413,0,0,"mcp_routing_operand_too_large",
+                            "MCP routing operands must fit without truncation");
+      stream->response_sent=1;
+      return 0;
+    }
+    size_t total=namelen+valuelen;
+    for (size_t i=0; i<stream->request_headers_count; i++)
+      total+=stream->request_headers[i].namelen+stream->request_headers[i].valuelen;
+    if (stream->request_headers_count>=256 || total>128U*1024U) {
+      proxy_h2_send_ai_deny(pfe,stream,413,0,0,"mcp_headers_too_large",
+                            "MCP request headers exceed the buffered validation limit");
+      stream->response_sent=1;
+      return 0;
+    }
+  }
+
   // Parse header (store important ones for backward compatibility and quick access)
   #define HEADER_MATCHES(hdr) (namelen == strlen(hdr) && memcmp(name, hdr, namelen) == 0)
 
@@ -839,6 +881,16 @@ proxy_h2_on_data_chunk_recv_callback(nghttp2_session *session,
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   
+  proxy_map_ent_t *mcp_head = pfe->head;
+  if (mcp_head && mcp_head->val.ephash && mcp_head->val.ephash->mcp_stateless) {
+    if (stream->response_sent) return 0;
+    if (len > SP_MCP_PROXY_BODY_MAX - stream->data_len) {
+      proxy_h2_send_ai_deny(pfe, stream, 413, 0, 0, "mcp_body_too_large",
+                            "MCP request exceeds the buffered validation limit");
+      stream->response_sent = 1;
+      return 0;
+    }
+  }
   // Append data to stream buffer
   if (append_stream_data(stream, data, len) < 0) {
     log_error("[HTTP/2] Failed to append data to stream %d", stream_id);
@@ -1968,6 +2020,241 @@ proxy_h2_backend_on_stream_close_callback(nghttp2_session *session,
   return 0;
 }
 
+/* MCP H2/H1 conversion uses the same response relay as native H2. Each
+ * backend session has exactly one mapping (backend stream id 1), so a
+ * backend close/reset can never answer or close a neighbouring H2 stream. */
+static int h2_h1_hop(const uint8_t *name, size_t n)
+{
+  static const char *const names[] = {"connection","proxy-connection","keep-alive",
+    "transfer-encoding","upgrade","te","trailer"};
+  for (size_t i=0;i<sizeof(names)/sizeof(names[0]);i++)
+    if (n==strlen(names[i]) && !strncasecmp((const char *)name,names[i],n)) return 1;
+  return 0;
+}
+static int h2_h1_begin(llhttp_t *p)
+{
+  backend_h2_session_t *bs=p->data;
+  bs->bridge_field_len=bs->bridge_value_len=bs->bridge_header_bytes=0;
+  bs->bridge_value_started=0; return 0;
+}
+static int h2_h1_field(llhttp_t *p,const char *at,size_t len)
+{
+  backend_h2_session_t *bs=p->data;
+  /* Response trailers are refused too: routing/security metadata may not
+   * change after final headers were already delivered to the H2 client. */
+  if ((p->flags & F_TRAILING) || len>=sizeof(bs->bridge_field)-bs->bridge_field_len) return -1;
+  for (size_t i=0;i<len;i++) {
+    unsigned char c=(unsigned char)at[i];
+    if (!sp_mcp_media_tchar(c)) return -1;
+    bs->bridge_field[bs->bridge_field_len++]=(char)(c>='A'&&c<='Z'?c+32:c);
+  }
+  bs->bridge_field[bs->bridge_field_len]=0; return 0;
+}
+static int h2_h1_value(llhttp_t *p,const char *at,size_t len)
+{
+  backend_h2_session_t *bs=p->data;
+  if (len>=sizeof(bs->bridge_value)-bs->bridge_value_len) return -1;
+  memcpy(bs->bridge_value+bs->bridge_value_len,at,len);
+  bs->bridge_value_len+=len; bs->bridge_value[bs->bridge_value_len]=0;return 0;
+}
+static int h2_h1_value_done(llhttp_t *p)
+{
+  backend_h2_session_t *bs=p->data; stream_mapping_t *m=bs->stream_map;
+  if (!m || !bs->bridge_field_len || m->response_headers_count>=256) return -1;
+  size_t bytes=bs->bridge_field_len+bs->bridge_value_len;
+  if (bytes>128U*1024U-bs->bridge_header_bytes) return -1;
+  bs->bridge_header_bytes+=bytes;
+  nghttp2_nv nv={(uint8_t *)bs->bridge_field,(uint8_t *)bs->bridge_value,
+    bs->bridge_field_len,bs->bridge_value_len,NGHTTP2_NV_FLAG_NONE};
+  int rv=proxy_h2_inject_resp_headers(m,&nv,1);
+  bs->bridge_field_len=bs->bridge_value_len=0;
+  return rv==1?0:-1;
+}
+static int h2_h1_connection_nominates(stream_mapping_t *m,nghttp2_nv *nv)
+{
+  for (size_t i=0;i<m->response_headers_count;i++) {
+    nghttp2_nv *c=&m->response_headers[i];
+    if (c->namelen!=10 || strncasecmp((char *)c->name,"connection",10)) continue;
+    size_t at=0;
+    while (at<c->valuelen) {
+      while (at<c->valuelen && (c->value[at]==' ' || c->value[at]=='\t' || c->value[at]==',')) at++;
+      size_t start=at;while (at<c->valuelen && c->value[at]!=',') at++;
+      size_t end=at;while (end>start && (c->value[end-1]==' ' || c->value[end-1]=='\t')) end--;
+      if (end-start==nv->namelen && !strncasecmp((char *)c->value+start,(char *)nv->name,nv->namelen)) return 1;
+    }
+  }
+  return 0;
+}
+static int h2_h1_headers_done(llhttp_t *p)
+{
+  backend_h2_session_t *bs=p->data;stream_mapping_t *m=bs->stream_map;
+  if (!m || p->status_code<100 || p->status_code==101 || p->status_code>599) return -1;
+  /* Decide all exclusions before freeing Connection fields they refer to. */
+  unsigned char drop[256]={0};
+  for (size_t i=0;i<m->response_headers_count;i++)
+    drop[i]=(unsigned char)(h2_h1_hop(m->response_headers[i].name,m->response_headers[i].namelen) ||
+                            h2_h1_connection_nominates(m,&m->response_headers[i]));
+  size_t out=0;
+  for (size_t i=0;i<m->response_headers_count;i++) {
+    if (drop[i]) {free(m->response_headers[i].name);free(m->response_headers[i].value);}
+    else m->response_headers[out++]=m->response_headers[i];
+  }
+  m->response_headers_count=out;
+  /* The range above guarantees exactly three decimal digits. Keep the
+   * encoding explicit so GCC need not infer a uint16_t range for snprintf. */
+  unsigned code=(unsigned)p->status_code;
+  char status[4]={(char)('0'+code/100U),(char)('0'+(code/10U)%10U),
+                  (char)('0'+code%10U),'\0'};
+  nghttp2_nv nv={(uint8_t *)":status",(uint8_t *)status,7,3,NGHTTP2_NV_FLAG_NONE};
+  if (proxy_h2_inject_resp_headers(m,&nv,1)!=1) return -1;
+  /* HTTP/2 pseudo-fields must precede every regular header. The H1 parser
+   * collected regular fields first, so move the synthesized status ahead. */
+  nghttp2_nv status_nv=m->response_headers[m->response_headers_count-1];
+  memmove(m->response_headers+1,m->response_headers,
+          (m->response_headers_count-1)*sizeof(*m->response_headers));
+  m->response_headers[0]=status_nv;
+  proxy_h2_stream_t *stream=find_stream(bs->client_session,m->client_stream_id);
+  if (stream && p->status_code>=200) stream->metric_response_status=p->status_code;
+  nghttp2_frame frame;memset(&frame,0,sizeof(frame));
+  frame.hd.type=NGHTTP2_HEADERS;frame.hd.stream_id=1;
+  return proxy_h2_backend_on_frame_recv_callback(NULL,&frame,bs)?-1:0;
+}
+static int h2_h1_body(llhttp_t *p,const char *at,size_t len)
+{
+  backend_h2_session_t *bs=p->data;
+  if (bs->bridge_cancelled || !bs->stream_map) return -1;
+  /* Bound slow-client memory independently of total stream length. A
+   * streaming SSE never needs its entire body resident in memory. */
+  if (bs->client_session->total_response_buffer_size>H2_SESSION_HIGH_WATER ||
+      len>H2_SESSION_HIGH_WATER-bs->client_session->total_response_buffer_size) return -1;
+  int rv=proxy_h2_backend_on_data_chunk_recv_callback(NULL,0,1,(const uint8_t *)at,len,bs);
+  return rv? -1:0;
+}
+static int h2_h1_complete(llhttp_t *p)
+{
+  backend_h2_session_t *bs=p->data;
+  if (p->status_code<200) return 0; /* informational, final response follows */
+  bs->bridge_done=1;
+  nghttp2_frame frame;memset(&frame,0,sizeof(frame));
+  frame.hd.type=NGHTTP2_DATA;frame.hd.stream_id=1;frame.hd.flags=NGHTTP2_FLAG_END_STREAM;
+  int rv=proxy_h2_backend_on_frame_recv_callback(NULL,&frame,bs);
+  if (rv) return -1;
+  /* Mapping/load units can go now; queued response bytes live on the
+   * client stream until its window drains, exactly as native H2 does. */
+  proxy_h2_backend_on_stream_close_callback(NULL,1,NGHTTP2_NO_ERROR,bs);
+  shutdown(bs->backend_fd,SHUT_RDWR);
+  return HPE_PAUSED;
+}
+static backend_h2_session_t *h2_h1_session_new(proxy_h2_session_t *client,int slot,
+    int ep,void *epv,int fd,void *ssl)
+{
+  backend_h2_session_t *bs=calloc(1,sizeof(*bs));if (!bs) return NULL;
+  bs->bridge_h1=1;bs->backend_fd=fd;bs->slot=slot;bs->ep_idx=ep;
+  bs->epv=epv;bs->client_session=client;bs->ssl=ssl;bs->connected=1;
+  pthread_mutex_init(&bs->send_lock,NULL);
+  llhttp_settings_init(&bs->bridge_settings);
+  bs->bridge_settings.on_message_begin=h2_h1_begin;
+  bs->bridge_settings.on_header_field=h2_h1_field;
+  bs->bridge_settings.on_header_value=h2_h1_value;
+  bs->bridge_settings.on_header_value_complete=h2_h1_value_done;
+  bs->bridge_settings.on_headers_complete=h2_h1_headers_done;
+  bs->bridge_settings.on_body=h2_h1_body;
+  bs->bridge_settings.on_message_complete=h2_h1_complete;
+  llhttp_init(&bs->bridge_parser,HTTP_RESPONSE,&bs->bridge_settings);bs->bridge_parser.data=bs;
+  HASH_ADD_INT(client->backend_sessions,slot,bs);return bs;
+}
+static int h2_h1_fail(backend_h2_session_t *bs)
+{
+  if (!bs || !bs->client_session) return -1;
+  stream_mapping_t *m=bs->stream_map;
+  if (m) {
+    proxy_h2_stream_t *s=find_stream(bs->client_session,m->client_stream_id);
+    if (s) h2_resp_relay_reset(bs->client_session,s,NGHTTP2_PROTOCOL_ERROR);
+  }
+  proxy_h2_client_send(bs->client_session);
+  shutdown(bs->backend_fd,SHUT_RDWR);return -1;
+}
+int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe,int clean_eof)
+{
+  backend_h2_session_t *bs=pfe?pfe->backend_h2_session:NULL;
+  if (!bs || !bs->bridge_h1) return 0;
+  if (!bs->bridge_done && !bs->bridge_cancelled) {
+    if (!clean_eof) {h2_h1_fail(bs);return 1;}
+    llhttp_errno_t err=llhttp_finish(&bs->bridge_parser);
+    if (err!=HPE_OK && err!=HPE_PAUSED) h2_h1_fail(bs);
+    else if (!bs->bridge_done) h2_h1_fail(bs);
+  }
+  return 1;
+}
+void proxy_h2_h1_backend_detach(proxy_fd_ent_t *pfe)
+{
+  backend_h2_session_t *bs=pfe?pfe->backend_h2_session:NULL;
+  if (!bs || !bs->bridge_h1) return;
+  proxy_fd_ent_t *client=bs->client_session?bs->client_session->pfe:NULL;
+  if (client && bs->slot>=0 && bs->slot<MAX_PROXY_EP && client->rfd_ent[bs->slot]==pfe) {
+    client->rfd_ent[bs->slot]=NULL;client->rfd[bs->slot]=-1;
+    while (client->n_rfd>0 && !client->rfd_ent[client->n_rfd-1]) client->n_rfd--;
+  }
+  pfe->rfd_ent[0]=NULL;pfe->rfd[0]=-1;pfe->n_rfd=0;pfe->backend_h2_session=NULL;
+  HASH_DEL(bs->client_session->backend_sessions,bs);
+  proxy_h2_backend_session_destroy(bs);
+}
+static int h2_h1_request(backend_h2_session_t *bs,proxy_h2_stream_t *stream,
+    const nghttp2_nv *headers,size_t nh)
+{
+  const char *path=stream->path,*authority=stream->authority;
+  if (path[0]!='/' || !authority[0]) return 400;
+  for (const char *p=path;*p;p++) if ((unsigned char)*p<=32 || (unsigned char)*p==127) return 400;
+  for (const char *p=authority;*p;p++) if ((unsigned char)*p<=32 || (unsigned char)*p==127 || *p=='/' || *p=='\\') return 400;
+  size_t hdr_size=128+strlen(path)+strlen(authority);
+  for (size_t i=0;i<nh;i++) {
+    const nghttp2_nv *nv=&headers[i];
+    if (!nv->namelen) return 400;
+    if (nv->name[0]==':') {
+      const char *captured=NULL;
+      if (nv->namelen==5 && !memcmp(nv->name,":path",5)) captured=path;
+      else if (nv->namelen==10 && !memcmp(nv->name,":authority",10)) captured=authority;
+      else if (nv->namelen==7 && !memcmp(nv->name,":method",7)) captured="POST";
+      else if (nv->namelen!=7 || memcmp(nv->name,":scheme",7)) return 400;
+      if (captured && (nv->valuelen!=strlen(captured) || memcmp(nv->value,captured,nv->valuelen))) return 413;
+      continue;
+    }
+    if (h2_h1_hop(nv->name,nv->namelen)) return 400;
+    for (size_t k=0;k<nv->namelen;k++) if (!sp_mcp_media_tchar(nv->name[k])) return 400;
+    for (size_t k=0;k<nv->valuelen;k++) if ((nv->value[k]<32 && nv->value[k]!=9) || nv->value[k]==127) return 400;
+    if (nv->namelen+nv->valuelen+4>128U*1024U-hdr_size) return 413;
+    hdr_size+=nv->namelen+nv->valuelen+4;
+  }
+  if (stream->data_len>SP_MCP_PROXY_BODY_MAX) return 413;
+  char *request=malloc(hdr_size+stream->data_len);if (!request) return 503;
+  int base=snprintf(request,hdr_size,"POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nContent-Length: %zu\r\n",
+                    path,authority,stream->data_len);
+  if (base<0 || (size_t)base>=hdr_size) {free(request);return 503;}
+  size_t off=(size_t)base;
+  for (size_t i=0;i<nh;i++) {
+    const nghttp2_nv *nv=&headers[i];
+    if (nv->name[0]==':' || (nv->namelen==4 && !strncasecmp((char *)nv->name,"host",4)) ||
+        (nv->namelen==14 && !strncasecmp((char *)nv->name,"content-length",14)) ||
+        (nv->namelen==6 && !strncasecmp((char *)nv->name,"expect",6))) continue;
+    memcpy(request+off,nv->name,nv->namelen);off+=nv->namelen;
+    memcpy(request+off,": ",2);off+=2;memcpy(request+off,nv->value,nv->valuelen);off+=nv->valuelen;
+    memcpy(request+off,"\r\n",2);off+=2;
+  }
+  memcpy(request+off,"\r\n",2);off+=2;
+  if (stream->data_len) memcpy(request+off,stream->data_buf,stream->data_len);
+  off+=stream->data_len;
+  stream_mapping_t *m=calloc(1,sizeof(*m));
+  if (!m) {free(request);return 503;}
+  m->client_stream_id=stream->stream_id;m->backend_stream_id=1;m->ep_idx=bs->ep_idx;m->created_ts=time(NULL);
+  HASH_ADD_INT(bs->stream_map,client_stream_id,m);
+#ifdef HAVE_DP_GPU_ROUTING
+  m->load_held=h2_load_unit_take((proxy_epval_t *)bs->epv,bs->ep_idx);
+#endif
+  int rv=proxy_h2_backend_add_send_buffer(bs,(const uint8_t *)request,off);free(request);
+  if (rv<0 || proxy_h2_backend_drain_send_buffer(bs)<0) return 503;
+  return 0;
+}
+
 /**
  * Create or get backend HTTP/2 session for endpoint
  */
@@ -3069,6 +3356,7 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 
   fc_permit_release(&stream->fc);
   if (fc_active(&tepval->fc) &&
+      !(tepval->mcp_stateless && is_post) &&
       !fc_is_inference_request(is_post, stream->path)) {
     fc_bypass(&tepval->fc, &stream->fc);
     return 0;
@@ -3096,8 +3384,11 @@ sp_fc_h2_gate_endpoint(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 
   if (stream->fc.state != FC_P_EXECUTING)
     return ep_idx;
+  sp_mcp_fc_scope mcp_scope={.pool=tepval,.request=pfe};
   ep = fc_ep_acquire_any(&tepval->fc, &stream->fc, FC_ROLE_NORMAL, ep_idx,
-                         tepval->n_eps, sp_fc_normal_eligible, tepval, &v);
+                         tepval->n_eps,
+                         tepval->mcp_stateless ? sp_mcp_fc_eligible : sp_fc_normal_eligible,
+                         tepval->mcp_stateless ? (void *)&mcp_scope : (void *)tepval, &v);
   if (ep < 0) {
     sp_fc_h2_shed(pfe, stream, tepval, v, FC_ROLE_NORMAL);
     return -1;
@@ -3241,12 +3532,14 @@ proxy_h2_handle_client_data(proxy_fd_ent_t *pfe)
     if (stream->headers_complete && stream->data_complete && !stream->response_sent) {
       ready_streams++;
       
+      int32_t forwarded_id=stream->stream_id;
       rv = proxy_h2_forward_to_backend(pfe, stream);
       if (rv == 0) {
-        // Mark as forwarded to prevent duplicate forwarding
-        stream->response_sent = 1;
+        // A local terminal answer may have closed and freed this stream.
+        proxy_h2_stream_t *live=find_stream(pfe->h2_session,forwarded_id);
+        if (live) live->response_sent = 1;
       } else {
-        log_error("[HTTP/2] ✗ Failed to forward stream %d to backend", stream->stream_id);
+        log_error("[HTTP/2] ✗ Failed to forward stream %d to backend", forwarded_id);
       }
     }
   }
@@ -3474,6 +3767,18 @@ proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe)
     return -1;
   }
   
+  if (backend_session->bridge_h1) {
+    if (backend_session->bridge_cancelled) return -1;
+    llhttp_errno_t e=llhttp_execute(&backend_session->bridge_parser,(char *)pfe->rcvbuf,pfe->rcv_off);
+    if (e==HPE_PAUSED && backend_session->bridge_done) {
+      if (llhttp_get_error_pos(&backend_session->bridge_parser)!=(char *)pfe->rcvbuf+pfe->rcv_off)
+        return h2_h1_fail(backend_session);
+      return 0;
+    }
+    if (e!=HPE_OK) return h2_h1_fail(backend_session);
+    return proxy_h2_client_send(client_pfe->h2_session);
+  }
+
   // Now process backend response data (already read into pfe->rcvbuf by event loop)
   pthread_mutex_lock(&backend_session->send_lock);
   
@@ -3757,6 +4062,88 @@ proxy_h2_free_l7_req_headers(nghttp2_nv *nv, l7h2_emit_ctx_t *ctx)
  * Week 3: Full implementation with endpoint selection integration
  * Integrates with: CHWBL routing, GPU-aware routing, conversation tracking, health checks
  */
+/* Request operands are reconstructed from THIS stream at dispatch. The
+ * connection-level generic header store can contain other multiplexed streams. */
+static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                         proxy_map_ent_t *ent)
+{
+  struct sp_mcp_request *req = calloc(1, sizeof(*req));
+  struct sp_mcp_media media = {0};
+  int status = req ? 0 : 503;
+  pfe->mcp_route_active=0;
+  if (req) {
+    const nghttp2_nv *authority = NULL, *host = NULL;
+    /* HTTP/2 permits Host when :authority is absent. Resolve the operand
+     * from this stream's complete headers, never a prior stream's mirror.
+     * When both are sent, require equal bytes (ignoring ASCII case), including
+     * the explicit port; alternative port spellings are deliberately refused. */
+    pfe->host_url[0] = '\0';
+    for (size_t i=0; !status && i<stream->request_headers_count; i++) {
+      const nghttp2_nv *h=&stream->request_headers[i];
+      if (l7h2_nv_name_eq(h, ":authority")) {
+        if (authority) status=400;
+        else authority=h;
+      } else if (l7h2_nv_name_eq(h, "host")) {
+        if (host) status=400;
+        else host=h;
+      }
+    }
+    const nghttp2_nv *effective_authority = authority ? authority : host;
+    if (!status && (!effective_authority || !effective_authority->valuelen ||
+        memchr(effective_authority->value, 0, effective_authority->valuelen))) status=400;
+    if (!status && authority && host &&
+        (authority->valuelen != host->valuelen ||
+         strncasecmp((const char *)authority->value, (const char *)host->value,
+                     authority->valuelen))) status=400;
+    if (!status && (effective_authority->valuelen >= sizeof(stream->authority) ||
+                    effective_authority->valuelen >= sizeof(pfe->host_url))) status=413;
+    if (!status) {
+      memcpy(stream->authority, effective_authority->value, effective_authority->valuelen);
+      stream->authority[effective_authority->valuelen]='\0';
+    }
+    if (!status && strcmp(stream->method, "POST")) status=405;
+    if (!status && stream->data_len > SP_MCP_PROXY_BODY_MAX) status=413;
+    for (size_t i=0; !status && i<stream->request_headers_count; i++) {
+      const nghttp2_nv *h=&stream->request_headers[i];
+      if (h->namelen && h->name[0]==':') continue;
+      sp_mcp_header(req,(const char *)h->name,h->namelen,(const char *)h->value,h->valuelen);
+      sp_mcp_media_header(&media,(const char *)h->name,h->namelen,(const char *)h->value,h->valuelen);
+    }
+    if (!status && !sp_mcp_media_valid(&media)) status=400;
+    if (!status) status=sp_mcp_validate(req,stream->method,(const char *)stream->data_buf,stream->data_len);
+    if (!status && ent->has_l7_policy) {
+      if (stream->request_headers_count>L7_MAX_CAPTURED_HEADERS || req->name_len>=L7_HDR_VALUE_MAX ||
+          memchr(req->name,0,req->name_len)) status=413;
+      else {
+        pfe->n_l7_headers=0;
+        for (size_t i=0;i<stream->request_headers_count;i++) {
+          const nghttp2_nv *h=&stream->request_headers[i];
+          const char *value=(const char *)h->value; size_t len=h->valuelen;
+          if (h->namelen==8 && !strncasecmp((const char *)h->name,"mcp-name",8)) {
+            value=req->name; len=req->name_len;
+          }
+          /* The L7 store truncates generic operands. For modern MCP,
+           * reject instead of routing on a different value from the backend. */
+          if (h->namelen>=L7_HDR_NAME_MAX || len>=L7_HDR_VALUE_MAX ||
+              memchr(value,0,len)) { status=413; break; }
+          l7_store_header_n(pfe,NULL,(const char *)h->name,h->namelen,value,len);
+        }
+      }
+    }
+    free(req);
+  }
+  if (status) {
+    static const char body[]="{\"error\":\"mcp_request_refused\"}";
+    nghttp2_nv allow={(uint8_t *)"allow",(uint8_t *)"POST",5,4,NGHTTP2_NV_FLAG_NONE};
+    h2_send_deny_frame(pfe,stream,status,0,body,sizeof(body)-1,status==405?&allow:NULL,status==405?1:0);
+    return -1;
+  }
+  stream->has_conv_id=0;
+  stream->conversation_id[0]=0;
+  pfe->has_conv_id=pfe->has_custom_session_header=pfe->has_user_id=0;
+  return 0;
+}
+
 int
 proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
 {
@@ -3771,6 +4158,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   }
   
   ent = (proxy_map_ent_t *)pfe->head;
+  if (ent->val.ephash && ent->val.ephash->mcp_stateless &&
+      sp_mcp_h2_gate(pfe,stream,ent)) return 0; /* this stream was refused */
 
   /* Mandatory security admission is the first service-dependent decision on
    * this stream.  It MUST precede L7 dispatch, model lookup, all Tier 0/1/1.5/2
@@ -4047,7 +4436,7 @@ h2_have_tepval:
    * and its ceilings are known, no selector has run, no backend byte has
    * moved. A refusal is a terminal response on this stream; return 0 so the
    * caller marks it answered and never redispatches. */
-  if (tepval->ai_gw_mode && sp_fc_h2_gate_service(pfe, stream, tepval) != 0)
+  if ((tepval->ai_gw_mode || tepval->mcp_stateless) && sp_fc_h2_gate_service(pfe, stream, tepval) != 0)
     return 0;
 
   // ============================================================================
@@ -4196,11 +4585,21 @@ h2_have_tepval:
     }
     
     // Simple round-robin fallback for now
-    static int rr_counter = 0;
-    int counter_val = rr_counter++;
-    ep_idx = (counter_val % tepval->n_eps);
+    if (tepval->mcp_stateless) {
+      ep_idx=sp_mcp_request_select(tepval,pfe);
+      if (ep_idx<0) {
+        static const char body[]="{\"error\":\"mcp_backend_unavailable\"}";
+        h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
+        return 0;
+      }
+    } else {
+      static int rr_counter = 0;
+      int counter_val = rr_counter++;
+      ep_idx = (counter_val % tepval->n_eps);
+    }
   }
-  ep_idx = select_healthy_endpoint(tepval, ep_idx);
+  if (!(tepval->mcp_stateless))
+    ep_idx = select_healthy_endpoint(tepval, ep_idx);
   if (ep_idx < 0) {
     log_error("[HTTP/2] stream %d: No healthy endpoint available", stream->stream_id);
     
@@ -4253,7 +4652,7 @@ h2_have_tepval:
   /* Capacity admission, endpoint level: the pick is a preference, the unit
    * is the decision. The bounded-load unit the selector counted was handed
    * back above, so a moved pick owes nothing. */
-  if (tepval->ai_gw_mode) {
+  if (tepval->ai_gw_mode || tepval->mcp_stateless) {
     int fc_ep = sp_fc_h2_gate_endpoint(pfe, stream, tepval, ep_idx);
     if (fc_ep < 0)
       return 0;
@@ -4271,6 +4670,12 @@ h2_have_tepval:
   // no per-stream decision may read them back (the settle dialect reads
   // stream->route_epv, the cookie path reads the backend session's epv).
   // ============================================================================
+  if (tepval->mcp_stateless && !sp_mcp_reserve_probe(tepval,ep_idx)) {
+    static const char body[]="{\"error\":\"mcp_backend_unavailable\"}";
+    fc_permit_release(&stream->fc);
+    h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
+    return 0;
+  }
   pfe->epv = tepval;
   pfe->ep_num = ep_idx;
   stream->route_epv = tepval;
@@ -4300,13 +4705,14 @@ h2_have_tepval:
    * pool A. rfd[]/rfd_ent[] therefore hold SLOTS: reuse requires the
    * registered backend pfe to match BOTH the pool (epv) and the
    * pool-relative endpoint index; a miss allocates the first free slot. */
+  int bridge_h1=ent->val.ephash && ent->val.ephash->mcp_stateless && ent->val.backend_protocol_cap==0;
   int slot = -1;
   for (int i = 0; i < pfe->n_rfd && i < MAX_PROXY_EP; i++) {
     proxy_fd_ent_t *bpfe = pfe->rfd_ent[i];
     /* A connection made under a backend TLS policy the listener has since
      * replaced takes no new stream: the streams on it finish there, this one
      * gets a connection made with the context in service. */
-    if (bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
+    if (!bridge_h1 && bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
         pfe->rfd[i] > 0 && !proxy_leg_tls_stale(ent, bpfe)) {
       slot = i;
       backend_fd = pfe->rfd[i];
@@ -4444,12 +4850,20 @@ h2_have_tepval:
   
   // Get or create backend HTTP/2 session
   // Pass backend_ssl (actual SSL connection) not ssl_epctx (SSL context)
-  backend_h2_session_t *backend_session = proxy_h2_get_backend_session(
-    pfe->h2_session, pfe, slot, ep_idx, tepval, backend_fd, backend_ssl);
+  backend_h2_session_t *backend_session = bridge_h1 ?
+    h2_h1_session_new(pfe->h2_session,slot,ep_idx,tepval,backend_fd,backend_ssl) :
+    proxy_h2_get_backend_session(pfe->h2_session,pfe,slot,ep_idx,tepval,backend_fd,backend_ssl);
   
   if (!backend_session) {
     log_error("[HTTP/2] stream %d: Failed to create backend HTTP/2 session for ep[%d]",
               stream->stream_id, ep_idx);
+    if (bridge_h1) {
+      if (backend_ssl) SSL_free(backend_ssl);
+      close(backend_fd);pfe->rfd[slot]=-1;
+      nghttp2_submit_rst_stream(pfe->h2_session->session,NGHTTP2_FLAG_NONE,
+                               stream->stream_id,NGHTTP2_INTERNAL_ERROR);
+      return 0;
+    }
     
     // Send error to client
     if (pfe->h2_session && pfe->h2_session->session) {
@@ -4487,7 +4901,9 @@ h2_have_tepval:
        * probe submits streams into a closed descriptor. */
       HASH_DEL(pfe->h2_session->backend_sessions, backend_session);
       proxy_h2_backend_session_destroy(backend_session);
+      if (bridge_h1 && backend_ssl) SSL_free(backend_ssl);
       close(backend_fd);
+      pfe->rfd[slot] = -1;
       return -1;
     }
     
@@ -4539,7 +4955,9 @@ h2_have_tepval:
        * kernel-recycled) descriptor number. */
       HASH_DEL(pfe->h2_session->backend_sessions, backend_session);
       proxy_h2_backend_session_destroy(backend_session);
+      if (bridge_h1 && backend_ssl) SSL_free(backend_ssl);
       close(backend_fd);
+      pfe->rfd[slot] = -1;
       return -1;
     }
   }
@@ -4581,6 +4999,11 @@ h2_have_tepval:
       nheaders = l7_n;
       l7_hdr_built = 1;
     }
+    if (bridge_h1 && !l7_hdr_built) {
+      backend_session->bridge_cancelled=1;shutdown(backend_fd,SHUT_RDWR);
+      nghttp2_submit_rst_stream(pfe->h2_session->session,NGHTTP2_FLAG_NONE,stream->stream_id,NGHTTP2_INTERNAL_ERROR);
+      return 0;
+    }
     /* On build failure (OOM) headers/nheaders stay the originals — fail-open to
      * the unmodified request rather than dropping it. */
   }
@@ -4612,6 +5035,20 @@ h2_have_tepval:
         stream->tenant_id, stream->auth_user_id);
     headers = security_headers_nv;
     security_headers_built = 1;
+  }
+
+  if (bridge_h1) {
+    int status=h2_h1_request(backend_session,stream,headers,nheaders);
+    free(security_headers_nv);
+    if (l7_hdr_built) proxy_h2_free_l7_req_headers(l7_headers_nv,&l7_hdr_ctx);
+    if (status) {
+      backend_session->bridge_cancelled=1;shutdown(backend_fd,SHUT_RDWR);
+      nghttp2_submit_rst_stream(pfe->h2_session->session,NGHTTP2_FLAG_NONE,stream->stream_id,NGHTTP2_INTERNAL_ERROR);
+      return 0; /* submit only; caller still owns its stream iteration */
+    }
+    if (backend_session->send_buffer_head)
+      proxy_notify_add_fd(backend_fd,NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP,pfe->rfd_ent[slot]);
+    return 0;
   }
 
   // Prepare data provider for request body (if present)

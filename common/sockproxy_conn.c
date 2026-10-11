@@ -54,6 +54,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_mcp_capture.h"
 #include "sockproxy_fe_limit.h"   /* connectionLimit unit release */
 #include "sockproxy_conn.h"
 #include "sockproxy_connect.h"
@@ -1460,6 +1461,8 @@ proxy_free_fd_ctx(proxy_fd_ent_t *pfe)
 #endif
     /* D2 root fix: recycle the shell into the pool (frees rcvbuf, bumps gen)
      * instead of free()ing it to the heap. */
+    sp_mcp_capture_free(pfe->mcp_capture);
+    pfe->mcp_capture = NULL;
     pfe_recycle(pfe);
   }
 }

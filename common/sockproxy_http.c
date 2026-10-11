@@ -57,6 +57,8 @@
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
+#define SP_MCP_PROXY_SELECTOR
+#include "sockproxy_mcp_rr.h"
 #include "sockproxy_fe_limit.h"   /* connectionLimit at accept */
 #include "sockproxy_fdlist.h"
 #include "sockproxy_metrics.h"
@@ -87,6 +89,7 @@
 #include "sockproxy_pd_leak.h"
 #include "sockproxy_stream_fallback.h"
 #include "sockproxy_admit_response.h"
+#include "sockproxy_mcp_capture.h"
 
 #ifdef HAVE_MTLS
 #include "sockproxy_mtls.h"
@@ -2818,11 +2821,12 @@ proxy_listener_revive(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeo
   }
 #endif
 
-  /* What the rule's backends speak decides what the listener offers. */
+  /* Modern MCP has a protocol bridge; keep both leg capabilities explicit. */
   ent->val.backend_protocol_cap = arg->backend_protocol_cap;
+  ent->val.frontend_protocol_cap = arg->mcp_stateless ? 2 : arg->backend_protocol_cap;
   if (nctx) {
-    SSL_CTX_set_alpn_select_cb(nctx, alpn_select_callback, &ent->val.backend_protocol_cap);
-    SSL_CTX_set_tlsext_servername_arg(nctx, &ent->val.backend_protocol_cap);
+    SSL_CTX_set_alpn_select_cb(nctx, alpn_select_callback, &ent->val.frontend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(nctx, &ent->val.frontend_protocol_cap);
   }
   __atomic_store_n(&ent->val.ssl_ctx, nctx, __ATOMIC_RELEASE);
   ent->val.have_ssl = arg->have_ssl;
@@ -3201,6 +3205,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
         tepval->path_match_mode = arg->path_match_mode;
 
+        tepval->mcp_stateless = arg->mcp_stateless;
+
         // Store custom header configuration
         if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
           tepval->session_header_enabled = 1;
@@ -3539,15 +3545,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   // Initialize backend protocol capability (default: HTTP/1.1 only for safety)
   node->val.backend_protocol_cap = arg->backend_protocol_cap;
+  node->val.frontend_protocol_cap = arg->mcp_stateless ? 2 : arg->backend_protocol_cap;
   node->val.sockmap_en = arg->sockmap_en;
 
-  // Configure ALPN callback with backend protocol capability
+  // Configure ALPN with frontend capability, preserving backend protocol selection
   if (ssl_ctx) {
-    SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.backend_protocol_cap);
-    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, &node->val.backend_protocol_cap);
-    const char *proto_str = (node->val.backend_protocol_cap == 0) ? "http/1.1 only" :
-                            (node->val.backend_protocol_cap == 1) ? "h2 only" : "h2+http/1.1";
-    log_info("[ALPN] Configured for backend capability: %s", proto_str);
+    SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.frontend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, &node->val.frontend_protocol_cap);
+    const char *proto_str = (node->val.frontend_protocol_cap == 0) ? "http/1.1 only" :
+                            (node->val.frontend_protocol_cap == 1) ? "h2 only" : "h2+http/1.1";
+    log_info("[ALPN] Configured frontend capability: %s", proto_str);
   }
 
   // P0.3: Initialize conversation tracking
@@ -3627,6 +3634,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->path_match_mode = arg->path_match_mode;
 
   // Store custom header configuration
+  tepval->mcp_stateless = arg->mcp_stateless;
   if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
     tepval->session_header_enabled = 1;
     strncpy(tepval->session_header_name, arg->session_header_name,
@@ -4040,7 +4048,7 @@ ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
     }
     /* Back in service: its admission ceiling ramps up over the pool's
      * warm-up window instead of taking a full share of a burst cold. */
-    if (tepval->ai_gw_mode)
+    if (tepval->ai_gw_mode || tepval->mcp_stateless)
       fc_ep_warm_start(&tepval->fc, ep_index, 0);
   }
 
@@ -4735,7 +4743,7 @@ proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
   PROXY_RDLOCK();
   for (ent = proxy_struct->head; ent && n < max; ent = ent->next) {
     HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-      if (!tepval->ai_gw_mode) {
+      if (!tepval->ai_gw_mode && !tepval->mcp_stateless) {
         continue;
       }
       if (n >= max) {
@@ -4850,7 +4858,7 @@ proxy_get_fc_inflight_total(void)
   PROXY_RDLOCK();
   for (ent = proxy_struct->head; ent; ent = ent->next) {
     HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-      if (tepval->ai_gw_mode) {
+      if (tepval->ai_gw_mode || tepval->mcp_stateless) {
         total += fc_inflight(&tepval->fc);
       }
     }
@@ -4920,7 +4928,7 @@ proxy_fc_drain_set(int on)
   PROXY_LOCK();
   for (ent = proxy_struct->head; ent; ent = ent->next) {
     HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-      if (!tepval->ai_gw_mode) {
+      if (!tepval->ai_gw_mode && !tepval->mcp_stateless) {
         continue;
       }
       drained += fc_queued(&tepval->fc);
@@ -5099,22 +5107,7 @@ proxy_set_circuit_breaker(proxy_ent_t *key, uint8_t enabled,
     if (cmp_proxy_ent(&ent->key, key)) {
       // Entry found - update circuit breaker config
       HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-        tepval->cb_enabled = enabled;
-
-        if (enabled) {
-          // Initialize circuit breakers for all endpoints
-          for (int i = 0; i < tepval->n_eps; i++) {
-            circuit_breaker_init(&tepval->circuit_breakers[i]);
-
-            // Apply custom thresholds if provided
-            if (failure_threshold > 0) {
-              tepval->circuit_breakers[i].failure_threshold = failure_threshold;
-            }
-            if (open_timeout_sec > 0) {
-              tepval->circuit_breakers[i].open_timeout_sec = open_timeout_sec;
-            }
-          }
-        }
+        circuit_breaker_configure_pool(tepval, enabled, failure_threshold, open_timeout_sec);
 
         PROXY_UNLOCK();
         return 0;
@@ -5861,6 +5854,11 @@ proxy_pdestroy(void *priv)
              pfe->fd, pfe->session_key, pfe->sticky_server_id, pfe->session_created);
   }
 
+  /* A fatal HUP can bypass the read/EOF path. Refuse only this unfinished
+   * bridge stream before entering PROXY_LOCK: framing and stream settling
+   * may re-enter control-plane locks through the client callbacks. */
+  proxy_h2_h1_backend_eof(pfe, 0);
+
   PROXY_LOCK();
   if (pfe) {
     PROXY_ENT_LOCK(pfe);
@@ -5885,6 +5883,7 @@ proxy_pdestroy(void *priv)
         }
       }
     }
+    proxy_h2_h1_backend_detach(pfe); /* isolate one bridge leg from its H2 client */
     ent = pfe->head;
     if (!ent) {
       assert(0);
@@ -8126,7 +8125,11 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
    * too (llb_conv_nat2proxy: pent->xport = nat_key->dport), so pass it as-is.
    * NEVER reintroduce `>> 16` here: it yields xport=0 and every fullproxy
    * connection gets an empty response. */
-  int psep_rc = proxy_setup_ep__(key->sip, (uint16_t)key->sport, (uint8_t)(protocol),
+  if (pfe->mcp_retry_pending) seltype = 0;
+  int psep_rc = pfe->mcp_retry_pending ?
+      proxy_setup_mcp_retry(pfe, &ep_sel, &tepval, &rid,
+                            (pp2len ? pp2buf : NULL), pp2len) :
+      proxy_setup_ep__(key->sip, (uint16_t)key->sport, (uint8_t)(protocol),
                        flt_url,
                        pfe->http_path_ok ? pfe->request_path : "/",  // P6: Pass request path
                        pfe->has_conv_id ? pfe->conversation_id : NULL,  // P0.3: Pass conversation ID
@@ -8502,6 +8505,8 @@ handle_on_message_begin(llhttp_t* parser)
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
     pfe->http_hdrs_done = 0;   /* request N+1's header block starts here */
+    pfe->mcp_retry_pending = 0;
+    pfe->mcp_retry_excluded = 0;
     /* Request N may have left an unsettled claim (no countable usage came
      * back, or its response was cut). Zeroing it here would strand it in the
      * quota store until the window rolls; release it so request N+1 on this
@@ -8891,6 +8896,7 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
    * a keep-alive connection can never accumulate units. */
   fc_permit_release(&pfe->fc);
   if (fc_active(&tepval->fc) &&
+      !(tepval->mcp_stateless && pfe->http_is_post) &&
       !fc_is_inference_request(pfe->http_is_post, pfe->request_path)) {
     fc_bypass(&tepval->fc, &pfe->fc);
     return 0;
@@ -8919,8 +8925,11 @@ sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel)
     return sel;                          /* off, bypassed, or already refused */
   if (pfe->fc.ep[FC_ROLE_PREFILL] >= 0 || pfe->fc.ep[FC_ROLE_DECODE] >= 0)
     return sel;                          /* a P/D request: its role legs hold the units */
+  sp_mcp_fc_scope mcp_scope={.pool=tepval,.request=pfe};
   ep = fc_ep_acquire_any(&tepval->fc, &pfe->fc, FC_ROLE_NORMAL, sel,
-                         tepval->n_eps, sp_fc_normal_eligible, tepval, &v);
+                         tepval->n_eps,
+                         tepval->mcp_stateless ? sp_mcp_fc_eligible : sp_fc_normal_eligible,
+                         tepval->mcp_stateless ? (void *)&mcp_scope : (void *)tepval, &v);
   if (ep < 0)
     return sp_fc_h1_refuse(pfe, tepval, v, FC_ROLE_NORMAL, 1);
   return ep;
@@ -8965,7 +8974,7 @@ sp_fc_warm_returning(proxy_epval_t *tepval, const proxy_ent_t *old_eps,
   uint64_t now;
   int n;
 
-  if (!tepval->ai_gw_mode || tepval->fc.cfg.warmup_ms == 0)
+  if ((!tepval->ai_gw_mode && !tepval->mcp_stateless) || tepval->fc.cfg.warmup_ms == 0)
     return;
   now = fc_now_ns();
   n = tepval->n_eps < FC_MAX_EP ? tepval->n_eps : FC_MAX_EP;
@@ -9331,6 +9340,119 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
   }
 }
 
+/* Explicit MCP mode validates before selecting a backend. */
+static int sp_mcp_enabled(const proxy_fd_ent_t *pfe)
+{
+  const proxy_map_ent_t *ent = pfe ? pfe->head : NULL;
+  return pfe && pfe->odir == 0 && ent && ent->val.ephash && ent->val.ephash->mcp_stateless;
+}
+static int sp_mcp_h1_refuse(proxy_fd_ent_t *pfe, int status)
+{
+  static const char body[] = "{\"error\":\"mcp_request_refused\"}\r\n";
+  char response[320];
+  const char *reason = status == 405 ? "Method Not Allowed" : status == 413 ? "Content Too Large" :
+                       status == 503 ? "Service Unavailable" : "Bad Request";
+  int n = snprintf(response, sizeof(response),
+      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+      "%sConnection: close\r\n\r\n%s", status, reason, sizeof(body)-1,
+      status == 405 ? "Allow: POST\r\n" : "", body);
+  pfe->ai_gw_denied = 1; /* Never enter llhttp's raw-relay fallback. */
+  pfe->lb_err_body_sent = 1;
+  if (n > 0 && (size_t)n < sizeof(response))
+    proxy_send_local_response_and_shutdown(pfe, response, (size_t)n);
+  else shutdown(pfe->fd, SHUT_RDWR);
+  return -1;
+}
+static int sp_mcp_h1_body(llhttp_t *parser, const char *at, size_t len)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe = settings ? settings->uarg : NULL;
+  if (!sp_mcp_enabled(pfe)) return 0;
+  int status = sp_mcp_capture_body(pfe->mcp_capture, at, len);
+  return status ? sp_mcp_h1_refuse(pfe, status) : 0;
+}
+static int sp_mcp_h1_headers(proxy_fd_ent_t *pfe, llhttp_t *parser)
+{
+  struct phr_header headers[256];
+  size_t nh = sizeof(headers)/sizeof(headers[0]), ml, pl;
+  const char *method, *path; int minor;
+  if (!pfe->mcp_capture) {
+    pfe->mcp_capture = calloc(1, sizeof(*pfe->mcp_capture));
+    if (!pfe->mcp_capture) return sp_mcp_h1_refuse(pfe, 503);
+  }
+  sp_mcp_capture_reset(pfe->mcp_capture);
+  if (parser->method != HTTP_POST) return sp_mcp_h1_refuse(pfe, 405);
+  if (pfe->http_content_length > SP_MCP_PROXY_BODY_MAX) return sp_mcp_h1_refuse(pfe, 413);
+  int off = phr_parse_request((const char *)pfe->rcvbuf, pfe->rcv_off,
+      &method, &ml, &path, &pl, &minor, headers, &nh, 0);
+  if (off < 0 || (size_t)off > 128U*1024U) return sp_mcp_h1_refuse(pfe, 400);
+  if (pl >= sizeof(pfe->url_path)) return sp_mcp_h1_refuse(pfe, 413);
+  memcpy(pfe->url_path,path,pl); pfe->url_path[pl]=0;
+  size_t path_len=0;
+  while (path_len<pl && path[path_len]!='?') path_len++;
+  if (path_len>=sizeof(pfe->request_path)) return sp_mcp_h1_refuse(pfe, 413);
+  memcpy(pfe->request_path,path,path_len); pfe->request_path[path_len]=0;
+  pfe->http_path_ok=pfe->http_is_post=1;
+  pfe->host_url[0]=0;
+  unsigned host_count=0;
+  /* Full fields avoid split llhttp name/value callbacks and prefix matches. */
+  pfe->n_l7_headers = 0;
+  struct sp_mcp_media media = {0};
+  proxy_map_ent_t *head = pfe->head;
+  if (head->has_l7_policy && nh > L7_MAX_CAPTURED_HEADERS) return sp_mcp_h1_refuse(pfe, 413);
+  for (size_t i=0; i<nh; i++) {
+    if (!headers[i].name) return sp_mcp_h1_refuse(pfe, 400);
+    /* MCP-Name is validated and normalized after decoding the full body;
+     * its encoded wire value may be longer than its representable L7 value. */
+    int mirrored_name=headers[i].name_len==8 &&
+      !strncasecmp(headers[i].name,"mcp-name",8);
+    if (head->has_l7_policy &&
+        (headers[i].name_len>=L7_HDR_NAME_MAX ||
+         (!mirrored_name && headers[i].value_len>=L7_HDR_VALUE_MAX)))
+      return sp_mcp_h1_refuse(pfe,413);
+    if (headers[i].name_len==4 && !strncasecmp(headers[i].name,"host",4)) {
+      if (++host_count!=1 || !headers[i].value_len || headers[i].value_len>=sizeof(pfe->host_url))
+        return sp_mcp_h1_refuse(pfe,400);
+      memcpy(pfe->host_url,headers[i].value,headers[i].value_len);
+      pfe->host_url[headers[i].value_len]=0;
+    }
+    sp_mcp_media_header(&media, headers[i].name, headers[i].name_len, headers[i].value, headers[i].value_len);
+    sp_mcp_header(&pfe->mcp_capture->req, headers[i].name, headers[i].name_len,
+                  headers[i].value, headers[i].value_len);
+    l7_store_header_n(pfe, NULL, headers[i].name, headers[i].name_len,
+                      headers[i].value, headers[i].value_len);
+  }
+  if (host_count!=1 || !sp_mcp_media_valid(&media)) return sp_mcp_h1_refuse(pfe, 400);
+  pfe->http_hok=pfe->http_hvok=1;
+  if (pfe->mcp_capture->req.error) return sp_mcp_h1_refuse(pfe, pfe->mcp_capture->req.error);
+  /* The body is withheld for validation; unblock Expect clients locally. */
+  return proxy_send_local_100_continue(pfe);
+}
+static int sp_mcp_h1_complete(proxy_fd_ent_t *pfe, llhttp_t *parser)
+{
+  struct sp_mcp_capture *c = pfe->mcp_capture;
+  if (!c) return sp_mcp_h1_refuse(pfe, 400);
+  int status = sp_mcp_validate(&c->req, llhttp_method_name(parser->method), c->body, c->len);
+  if (status) return sp_mcp_h1_refuse(pfe, status);
+  proxy_map_ent_t *ent = pfe->head;
+  if (ent->has_l7_policy) {
+    if (c->req.name_len >= L7_HDR_VALUE_MAX || memchr(c->req.name, 0, c->req.name_len))
+      return sp_mcp_h1_refuse(pfe, 413);
+    int method_found=0, name_found=!c->req.name_seen;
+    for (uint16_t i=0; i<pfe->n_l7_headers; i++) {
+      if (!strcasecmp(pfe->l7_headers[i].name, "mcp-method")) method_found=1;
+      if (!strcasecmp(pfe->l7_headers[i].name, "mcp-name")) {
+        memcpy(pfe->l7_headers[i].value, c->req.name, c->req.name_len);
+        pfe->l7_headers[i].value[c->req.name_len]=0; name_found=1;
+      }
+    }
+    if (!method_found || !name_found) return sp_mcp_h1_refuse(pfe, 413);
+  }
+  pfe->has_conv_id = pfe->has_custom_session_header = pfe->has_user_id = 0;
+  atomic_store_explicit(&pfe->mcp_inflight, 1, memory_order_release);
+  return 0;
+}
+
 static int
 handle_on_headers_complete(llhttp_t* parser)
 {
@@ -9346,6 +9468,7 @@ handle_on_headers_complete(llhttp_t* parser)
    * which is the first line every HTTP/1.1 client -- and every slowloris --
    * sends. */
   pfe->http_hdrs_done = 1;
+  if (sp_mcp_enabled(pfe)) return sp_mcp_h1_headers(pfe, parser);
   return 0;                          /* 0: parse the body that follows */
 }
 
@@ -9360,6 +9483,7 @@ handle_on_message_complete(llhttp_t* parser)
 
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
+  if (sp_mcp_enabled(pfe) && sp_mcp_h1_complete(pfe, parser)) return -1;
   // L7 Metrics: capture request start timestamp for TTFB. Kept independent of
   // HAVE_HTTP_TRACE — the metric_* fields and record_latency_sample() are always
   // compiled (see sockproxy.h "L7 Metrics (independent of Jaeger tracing)"), so
@@ -9829,7 +9953,7 @@ handle_on_message_complete(llhttp_t* parser)
 #ifdef HAVE_PROXY_EXTRA_DEBUG
 	log_debug("http completed %p!\n", settings->uarg);
 #endif
-	return 0;
+	return sp_mcp_enabled(pfe) ? HPE_PAUSED : 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -10251,6 +10375,11 @@ cresp_on_message_complete(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
 
   if (pfe && cresp_is_answer(parser->status_code)) {
+    /* Capture ownership survives a policy change and names modern H1
+     * requests independently of the AI accounting marker. Release execution
+     * before admitting the client's next request; the framer holds its lock. */
+    if (pfe->mcp_capture) fc_permit_release(&pfe->fc);
+    atomic_store_explicit(&pfe->mcp_inflight, 0, memory_order_release);
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     hc_resp_done(pfe);
@@ -10268,6 +10397,7 @@ cresp_on_message_complete(llhttp_t *parser)
 static void
 cresp_note_local_answer(proxy_fd_ent_t *client)
 {
+  atomic_store_explicit(&client->mcp_inflight, 0, memory_order_release);
   (void)cresp_head_pop(client);
   atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
 }
@@ -10332,6 +10462,16 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
    * without the entry lock the framer holds: only the caller that actually
    * clears it counts the completion, so two legs closing cannot count one
    * response twice. */
+  if (client->mcp_capture) {
+    /* EOF also ends execution when a final HTTP boundary never arrived.
+     * This backend-worker site normally has no client-entry lock. */
+    PROXY_ENT_LOCK(client);
+    fc_permit_release(&client->fc);
+    atomic_store_explicit(&client->mcp_inflight, 0, memory_order_release);
+    PROXY_ENT_UNLOCK(client);
+  } else {
+    atomic_store_explicit(&client->mcp_inflight, 0, memory_order_release);
+  }
   if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     hc_resp_done(client);
@@ -10363,6 +10503,9 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
 
   pfe = settings->uarg;
   assert(pfe);
+  /* Trailers must never replace already-validated routing operands. */
+  if (sp_mcp_enabled(pfe) && (parser->flags & F_TRAILING))
+    return sp_mcp_h1_refuse(pfe, 400);
 
   if (length >= sizeof(str)-1) {
     return 0;
@@ -11111,6 +11254,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   llhttp_settings_init(&npfe1->settings);
   npfe1->settings.on_message_begin = handle_on_message_begin;
   npfe1->settings.on_headers_complete = handle_on_headers_complete;
+  npfe1->settings.on_body = sp_mcp_h1_body;
   npfe1->settings.on_message_complete = handle_on_message_complete;
   npfe1->settings.on_header_field = handle_header_name;
   npfe1->settings.on_header_value = handle_header_val;
@@ -11228,7 +11372,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * own service and endpoint units before a byte rides the leg. A
      * refusal is answered on the client socket and closes the connection
      * (the leg goes with it). */
-    if (pfe->epv && ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+    if (pfe->epv && (((proxy_epval_t *)pfe->epv)->ai_gw_mode ||
+                     ((proxy_epval_t *)pfe->epv)->mcp_stateless)) {
       proxy_epval_t *ka_epv = (proxy_epval_t *)pfe->epv;
       int g = sp_fc_h1_gate_service(pfe, ka_epv);
       if (g == 0)
@@ -11308,7 +11453,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * accumulated bodies are left untouched (not contiguous/complete
      * here); non-streaming requests carry usage without the flag. */
     if (pfe->epv && pfe->odir == 0 && pfe->rcv_off > 4 && !pfe->is_streamable &&
-        ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+        ((proxy_epval_t *)pfe->epv)->ai_gw_mode &&
+        !((proxy_epval_t *)pfe->epv)->mcp_stateless) {
       size_t ug_scan = pfe->rcv_off < 2048 ? pfe->rcv_off : 2048;
       if (memmem(pfe->rcvbuf, ug_scan, "Transfer-Encoding: chunked", 26) == NULL &&
           memmem(pfe->rcvbuf, ug_scan, "transfer-encoding: chunked", 26) == NULL) {
@@ -11900,10 +12046,24 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
   int protocol = 0;
   int epprotocol = 0;
   int err;
+  int preconnect_error = 0;
+  socklen_t error_len = sizeof(preconnect_error);
+  /* SO_ERROR proves handshake failure before any HTTP bytes are forwarded.
+   * A successful connection that later closes is never replayed. */
+  if (epv && epv->mcp_stateless) {
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &preconnect_error, &error_len) != 0)
+    preconnect_error = errno;
+  if (!preconnect_error && (type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != 0)
+      preconnect_error = ETIMEDOUT;
+  }
+  }
 
   proxy_connect_pending_clear(pfe);
 
-  err = proxy_setup_ep_connect_complete(fd, pfe->connect_pp2_len ? pfe->connect_pp2 : NULL,
+  err = preconnect_error ? preconnect_error : proxy_setup_ep_connect_complete(fd, pfe->connect_pp2_len ? pfe->connect_pp2 : NULL,
                                         pfe->connect_pp2_len);
   if (err == 0 && (type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
     /* No socket error but the leg is gone: the backstop's shutdown. */
@@ -11926,6 +12086,30 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
       circuit_breaker_record_failure(epv, client->ep_num);
     } else {
       log_error("connect backend fd=%d(%s)", fd, strerror(err));
+    }
+    /* A reset can follow a successful accept before the event is consumed.
+     * Restrict replay to unambiguous handshake failures, never ECONNRESET. */
+    if ((preconnect_error == ECONNREFUSED || preconnect_error == ETIMEDOUT ||
+         preconnect_error == ENETUNREACH || preconnect_error == EHOSTUNREACH) &&
+        client && client->fd > 0 && epv &&
+        epv->mcp_stateless && client->ep_num >= 0 &&
+        client->ep_num < epv->n_eps && client->ep_num < MAX_PROXY_EP) {
+      client->mcp_retry_excluded |= UINT32_C(1) << client->ep_num;
+      client->mcp_retry_pending = 1;
+      /* Both legs have the same notifier owner. Detach the failed leg and
+       * keep the client request buffer + service permit intact. Its deferred
+       * destroy sees no client peer; the stale event generation cannot destroy
+       * a newly registered replacement. */
+      proxy_release_rfd_ctx(client);
+      client->connect_wait = 0;
+      client->read_paused = 0;
+      sp_notify_arm(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
+                    client, client->gen);
+      const char *phurl = client->http_hvok ? client->host_url : NULL;
+      int rc = pd_setup_and_forward(client->fd, client, &key, &rkey, phurl);
+      if (rc == SP_FWD_RESTART)
+        notify_delete_ent(proxy_struct->ns, client->fd, 0);
+      return 0;
     }
     if (client && client->fd > 0) {
       static const char lb_502[] =
@@ -12172,6 +12356,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       break;
     }
 
+    if (rc<=0 && pfe->backend_h2_session &&
+        ((backend_h2_session_t *)pfe->backend_h2_session)->bridge_h1) {
+      proxy_h2_h1_backend_eof(pfe,rc==0); /* reset is not a valid close delimiter */
+      return -1;
+    }
+
     errno = saved_errno;  // Restore errno before error checking
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -12309,6 +12499,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * the P/D arm, this assumes the client does not pipeline request N+1
        * before N's response drains. */
       int ai_gw_boundary = 0;
+      int mcp_boundary = sp_mcp_enabled(pfe);
+      if (mcp_boundary && atomic_load_explicit(&pfe->mcp_inflight, memory_order_acquire))
+        return sp_mcp_h1_refuse(pfe, 400);
       if (pfe->head) {
         proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
         if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode &&
@@ -12322,7 +12515,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                    "request (n_rfd=%d rfd0=%d) — reframe",
                    pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
-        } else if (ai_gw_boundary) {
+        } else if (mcp_boundary || ai_gw_boundary) {
           log_trace("[KA_FIX] fd=%d gate re-arm on live backend leg "
                     "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           pfe->ka_reparse = 1;
@@ -12438,6 +12631,13 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         enum llhttp_errno err = llhttp_execute(&pfe->parser,
                                 (char *)pfe->rcvbuf + pfe->parsed_off, to_parse);
 
+        if (sp_mcp_enabled(pfe) && err == HPE_PAUSED) {
+          const char *end = llhttp_get_error_pos(&pfe->parser);
+          if (end != (const char *)pfe->rcvbuf + pfe->rcv_off)
+            return sp_mcp_h1_refuse(pfe, 400); /* pipelining refused before any delivery */
+          llhttp_resume(&pfe->parser); err = HPE_OK;
+        }
+
         // Update how much we've parsed
         pfe->parsed_off = pfe->rcv_off;
 
@@ -12445,7 +12645,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
          * An oversize JSON request deliberately spans another read while we
          * wait for its body model, so restore the already-proven header state
          * for that continuation read. */
-        if (json_stream_was_pending) {
+        if (json_stream_was_pending || (sp_mcp_enabled(pfe) && pfe->http_hdrs_done)) {
           pfe->http_hok = 1;
           pfe->http_hvok = pfe->host_url[0] != '\0';
         }
@@ -12502,7 +12702,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           //                application/octet-stream, image/*, video/*, application/pdf, etc.
           // 
           // Detection: Check if Content-Type is one of the types that needs buffering
-          int needs_body_inspection = 0;
+          int needs_body_inspection = sp_mcp_enabled(pfe);
           if (pfe->http_hok && pfe->rcv_off >= 100) {
             size_t search_len = (pfe->rcv_off < 2048) ? pfe->rcv_off : 2048;
             // Only these types require full body buffering for routing logic
@@ -12523,7 +12723,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // other KV miss path. Requires Content-Length (chunked TE has none;
           // those already skip inspection via the content_length==0 gate).
           int json_stream_fallback = pfe->json_stream_route_pending;
-          if (needs_body_inspection &&
+          if (!sp_mcp_enabled(pfe) && needs_body_inspection &&
               pfe->http_content_length > SP_JSON_INSPECT_MAX) {
             if (!pfe->json_stream_route_pending) {
               log_debug("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
@@ -12614,7 +12814,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
             // P0.2: Extract LLM prefix from JSON body
             // SKIP for streamable content - only inspect JSON/form data
-            if (!pfe->is_streamable && pfe->http_content_length > 0 && pfe->rcv_off > 0) {
+            if (!sp_mcp_enabled(pfe) && !pfe->is_streamable && pfe->http_content_length > 0 && pfe->rcv_off > 0) {
               // Find start of body (after headers)
               // The parser has consumed headers, body starts at current parse position
               // For llhttp, we need to find body start by looking for "\r\n\r\n"
@@ -12763,7 +12963,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                   proxy_leg_tls_stale((proxy_map_ent_t *)pfe->head,
                                                       pfe->rfd_ent[0])),
               };
-              if (ka_leg_reusable(&ka_ctx, &ka_reason)) {
+              if (!sp_mcp_enabled(pfe) && ka_leg_reusable(&ka_ctx, &ka_reason)) {
                 pfe->ka_keep_leg = 1;
                 log_trace("[KA_FIX] fd=%d keeping backend leg fd=%d ep=%d",
                           pfe->fd, pfe->rfd[0], pfe->ep_num);
@@ -12822,6 +13022,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             // With 1MB buffer, this gives 972KB usable space before overflow protection
             // Early backend connection (at 512KB) should prevent reaching this threshold
             if (pfe->rcv_off >= (SP_SOCK_MSG_LEN * 95 / 100)) {
+              if (sp_mcp_enabled(pfe)) return sp_mcp_h1_refuse(pfe,413);
               /* On an AI-gateway service the client gets a deterministic
                * answer before the reset: a chunked (or length-less) body
                * that outgrows the buffer is refused 413, not cut mid-upload
@@ -12889,7 +13090,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           {
             proxy_map_ent_t *perr_head = (proxy_map_ent_t *)pfe->head;
             if (pfe->odir == 0 && perr_head && perr_head->val.ephash &&
-                perr_head->val.ephash->ai_gw_mode) {
+                (perr_head->val.ephash->ai_gw_mode || perr_head->val.ephash->mcp_stateless)) {
+              if (sp_mcp_enabled(pfe)) return sp_mcp_h1_refuse(pfe, 400);
               static const char smuggle_400[] =
                 "HTTP/1.1 400 Bad Request\r\n"
                 "Content-Type: application/json\r\n"

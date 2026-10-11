@@ -53,6 +53,7 @@
 #include "sockproxy_ai_admit.h"   /* the refusal record of a request ended while it waited */
 #include "sockproxy_conn.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
+static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
 #include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
 #include "sockproxy_ai_gw.h"
@@ -839,13 +840,16 @@ check_draining_endpoints(void)
          * under PROXY_LOCK). Mirrors the transition at :797-799 exactly. */
         if (tepval->cb_enabled) {
           circuit_breaker_t *cb = &tepval->circuit_breakers[ep_idx];
+          circuit_breaker_lock();
           time_t open_for = now - cb->open_ts;  /* captured before the transition for the log */
-          if (circuit_breaker_proactive_heal(cb, now)) {
+          uint32_t open_timeout = cb->open_timeout_sec;
+          circuit_breaker_unlock();
+          if (circuit_breaker_heal_guarded(cb, now)) {
             atomic_fetch_add(&global_stats.pd_cb_flips, 1);          /* OBS-03: OPEN->HALF_OPEN */
             atomic_fetch_add(&global_stats.pd_cb_proactive_heal, 1); /* : health-pass heal */
             log_info("[CB heal] ep[%d] OPEN->HALF_OPEN driven by 1Hz health pass "
                      "(open %lds >= %us) — EP re-enters rotation, next relay success closes it",
-                     ep_idx, (long)open_for, cb->open_timeout_sec);
+                     ep_idx, (long)open_for, open_timeout);
           }
         }
       }
@@ -1611,24 +1615,85 @@ check_draining_endpoints(void)
 }
 
 
+/* Global -> CB is the only nested order. Transition callbacks run after
+ * releasing this dedicated guard, so parked-client drains may reenter it. */
+static pthread_mutex_t cb_transition_lock = PTHREAD_MUTEX_INITIALIZER;
+void circuit_breaker_lock(void) { pthread_mutex_lock(&cb_transition_lock); }
+void circuit_breaker_unlock(void) { pthread_mutex_unlock(&cb_transition_lock); }
+static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now)
+{
+  circuit_breaker_lock();
+  int changed = circuit_breaker_proactive_heal(cb, now);
+  circuit_breaker_unlock();
+  return changed;
+}
+int circuit_breaker_candidate(proxy_epval_t *pool, int ep)
+{
+  if (!pool || ep < 0 || ep >= pool->n_eps || ep >= MAX_PROXY_EP) return 0;
+  if (!pool->cb_enabled) return 1;
+  circuit_breaker_t *cb = &pool->circuit_breakers[ep];
+  circuit_breaker_lock();
+  int allow = cb->state == CB_STATE_CLOSED ||
+      (cb->state == CB_STATE_OPEN && time(NULL)-cb->open_ts >= cb->open_timeout_sec) ||
+      (cb->state == CB_STATE_HALF_OPEN && cb->half_open_requests < cb->half_open_max_requests);
+  circuit_breaker_unlock();
+  return allow;
+}
+static void circuit_breaker_trip_actions(proxy_epval_t *pool, int ep, const char *reason)
+{
+  if (pool->pd_trie) {
+    pthread_rwlock_wrlock(&pool->pd_trie_lock);
+    pd_trie_remove_ep(pool->pd_trie, ep);
+    pthread_rwlock_unlock(&pool->pd_trie_lock);
+  }
+  pd_parked_drain_ep(pool, ep, reason);
+}
+
 // P2 Task 2.3: Initialize circuit breaker for an endpoint
-void
-circuit_breaker_init(circuit_breaker_t *cb)
+static void
+circuit_breaker_init_locked(circuit_breaker_t *cb)
 {
   if (!cb) return;
   
-  memset(cb, 0, sizeof(*cb));
+  /* Atomic state readers must not race a bytewise reset. */
+  cb->failure_count = cb->success_count = cb->half_open_requests = 0;
+  cb->last_failure_ts = cb->open_ts = 0;
+  cb->origin_err_streak = cb->origin_tripped = 0;
   cb->state = CB_STATE_CLOSED;
   cb->failure_threshold = 5;      // Default: 5 consecutive failures
   cb->success_threshold = 1;       // Default: 1 success in HALF_OPEN to close
   cb->open_timeout_sec = 30;       // Default: 30 seconds
   cb->half_open_max_requests = 3;  // Default: 3 test requests in HALF_OPEN
 }
+void circuit_breaker_init(circuit_breaker_t *cb)
+{
+  circuit_breaker_lock();
+  circuit_breaker_init_locked(cb);
+  circuit_breaker_unlock();
+}
+/* Live configuration is one transaction, including enabled publication.
+ * Never expose zero/default thresholds between reset and customization. */
+void circuit_breaker_configure_pool(proxy_epval_t *pool, uint8_t enabled,
+                                   uint32_t failure_threshold, uint32_t open_timeout_sec)
+{
+  if (!pool) return;
+  circuit_breaker_lock();
+  if (enabled) {
+    for (int i=0; i<pool->n_eps && i<MAX_PROXY_EP; i++) {
+      circuit_breaker_t *cb=&pool->circuit_breakers[i];
+      circuit_breaker_init_locked(cb);
+      if (failure_threshold) cb->failure_threshold=failure_threshold;
+      if (open_timeout_sec) cb->open_timeout_sec=open_timeout_sec;
+    }
+  }
+  pool->cb_enabled=enabled;
+  circuit_breaker_unlock();
+}
 
 // P2 Task 2.3: Check if circuit breaker should skip this endpoint
 // Returns: 1 = skip endpoint, 0 = allow traffic
-int
-circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
+static int
+circuit_breaker_should_skip_locked(proxy_epval_t *tepval, int ep_index)
 {
   circuit_breaker_t *cb;
   time_t now = time(NULL);
@@ -1648,7 +1713,7 @@ circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
     // Check if timeout expired → transition to HALF_OPEN
     if (now - cb->open_ts >= cb->open_timeout_sec) {
       cb->state = CB_STATE_HALF_OPEN;
-      cb->half_open_requests = 0;
+      cb->half_open_requests = 1; /* The timeout winner consumes a probe too. */
       cb->success_count = 0;
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: OPEN→HALF_OPEN */
       return 0;  // Allow testing in HALF_OPEN
@@ -1668,18 +1733,29 @@ circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
   return 0;
 }
 
+int circuit_breaker_should_skip(proxy_epval_t *pool, int ep)
+{
+  if (!pool || ep < 0 || ep >= pool->n_eps || ep >= MAX_PROXY_EP) return 1;
+  circuit_breaker_lock();
+  int skip = circuit_breaker_should_skip_locked(pool, ep);
+  circuit_breaker_unlock();
+  return skip;
+}
+
 // P2 Task 2.3: Record connection failure for circuit breaker
 void
 circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
 {
   circuit_breaker_t *cb;
+  int tripped = 0;
   time_t now = time(NULL);
   
-  if (!tepval || !tepval->cb_enabled || ep_index >= MAX_PROXY_EP) {
+  if (!tepval || !tepval->cb_enabled || ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   cb->last_failure_ts = now;
   
   switch (cb->state) {
@@ -1693,14 +1769,7 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: CLOSED→OPEN */
       log_info("Circuit breaker CLOSED → OPEN - ep[%d], %u failures",
                ep_index, cb->failure_count);
-      /* remove tripped EP from trie */
-      if (tepval->pd_trie) {
-        pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-        pd_trie_remove_ep(tepval->pd_trie, ep_index);
-        pthread_rwlock_unlock(&tepval->pd_trie_lock);
-      }
-      /* release clients parked on the tripped EP for re-selection */
-      pd_parked_drain_ep(tepval, ep_index, "cb-open");
+      tripped = 1;
     }
     break;
     
@@ -1712,20 +1781,15 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
     atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: HALF_OPEN→OPEN */
     log_info("Circuit breaker HALF_OPEN → OPEN - ep[%d], recovery failed",
              ep_index);
-    /* remove tripped EP from trie */
-    if (tepval->pd_trie) {
-      pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-      pd_trie_remove_ep(tepval->pd_trie, ep_index);
-      pthread_rwlock_unlock(&tepval->pd_trie_lock);
-    }
-    /* release clients parked on the tripped EP for re-selection */
-    pd_parked_drain_ep(tepval, ep_index, "cb-open");
+    tripped = 1;
     break;
     
   case CB_STATE_OPEN:
     // Already open - no action needed
     break;
   }
+  circuit_breaker_unlock();
+  if (tripped) circuit_breaker_trip_actions(tepval, ep_index, "cb-open");
 }
 
 // P2 Task 2.3: Record connection success for circuit breaker
@@ -1734,11 +1798,12 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
 {
   circuit_breaker_t *cb;
   
-  if (!tepval || !tepval->cb_enabled || ep_index >= MAX_PROXY_EP) {
+  if (!tepval || !tepval->cb_enabled || ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   
   switch (cb->state) {
   case CB_STATE_CLOSED:
@@ -1778,6 +1843,7 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
     // Success in OPEN state shouldn't happen, but log it
     break;
   }
+  circuit_breaker_unlock();
 }
 
 /* Origin-error demotion threshold: consecutive origin 5xx responses from a
@@ -1787,7 +1853,7 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
 static int
 pd_origin_err_threshold(void)
 {
-  static int thr = -1;
+  static _Atomic int thr = -1;
   if (thr < 0) {
     const char *env = getenv("LLB_PD_ORIGIN_ERR_THRESHOLD");
     thr = env ? atoi(env) : PD_ORIGIN_ERR_THRESHOLD_DEFAULT;
@@ -1812,28 +1878,24 @@ circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index)
   int thr = pd_origin_err_threshold();
 
   if (!tepval || !tepval->cb_enabled || thr <= 0 ||
-      ep_index < 0 || ep_index >= MAX_PROXY_EP) {
+      ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   if (!circuit_breaker_origin_note_error(cb, thr)) {
+    circuit_breaker_unlock();
     return;
   }
   cb->state = CB_STATE_OPEN;
   cb->open_ts = time(NULL);
   cb->last_failure_ts = cb->open_ts;
   cb->failure_count = cb->failure_threshold;
+  circuit_breaker_unlock();
   atomic_fetch_add(&global_stats.pd_cb_flips, 1);
   log_warn("[CB_ORIGIN] ep[%d] -> OPEN after %d consecutive origin 5xx — "
            "demoted from selection and KV affinity", ep_index, thr);
-  /* remove tripped EP from trie */
-  if (tepval->pd_trie) {
-    pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-    pd_trie_remove_ep(tepval->pd_trie, ep_index);
-    pthread_rwlock_unlock(&tepval->pd_trie_lock);
-  }
-  /* release clients parked on the tripped EP for re-selection */
-  pd_parked_drain_ep(tepval, ep_index, "cb-origin-open");
+  circuit_breaker_trip_actions(tepval, ep_index, "cb-origin-open");
 }
 
 /* Record an origin success (status < 400) from a backend leg: the
@@ -1847,10 +1909,11 @@ circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
   circuit_breaker_t *cb;
 
   if (!tepval || !tepval->cb_enabled ||
-      ep_index < 0 || ep_index >= MAX_PROXY_EP) {
+      ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   if (circuit_breaker_origin_note_success(cb)) {
     cb->state = CB_STATE_CLOSED;
     cb->failure_count = 0;
@@ -1861,6 +1924,7 @@ circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
     log_info("[CB_ORIGIN] ep[%d] HALF_OPEN->CLOSED on origin success — "
              "fully back in rotation", ep_index);
   }
+  circuit_breaker_unlock();
 }
 
 // ============================================================================

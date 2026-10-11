@@ -105,7 +105,8 @@ alpn_select_callback(SSL *ssl,
                       unsigned int inlen,
                       void *arg)
 {
-  // Extract backend protocol capability from arg (passed from SSL_CTX_set_alpn_select_cb)
+  // Extract frontend protocol capability from the listener. Modern MCP may
+  // advertise H2 while its independent backend leg uses HTTP/1.1.
   uint8_t *backend_cap_ptr = (uint8_t *)arg;
   uint8_t backend_cap = backend_cap_ptr ? *backend_cap_ptr : 2;  // Default: h2+http/1.1
   pthread_once(&alpn_conn_once, alpn_conn_index_init);

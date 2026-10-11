@@ -250,6 +250,7 @@ typedef struct {
  * ------------------------------------------------------------------------- */
 typedef struct {
   l7_action_kind_t kind;
+  int route_index; /* Index of matched installed route for runtime cursors. */
   union {
     l7_forward_t  fwd;
     l7_redirect_t redir;

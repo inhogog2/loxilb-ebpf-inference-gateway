@@ -8,6 +8,7 @@
 
 #include <string.h>  /* strncpy/memset — needed by the static-inline l7_store_header helpers below */
 #include <stdint.h>
+#include "sockproxy_mcp_rr.h"
 #include <stdatomic.h>  /* D2 root fix: _Atomic gen stamp on proxy_fd_ent */
 
 #include "llhttp.h"
@@ -487,7 +488,7 @@ typedef enum {
 
 // P2 Task 2.3: Circuit breaker per endpoint
 typedef struct circuit_breaker {
-  circuit_breaker_state_t state;   // Current circuit state
+  _Atomic circuit_breaker_state_t state; // Raw P/D state snapshots remain race free
   uint32_t failure_count;          // Consecutive failures in CLOSED state
   uint32_t success_count;          // Successes in HALF_OPEN state
   time_t last_failure_ts;          // Timestamp of last failure
@@ -575,6 +576,8 @@ typedef struct proxy_epval {
   int main_fd;
   int n_eps;
   int ep_sel;
+  sp_mcp_selector_state mcp_selector;
+  _Atomic uint64_t mcp_rr_ticket; /* Modern request-level RR, shared by H1/H2. */
   int select;
   proxy_ent_t eps[MAX_PROXY_EP];
   proxy_epstat_t ep_stats[MAX_PROXY_EP];
@@ -591,7 +594,7 @@ typedef struct proxy_epval {
   
   // P2 Task 2.3: Circuit breaker support
   circuit_breaker_t circuit_breakers[MAX_PROXY_EP]; // Circuit breaker per endpoint
-  uint8_t cb_enabled;                               // 1 = enabled, 0 = disabled
+  _Atomic uint8_t cb_enabled;                       // 1 = enabled, 0 = disabled
   
   // P3: WRR support (Weighted Round-Robin)
   int wrr_current_weights[MAX_PROXY_EP];  // Current weight counters for smooth WRR
@@ -607,6 +610,7 @@ typedef struct proxy_epval {
   // Custom header-based session stickiness configuration
   char session_header_name[128];  // e.g., "mcp-session-id", "x-session-token", "authorization"
   uint8_t session_header_enabled;  // 1=enabled, 0=disabled (use IP-based)
+  uint8_t mcp_stateless; /* Explicit MCP 2026-07-28 validation and per-request selection. */
 
   // SSE (Server-Sent Events) streaming configuration per service rule
   uint8_t  sse_mode;                // 1=SSE mode enabled, 0=disabled
@@ -787,6 +791,7 @@ typedef struct proxy_val {
   // 1 = HTTP/2 only
   // 2 = Both HTTP/1.1 and HTTP/2 (backend auto-negotiates)
   uint8_t backend_protocol_cap;
+  uint8_t frontend_protocol_cap; /* MCP bridge decouples frontend ALPN from backend protocol. */
   // sockmap acceleration mode (dp_proxy_tacts.sockmap_en):
   // 0=off, 1=both, 2=request-only, 3=response-only
   uint8_t sockmap_en;
@@ -838,6 +843,8 @@ typedef struct proxy_map_ent {
   // sockproxy.h free of the l7policy IR dependency; sockproxy_l7policy.c casts it
   // to (const l7_route_t *) before calling l7_policy_evaluate.
   uint8_t has_l7_policy;            // 1 => an L7_POLICY is attached ( discriminator)
+  sp_mcp_selector_state mcp_l7_selector[256];
+  _Atomic uint64_t mcp_l7_rr_ticket[256]; /* Bounded persistent route cursors. */
   void   *l7_routes;                // ordered l7_route_t[] (opaque here; cast in the engine)
   int     n_l7_routes;              // number of routes in l7_routes
 
@@ -1271,6 +1278,15 @@ struct proxy_fd_ent {
   uint8_t http_is_post;    // 1 = the request line's method is POST (capacity
                            // permits apply to inference POSTs only)
   char last_header_name[128];
+  struct sp_mcp_capture *mcp_capture; /* Allocated only on explicit MCP H1 rules. */
+  _Atomic uint8_t mcp_inflight; /* H1 permits one request until its response is framed. */
+  uint8_t mcp_retry_pending; /* Only a failed, not yet connected H1 backend leg. */
+  uint32_t mcp_retry_excluded; /* Bounded to original pool endpoints per request. */
+  uint8_t mcp_route_active;
+  uint32_t mcp_route_mask;
+  uint8_t mcp_route_weights[MAX_PROXY_EP];
+  void *mcp_selector_state; /* Listener-owned slot; no policy allocation pointer. */
+  uint64_t mcp_route_ticket; /* Copied at dispatch; no policy pointer survives. */
 
   // L7 policy generic header/cookie store — bounded fixed
   // capacity; populated by l7_store_header_n() from BOTH the H1 and H2 parse
@@ -1986,6 +2002,7 @@ struct proxy_arg {
   // Custom header-based session stickiness configuration
   char session_header_name[128];    // e.g., "mcp-session-id", "x-session-token"
   uint8_t session_header_enabled;   // 1=enabled, 0=use IP-based
+  uint8_t mcp_stateless; /* Empty/default rules keep their existing protocol. */
   
   // Backend protocol capability (for ALPN configuration)
   // 0 = HTTP/1.1 only (default) - advertise only http/1.1 to clients
