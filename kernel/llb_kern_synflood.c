@@ -22,6 +22,8 @@
 #define __LLB_KERN_SYNFLOOD_C
 
 #include "../common/llb_dpapi.h"
+#include "../common/security_aggregate.h"
+#include "../common/security_ipv6.h"
 
 #ifdef HAVE_DP_SECURITY_RATE_LIMIT
 
@@ -32,14 +34,14 @@
 #ifdef HAVE_DP_SECURITY_RATE_RUNTIME_CONFIG
 // Runtime configurable thresholds (version-based cache)
 #define SYN_FLOOD_THRESHOLD     100  // Default SYNs/sec (overridable via Go API)
-#define SYN_COOKIE_THRESHOLD    50   // Default SYN cookie trigger (overridable via Go API)
+#define SYN_COOKIE_THRESHOLD    50   // Default SYN threshold event (overridable via Go API)
 #define CONN_RATE_THRESHOLD     50   // Default connections/sec (overridable via Go API)
 #define UDP_PKT_THRESHOLD       1000 // Default UDP packets/sec (overridable via Go API)
 #define UDP_BANDWIDTH_THRESHOLD (100 * 1024 * 1024) // Default 100MB/sec (overridable via Go API)
 #else
 // Hardcoded thresholds (compile-time constants, zero overhead)
 #define SYN_FLOOD_THRESHOLD     100  // Max SYNs per second per IP (FIXED)
-#define SYN_COOKIE_THRESHOLD    50   // Enable SYN cookies above this rate (FIXED)
+#define SYN_COOKIE_THRESHOLD    50   // SYN threshold telemetry only (FIXED)
 #define CONN_RATE_THRESHOLD     50   // Max connections per second per IP (FIXED)
 #define UDP_PKT_THRESHOLD       1000 // Max UDP packets per second per IP (FIXED)
 #define UDP_BANDWIDTH_THRESHOLD (100 * 1024 * 1024) // Max 100MB/sec per IP (FIXED)
@@ -221,6 +223,114 @@ dp_update_security_stats(__u32 stat_type, __u64 increment)
     }
 }
 
+/* Explicit test-only failure injection. This map does not exist in a
+ * production build and is never exposed through the management API. */
+#ifdef HAVE_DP_SECURITY_RATE_TEST_FAULTS
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 2);
+} sec_rate_fault SEC(".maps");
+#endif
+static int __always_inline
+dp_security_tracking_fault(void)
+{
+#ifdef HAVE_DP_SECURITY_RATE_TEST_FAULTS
+    __u32 key = 0;
+    __u32 *fault = bpf_map_lookup_elem(&sec_rate_fault, &key);
+    return fault && *fault;
+#else
+    return 0;
+#endif
+}
+
+#ifdef HAVE_DP_SECURITY_RATE_RUNTIME_CONFIG
+/* One shared state across CPUs, IP families, interfaces and listeners.
+ * No LRU allocation: distributed source churn cannot reset this budget.
+ * Helpers are deliberately outside the spin lock (BPF verifier requirement).
+ * The existing source whitelist bypasses both per-source and aggregate limits.
+ */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct security_aggregate_state);
+    __uint(max_entries, 1);
+} sec_rate_agg SEC(".maps");
+
+static int __always_inline
+dp_check_security_aggregate(struct xfi *xf, int is_syn, int is_udp, __u32 *account)
+{
+    *account = 0;
+    __u32 key = 0;
+    struct dp_security_rate_config *cfg = bpf_map_lookup_elem(&sec_rate_cfg, &key);
+    if (!cfg || cfg->version == 0)
+        return XDP_PASS;
+    __u32 syn_limit = cfg->aggregate_syn_threshold;
+    __u32 conn_limit = cfg->aggregate_conn_rate_threshold;
+    __u32 udp_limit = cfg->aggregate_udp_pkt_threshold;
+    __u32 byte_limit = cfg->aggregate_udp_bandwidth_threshold;
+    if ((!is_syn || (!syn_limit && !conn_limit)) &&
+        (!is_udp || (!udp_limit && !byte_limit)))
+        return XDP_PASS;
+    __u32 version = cfg->version;
+    __u64 second = bpf_ktime_get_ns() / RATE_WINDOW_NS;
+    __u32 drop = 0;
+    struct security_aggregate_state *state = bpf_map_lookup_elem(&sec_rate_agg, &key);
+    if (!state) {
+        /* A configured aggregate guard must not silently fail open. */
+        drop = is_udp ? 3 : syn_limit ? 1 : 2;
+    } else {
+        bpf_spin_lock(&state->lock);
+        struct security_aggregate_budget budget = { version, syn_limit, conn_limit, udp_limit, byte_limit };
+        drop = security_aggregate_decide(state, &budget, second, is_syn, is_udp, xf->pm.l3_len);
+        bpf_spin_unlock(&state->lock);
+    }
+    if (drop == 1) {
+        dp_update_security_stats(11, 1);
+        dp_update_security_stats(STAT_SYN_BLOCKED, 1);
+    } else if (drop == 2) {
+        dp_update_security_stats(12, 1);
+        dp_update_security_stats(STAT_CONN_BLOCKED, 1);
+    } else if (drop == 3) {
+        dp_update_security_stats(13, 1);
+        dp_update_security_stats(STAT_UDP_BLOCKED, 1);
+        dp_update_security_stats(STAT_UDP_BYTES_BLOCKED, xf->pm.l3_len);
+    }
+    if (drop) {
+        LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_DROP);
+        return XDP_DROP;
+    }
+    /* Count only after the packet also survives the source checks. */
+    if (is_syn && syn_limit && !cfg->syn_enabled) *account |= 1;
+    if (is_syn && conn_limit && !cfg->conn_rate_enabled) *account |= 2;
+    if (is_udp && (udp_limit || byte_limit) && !cfg->udp_enabled) *account |= 4;
+    return XDP_PASS;
+}
+#else
+static int __always_inline
+dp_check_security_aggregate(struct xfi *xf, int is_syn, int is_udp, __u32 *account)
+{
+    *account = 0;
+    return XDP_PASS;
+}
+#endif
+
+static void __always_inline
+dp_account_security_aggregate_pass(struct xfi *xf, __u32 account)
+{
+    if (account & 1) dp_update_security_stats(STAT_SYN_PASSED, 1);
+    if (account & 2) dp_update_security_stats(STAT_CONN_PASSED, 1);
+    if (account & 4) {
+        dp_update_security_stats(STAT_UDP_PASSED, 1);
+        dp_update_security_stats(STAT_UDP_BYTES_PASSED, xf->pm.l3_len);
+    }
+}
+
+
+
+
 /*
  * IPv4 Unified Security Rate Check Function
  *
@@ -237,6 +347,7 @@ dp_update_security_stats(__u32 stat_type, __u64 increment)
 static int __always_inline
 dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn, int is_udp)
 {
+    __u32 aggregate_account = 0;
     struct dp_security_rate_state *state;
     struct dp_security_rate_state new_state;
     __u32 key;
@@ -261,6 +372,7 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
     // CRITICAL: Validate that L3/L4 parsing was successful
     // Without this check, xf->l34m.saddr4 might contain garbage data
     if (!xf->l34m.valid) {
+        dp_account_security_aggregate_pass(xf, aggregate_account);
         return XDP_PASS;  // Skip security check for unparsed packets
     }
 
@@ -268,11 +380,6 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
     // Pattern: Native __u32 for exact IP match (not CIDR)
     key = xf->l34m.saddr4;  // Already in network byte order
     
-    // Sanity check: Reject obviously invalid IPs (0.0.0.0, 255.255.255.255)
-    if (key == 0 || key == 0xFFFFFFFF) {
-        return XDP_PASS;  // Skip security check for invalid IPs
-    }
-
     // WHITELIST BYPASS: Check if source IP is whitelisted (P0-7 integration)
     // Whitelisted IPs bypass ALL rate limiting (both SYN flood and connection rate)
     // Pattern: Same as P0-7 IP filter whitelist check
@@ -307,7 +414,20 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
         // packet against the whitelist rule; incrementing again double-counts
         // (and the old read-modify-write here raced with ipfilter's atomics).
         BPF_DBG_PRINTK("[XDP-SECURITY] ✓ IPv4 WHITELIST BYPASS: src=0x%x\n", saddr_host);
+        dp_account_security_aggregate_pass(xf, aggregate_account);
         return XDP_PASS;  // Allow whitelisted IP without rate limiting
+    }
+
+    if (dp_check_security_aggregate(xf, is_syn, is_udp, &aggregate_account) == XDP_DROP) return XDP_DROP;
+    if (!syn_enabled && !conn_enabled && !udp_enabled) {
+        dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;
+    }
+
+    // Sanity check: Reject obviously invalid IPs (0.0.0.0, 255.255.255.255)
+    if (key == 0 || key == 0xFFFFFFFF) {
+        dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;  // Skip security check for invalid IPs
     }
 
     // Get current time for window tracking (convert ns to seconds)
@@ -343,7 +463,7 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
                     LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_DROP);
                     return XDP_DROP;
                 } else if (current_count + 1 > cookie_threshold) {
-                    // Above cookie threshold - mark for SYN cookies
+                    // Above telemetry threshold; no SYN-cookie generation occurs here
                     BPF_DBG_PRINTK("[XDP-SECURITY] IPv4 SYN COOKIE: src=0x%x count=%llu\n",
                                    bpf_ntohl(key), current_count + 1);
                     dp_update_security_stats(STAT_SYN_COOKIES, 1);
@@ -533,7 +653,8 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
         // 3. This is a UDP packet and UDP flood protection is enabled
         if (!is_syn && !conn_enabled && (!is_udp || !udp_enabled)) {
             // Skip tracking: non-SYN TCP, conn rate disabled, and (non-UDP or UDP protection disabled)
-            return XDP_PASS;
+            dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;
         }
 
         // Create new tracking entry
@@ -549,10 +670,21 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
         new_state.flags = 0;
 
         // Insert into LRU map (auto-evicts old entries)
-        int ret = bpf_map_update_elem(&sec_rate_v4, &key, &new_state, BPF_ANY);
+        int ret = dp_security_tracking_fault() ? -12 : bpf_map_update_elem(&sec_rate_v4, &key, &new_state, BPF_ANY);
         if (ret != 0) {
-            // Map full or error - allow packet (fail open)
+            // Tracking failure: fail closed for configured protected packet types.
             BPF_DBG_PRINTK("[XDP-SECURITY] IPv4 map update failed: ret=%d\n", ret);
+            dp_update_security_stats(14, 1);
+            if ((is_syn && (syn_enabled || conn_enabled)) || (is_udp && udp_enabled)) {
+                if (is_syn && syn_enabled) dp_update_security_stats(STAT_SYN_BLOCKED, 1);
+                else if (is_syn && conn_enabled) dp_update_security_stats(STAT_CONN_BLOCKED, 1);
+                if (is_udp) {
+                    dp_update_security_stats(STAT_UDP_BLOCKED, 1);
+                    dp_update_security_stats(STAT_UDP_BYTES_BLOCKED, xf->pm.l3_len);
+                }
+                LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_DROP);
+                return XDP_DROP;
+            }
         }
         // Note: uniqueIps counter is calculated by Go control plane via map iteration
         // (no eBPF counter needed - avoids monotonic increase bug on LRU eviction)
@@ -572,7 +704,8 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
             dp_update_security_stats(STAT_UDP_BYTES_PASSED, xf->pm.l3_len);
         }
     }
-    return XDP_PASS;
+    dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;
 }
 
 /*
@@ -589,6 +722,7 @@ dp_do_security_rate_check_v4_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
 static int __always_inline
 dp_do_security_rate_check_v6_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn, int is_udp)
 {
+    __u32 aggregate_account = 0;
     struct dp_security_rate_state *state;
     struct dp_security_rate_state new_state;
     struct in6_addr key;
@@ -608,6 +742,7 @@ dp_do_security_rate_check_v6_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
 
     // CRITICAL: Validate that L3/L4 parsing was successful
     if (!xf->l34m.valid) {
+        dp_account_security_aggregate_pass(xf, aggregate_account);
         return XDP_PASS;  // Skip security check for unparsed packets
     }
 
@@ -637,10 +772,17 @@ dp_do_security_rate_check_v6_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
         // NOTE: no stat update here - the ipfilter stage already counted this
         // packet against the whitelist rule (see IPv4 path).
         BPF_DBG_PRINTK("[XDP-SECURITY] IPv6 WHITELIST BYPASS\n");
+        dp_account_security_aggregate_pass(xf, aggregate_account);
         return XDP_PASS;  // Allow whitelisted IP without rate limiting
     }
 
     // Get current time (convert ns to seconds)
+    if (dp_check_security_aggregate(xf, is_syn, is_udp, &aggregate_account) == XDP_DROP) return XDP_DROP;
+    if (!syn_enabled && !conn_enabled && !udp_enabled) {
+        dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;
+    }
+
     now_ns = bpf_ktime_get_ns();
     now_sec = (__u32)(now_ns / 1000000000ULL);
 
@@ -841,7 +983,8 @@ dp_do_security_rate_check_v6_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
         // 3. This is a UDP packet and UDP flood protection is enabled
         if (!is_syn && !conn_enabled && (!is_udp || !udp_enabled)) {
             // Skip tracking: non-SYN TCP, conn rate disabled, and (non-UDP or UDP protection disabled)
-            return XDP_PASS;
+            dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;
         }
 
         // Create new tracking entry
@@ -856,9 +999,20 @@ dp_do_security_rate_check_v6_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
         new_state.udp_byte_count = is_udp ? xf->pm.l3_len : 0;
         new_state.flags = 0;
 
-        int ret = bpf_map_update_elem(&sec_rate_v6, &key, &new_state, BPF_ANY);
+        int ret = dp_security_tracking_fault() ? -12 : bpf_map_update_elem(&sec_rate_v6, &key, &new_state, BPF_ANY);
         if (ret != 0) {
             BPF_DBG_PRINTK("[XDP-SECURITY] IPv6 map update failed: ret=%d\n", ret);
+            dp_update_security_stats(14, 1);
+            if ((is_syn && (syn_enabled || conn_enabled)) || (is_udp && udp_enabled)) {
+                if (is_syn && syn_enabled) dp_update_security_stats(STAT_SYN_BLOCKED, 1);
+                else if (is_syn && conn_enabled) dp_update_security_stats(STAT_CONN_BLOCKED, 1);
+                if (is_udp) {
+                    dp_update_security_stats(STAT_UDP_BLOCKED, 1);
+                    dp_update_security_stats(STAT_UDP_BYTES_BLOCKED, xf->pm.l3_len);
+                }
+                LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_DROP);
+                return XDP_DROP;
+            }
         }
         // Note: uniqueIps counter is calculated by Go control plane via map iteration
         // (no eBPF counter needed - avoids monotonic increase bug on LRU eviction)
@@ -874,7 +1028,67 @@ dp_do_security_rate_check_v6_xdp(struct xdp_md *ctx, struct xfi *xf, int is_syn,
             dp_update_security_stats(STAT_UDP_BYTES_PASSED, xf->pm.l3_len);
         }
     }
-    return XDP_PASS;
+    dp_account_security_aggregate_pass(xf, aggregate_account);
+        return XDP_PASS;
+}
+
+/* Resolve bounded IPv6 extension chains before classifying SYN/UDP. A
+ * protected fragmented or uninspectable packet must not silently bypass rates.
+ * Whitelisted IPv6 sources retain the documented rate bypass contract. */
+static int __always_inline
+dp_prepare_security_ipv6(struct xdp_md *ctx, struct xfi *xf)
+{
+    const __u8 *data = (void *)(long)ctx->data;
+    const __u8 *end = (void *)(long)ctx->data_end;
+    const __u8 *ip = data + xf->pm.l3_off;
+    struct security_ipv6_transport r = security_ipv6_transport(ip, end);
+    __u32 syn_threshold, cookie_threshold, conn_threshold, syn_enabled, conn_enabled;
+    __u32 udp_threshold, udp_bytes, udp_enabled;
+    dp_get_security_rate_config(&syn_threshold, &cookie_threshold, &conn_threshold,
+        &syn_enabled, &conn_enabled, &udp_threshold, &udp_bytes, &udp_enabled);
+    int tcp_guard = syn_enabled || conn_enabled;
+    int udp_guard = udp_enabled;
+#ifdef HAVE_DP_SECURITY_RATE_RUNTIME_CONFIG
+    __u32 zero = 0;
+    struct dp_security_rate_config *cfg = bpf_map_lookup_elem(&sec_rate_cfg, &zero);
+    if (cfg && cfg->version) {
+        tcp_guard |= cfg->aggregate_syn_threshold || cfg->aggregate_conn_rate_threshold;
+        udp_guard |= cfg->aggregate_udp_pkt_threshold || cfg->aggregate_udp_bandwidth_threshold;
+    }
+#endif
+    if (r.status == SECURITY_IPV6_OK && !r.fragmented &&
+        (r.protocol == IPPROTO_TCP || r.protocol == IPPROTO_UDP)) {
+        __u32 required = r.protocol == IPPROTO_TCP ? 20 : 8;
+        const __u8 *transport = ip + r.offset;
+        if (ip + 40 > end || transport + required > end ||
+            r.offset + required > 40 + (((__u32)ip[4] << 8) | ip[5])) {
+            r.status = SECURITY_IPV6_MALFORMED;
+        } else {
+            xf->l34m.nw_proto = r.protocol;
+            if (r.protocol == IPPROTO_TCP) {
+                if (transport + 20 > end) r.status = SECURITY_IPV6_MALFORMED;
+                else xf->pm.tcp_flags = transport[13];
+            }
+        }
+    }
+    if (r.status == SECURITY_IPV6_OK && !r.fragmented) return XDP_PASS;
+    int protected = r.protocol == IPPROTO_TCP ? tcp_guard :
+        r.protocol == IPPROTO_UDP ? udp_guard :
+        (r.protocol == 0 || r.protocol == 43 || r.protocol == 60 ||
+         r.protocol == 51 || r.protocol == 44 || r.status == SECURITY_IPV6_MALFORMED)
+            ? (tcp_guard || udp_guard) : 0;
+    if (!protected) return XDP_PASS;
+    if (xf->l34m.valid) {
+        struct dp_ip_filter_key key;
+        __builtin_memset(&key, 0, sizeof(key));
+        key.prefixlen = 128;
+        __builtin_memcpy(key.data, xf->l34m.saddr, 16);
+        struct dp_ip_filter_rule *allow = bpf_map_lookup_elem(&ip_whitelist6_map, &key);
+        if (allow && allow->action == 0) return XDP_PASS;
+    }
+    dp_update_security_stats(15, 1);
+    LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_DROP);
+    return XDP_DROP;
 }
 
 /*
@@ -896,6 +1110,8 @@ dp_do_security_rate_main_xdp(struct xdp_md *ctx, struct xfi *xf)
 {
     int is_syn = 0;
     int is_udp = 0;
+    if (xf->l2m.dl_type == bpf_htons(ETH_P_IPV6) &&
+        dp_prepare_security_ipv6(ctx, xf) == XDP_DROP) return XDP_DROP;
 
     // Check protocol type for rate limiting
     // Process TCP (for SYN flood + connection rate) and UDP (for UDP flood)
