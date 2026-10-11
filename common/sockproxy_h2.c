@@ -1199,6 +1199,17 @@ h2_resp_release(proxy_h2_session_t *client_session, int32_t client_stream_id,
   HASH_ITER(hh, client_session->backend_sessions, backend_session, btmp) {
     stream_mapping_t *mapping = NULL;
     HASH_FIND_INT(backend_session->stream_map, &client_stream_id, mapping);
+    if (backend_session->bridge_h1 && !backend_session->bridge_done &&
+        !backend_session->bridge_cancelled) {
+      proxy_fd_ent_t *client=client_session->pfe;
+      int slot=backend_session->slot;
+      proxy_fd_ent_t *backend=(client && slot>=0 && slot<MAX_PROXY_EP) ? client->rfd_ent[slot]:NULL;
+      if (backend && backend->backend_h2_session==backend_session && backend->read_paused) {
+        backend->read_paused=0;
+        sp_notify_arm(proxy_struct->ns,backend->fd,NOTI_TYPE_IN|NOTI_TYPE_HUP,backend,backend->gen);
+      }
+      continue; /* session budget: resume every paused H1 bridge */
+    }
     if (!mapping || !backend_session->session) {
       continue;
     }
@@ -2123,12 +2134,12 @@ static int h2_h1_body(llhttp_t *p,const char *at,size_t len)
 {
   backend_h2_session_t *bs=p->data;
   if (bs->bridge_cancelled || !bs->stream_map) return -1;
-  /* Bound slow-client memory independently of total stream length. A
-   * streaming SSE never needs its entire body resident in memory. */
-  if (bs->client_session->total_response_buffer_size>H2_SESSION_HIGH_WATER ||
-      len>H2_SESSION_HIGH_WATER-bs->client_session->total_response_buffer_size) return -1;
+  /* The relay callback has already queued this chunk when it returns PAUSE.
+   * Finish parsing the current bounded socket read, then disable backend IN.
+   * This avoids dropping llhttp's unconsumed tail or replaying a queued chunk.
+   * Overshoot is bounded by one receive buffer, not total response length. */
   int rv=proxy_h2_backend_on_data_chunk_recv_callback(NULL,0,1,(const uint8_t *)at,len,bs);
-  return rv? -1:0;
+  return rv && rv!=NGHTTP2_ERR_PAUSE ? -1:0;
 }
 static int h2_h1_complete(llhttp_t *p)
 {
@@ -2165,7 +2176,8 @@ static backend_h2_session_t *h2_h1_session_new(proxy_h2_session_t *client,int sl
 }
 static int h2_h1_fail(backend_h2_session_t *bs)
 {
-  if (!bs || !bs->client_session) return -1;
+  if (!bs || !bs->client_session || bs->bridge_cancelled) return -1;
+  bs->bridge_cancelled=1; /* terminal failure is idempotent */
   stream_mapping_t *m=bs->stream_map;
   if (m) {
     proxy_h2_stream_t *s=find_stream(bs->client_session,m->client_stream_id);
@@ -3244,6 +3256,15 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   char body[512];
   int blen;
 
+  proxy_map_ent_t *mcp_ent=pfe ? pfe->head:NULL;
+  if (mcp_ent && mcp_ent->val.ephash &&
+      mcp_ent->val.ephash->mcp_stateless && error_code &&
+      !strncmp(error_code,"mcp_",4)) {
+    size_t len=0;
+    char *denial=sp_mcp_error_json(NULL,status_code,(const char *)stream->data_buf,stream->data_len,&len);
+    int ret=h2_send_deny_frame(pfe,stream,status_code,retry_after,denial,(int)len,NULL,0);
+    free(denial);return ret;
+  }
   if (!error_code || !error_code[0])
     error_code = "denied";
   if (retry_body) {
@@ -3776,6 +3797,10 @@ proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe)
       return 0;
     }
     if (e!=HPE_OK) return h2_h1_fail(backend_session);
+    if (client_pfe->h2_session->backpressure_active && !backend_session->bridge_done) {
+      pfe->read_paused=1;
+      sp_notify_arm(proxy_struct->ns,pfe->fd,NOTI_TYPE_HUP,pfe,pfe->gen);
+    }
     return proxy_h2_client_send(client_pfe->h2_session);
   }
 
@@ -4112,32 +4137,29 @@ static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     if (!status && !sp_mcp_media_valid(&media)) status=400;
     if (!status) status=sp_mcp_validate(req,stream->method,(const char *)stream->data_buf,stream->data_len);
     if (!status && ent->has_l7_policy) {
-      if (stream->request_headers_count>L7_MAX_CAPTURED_HEADERS || req->name_len>=L7_HDR_VALUE_MAX ||
-          memchr(req->name,0,req->name_len)) status=413;
-      else {
-        pfe->n_l7_headers=0;
-        for (size_t i=0;i<stream->request_headers_count;i++) {
-          const nghttp2_nv *h=&stream->request_headers[i];
-          const char *value=(const char *)h->value; size_t len=h->valuelen;
-          if (h->namelen==8 && !strncasecmp((const char *)h->name,"mcp-name",8)) {
-            value=req->name; len=req->name_len;
-          }
-          /* The L7 store truncates generic operands. For modern MCP,
-           * reject instead of routing on a different value from the backend. */
-          if (h->namelen>=L7_HDR_NAME_MAX || len>=L7_HDR_VALUE_MAX ||
-              memchr(value,0,len)) { status=413; break; }
-          l7_store_header_n(pfe,NULL,(const char *)h->name,h->namelen,value,len);
+      pfe->n_l7_headers=0;
+      for (size_t i=0;i<stream->request_headers_count;i++) {
+        const nghttp2_nv *h=&stream->request_headers[i];
+        if (!l7_mcp_header_used(ent,(const char *)h->name,h->namelen)) continue;
+        const char *value=(const char *)h->value; size_t len=h->valuelen;
+        if (h->namelen==8 && !strncasecmp((const char *)h->name,"mcp-name",8)) {
+          value=req->name; len=req->name_len;
         }
+        if (h->namelen>=L7_HDR_NAME_MAX || len>=L7_HDR_VALUE_MAX || memchr(value,0,len) ||
+            pfe->n_l7_headers>=L7_MAX_CAPTURED_HEADERS) { status=413; break; }
+        l7_store_header_n(pfe,NULL,(const char *)h->name,h->namelen,value,len);
       }
     }
-    free(req);
   }
   if (status) {
-    static const char body[]="{\"error\":\"mcp_request_refused\"}";
+    size_t blen=0;
+    char *body=sp_mcp_error_json(req,status,(const char *)stream->data_buf,stream->data_len,&blen);
     nghttp2_nv allow={(uint8_t *)"allow",(uint8_t *)"POST",5,4,NGHTTP2_NV_FLAG_NONE};
-    h2_send_deny_frame(pfe,stream,status,0,body,sizeof(body)-1,status==405?&allow:NULL,status==405?1:0);
+    h2_send_deny_frame(pfe,stream,status,0,body,(int)blen,status==405?&allow:NULL,status==405?1:0);
+    free(body);free(req);
     return -1;
   }
+  free(req);
   stream->has_conv_id=0;
   stream->conversation_id[0]=0;
   pfe->has_conv_id=pfe->has_custom_session_header=pfe->has_user_id=0;

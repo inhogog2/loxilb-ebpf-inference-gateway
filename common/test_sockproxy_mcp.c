@@ -49,6 +49,26 @@ int main(void) {
     "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"," META ",\"x\":\"\\q\"}}",
     "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"," META "},\"id\":null}"};
   for(size_t i=0;i<sizeof(bad)/sizeof(bad[0]);i++) expect(bad[i],400);
+  char *cookie=malloc(30001); assert(cookie); memset(cookie,'x',30000); cookie[30000]=0;
+  header("Cookie",cookie); header("Authorization",cookie); expect(valid,0); free(cookie);
+  /* A valid 2,000-key object must not consume a quadratic comparison budget. */
+  char *wide=malloc(100000); assert(wide);
+  size_t wide_off=(size_t)snprintf(wide,100000,
+      "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"echo\"," META ",\"arguments\":{");
+  for (unsigned i=0;i<2000;i++)
+    wide_off+=(size_t)snprintf(wide+wide_off,100000-wide_off,"%s\"key%04u\":0",i?",":"",i);
+  strcpy(wide+wide_off,"}}}"); expect(wide,0);
+  /* Escaped last key still collides with the first after sorting. */
+  strcpy(wide+wide_off,",\"\\u006bey0000\":1}}}"); expect(wide,400); free(wide);
+  size_t error_len=0;
+  setup("tools/call","wrong"); expect(valid,400);
+  char *error_body=sp_mcp_error_json(&req,400,valid,strlen(valid),&error_len);
+  assert(error_body && error_len==strlen(error_body));
+  assert(strstr(error_body,"\"id\":1") && strstr(error_body,"\"code\":-32020"));free(error_body);checks++;
+  setup("tools/call","echo"); strcpy(req.version,"2026-11-25"); expect(valid,400);
+  error_body=sp_mcp_error_json(&req,400,valid,strlen(valid),&error_len);
+  assert(error_body && strstr(error_body,"\"code\":-32022") && strstr(error_body,"\"supported\":[\"2026-07-28\"]"));free(error_body);checks++;
+  setup("tools/call","echo");
   /* Every prefix cut fails closed. */
   for(size_t i=0;i<strlen(valid);i++) { assert(sp_mcp_validate(&req,"POST",valid,i)==400); checks++; }
   char trailing[1024]; snprintf(trailing,sizeof(trailing),"%s garbage",valid); expect(trailing,400);
@@ -101,7 +121,8 @@ int main(void) {
   setup("tools/call","=?base64?" "?=");
   expect("{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"\"," META "}}",0);
   setup("tools/call","echo");
-  sp_mcp_header(&req,"bad\0name",8,"x",1);assert(req.error==400);checks++;
+  sp_mcp_header_begin(&req); sp_mcp_header_name(&req,"bad\0name",8);
+  assert(req.error==400);checks++;
   setup("tools/call","echo");
   /* Deterministic byte mutations exercise parser memory safety under sanitizers. */
   size_t vl=strlen(valid);char copy[1024];

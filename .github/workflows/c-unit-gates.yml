@@ -45,6 +45,9 @@ jobs:
             common/sockproxy_routing.c -Icommon
           ASAN_OPTIONS=detect_leaks=1 /tmp/test_model_routing_sanitized
 
+      - name: Modern MCP validation, framing, relay and selection (sanitizers)
+        run: make -C common test_mcp
+
       - name: Header-field guard (bytes between a header value and the wire)
         run: make -C common test_l7hdr
 

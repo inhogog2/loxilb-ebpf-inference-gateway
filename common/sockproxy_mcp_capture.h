@@ -11,11 +11,12 @@ struct sp_mcp_capture {
   struct sp_mcp_request req;
   char *body;
   size_t len, cap;
+  int refusal_status; /* bounded, well-framed H1 body drains before refusal */
 };
 static inline void sp_mcp_capture_reset(struct sp_mcp_capture *c) {
   if (!c) return;
   sp_mcp_reset(&c->req);
-  free(c->body); c->body = NULL; c->len = c->cap = 0;
+  free(c->body); c->body = NULL; c->len = c->cap = 0; c->refusal_status=0;
 }
 static inline void sp_mcp_capture_free(struct sp_mcp_capture *c) {
   if (!c) return;

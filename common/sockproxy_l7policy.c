@@ -1439,3 +1439,20 @@ int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
             (unsigned)key->xip, (unsigned)key->xport, (unsigned)key->protocol);
   return -1;
 }
+
+/* Do not apply the 256-byte routing operand limit to unrelated credentials.
+ * Cookie predicates use the Cookie header as their operand source. */
+int l7_mcp_header_used(const proxy_map_ent_t *ent, const char *name, size_t len)
+{
+  if (!ent || !ent->has_l7_policy || !ent->l7_routes) return 0;
+  const l7_route_t *routes=ent->l7_routes;
+  for (int i=0;i<ent->n_l7_routes;i++)
+    for (unsigned j=0;j<routes[i].n_sets;j++)
+      for (unsigned k=0;k<routes[i].sets[j].n_conds;k++) {
+        const l7_condition_t *cond=&routes[i].sets[j].conds[k];
+        if (cond->field==L7F_HEADER && strlen(cond->key)==len &&
+            !strncasecmp(cond->key,name,len)) return 1;
+        if (cond->field==L7F_COOKIE && len==6 && !strncasecmp(name,"cookie",6)) return 1;
+      }
+  return 0;
+}

@@ -117,6 +117,7 @@ proxy_setup_mcp_retry(proxy_fd_ent_t *pfe, proxy_ep_sel_t *out,
                       const void *pp2hdr, int pp2len)
 {
   proxy_epval_t *pool = (proxy_epval_t *)pfe->epv;
+  if (proxy_ent_epctx(pfe->head)) return -1; /* async retry is plaintext-only */
   if (!pool || !pool->mcp_stateless || pool->n_eps <= 0 ||
       pool->n_eps > MAX_PROXY_EP || !pfe->mcp_retry_pending)
     return -1;
@@ -701,6 +702,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           algorithm_selection=sp_mcp_request_select(tepval,pfe);
           if (algorithm_selection<0) {
             static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            fc_permit_release(&pfe->fc);
+            pfe->lb_err_body_sent=1;
             proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
             return -1;
           }
@@ -1222,6 +1225,7 @@ pd_fallback_normal:
         if (tepval->mcp_stateless && !sp_mcp_reserve_probe(tepval,sel)) {
           static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
           fc_permit_release(&pfe->fc);
+          pfe->lb_err_body_sent=1;
           proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
           return -1;
         }

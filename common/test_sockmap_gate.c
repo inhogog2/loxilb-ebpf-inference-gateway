@@ -107,6 +107,12 @@ main(void)
   CHECK(reduce(&cred_l7, MODE_RESP) == MODE_OFF, "credential + L7 policy: response does not pair");
   CHECK(reduce(&l7, MODE_BOTH) == MODE_OFF, "L7 policy: nothing pairs");
 
+  sockmap_gate_in_t mcp = { .mcp_stateless = 1 };
+  sockmap_gate_owned_dirs(&mcp, &own_req, &own_resp);
+  CHECK(own_req && own_resp, "modern MCP owns both directions");
+  for (uint8_t mode = MODE_OFF; mode <= MODE_RESP; mode++)
+    CHECK(reduce(&mcp, mode) == MODE_OFF, "modern MCP never pairs either direction");
+
   printf("T4: the reduction keeps the direction the service does not own\n");
   CHECK(reduce(&cred, MODE_BOTH) == MODE_RESP, "both on a credential service pairs responses only");
   CHECK(reduce(&strip, MODE_BOTH) == MODE_RESP, "both on a strip-only service pairs responses only");

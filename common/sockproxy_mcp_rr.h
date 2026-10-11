@@ -59,7 +59,7 @@ static inline int sp_mcp_wrr_index(sp_mcp_selector_state *state,
 /* Included a second time by selector TUs after sockproxy types are complete. */
 #ifdef SP_MCP_PROXY_SELECTOR
 #include "sockproxy_health.h" /* synchronized CB snapshot/probe APIs */
-/* Caller holds the global lock. Eligibility must not reserve a HALF_OPEN
+/* Caller holds the global read lock; configuration writers remain excluded. Eligibility must not reserve a HALF_OPEN
  * probe on every scanned endpoint; only the final dispatch reserves one. */
 static inline int sp_mcp_candidate_locked(proxy_epval_t *pool, int ep)
 {
@@ -68,14 +68,14 @@ static inline int sp_mcp_candidate_locked(proxy_epval_t *pool, int ep)
 }
 static inline int sp_mcp_candidate(proxy_epval_t *pool, int ep)
 {
-  PROXY_LOCK();
+  PROXY_RDLOCK();
   int eligible=sp_mcp_candidate_locked(pool,ep);
   PROXY_UNLOCK();
   return eligible;
 }
 static inline int sp_mcp_reserve_probe(proxy_epval_t *pool, int ep)
 {
-  PROXY_LOCK();
+  PROXY_RDLOCK();
   int healthy=is_endpoint_healthy(pool,ep);
   PROXY_UNLOCK();
   return healthy;
@@ -96,7 +96,7 @@ static inline int sp_mcp_request_select(proxy_epval_t *pool, proxy_fd_ent_t *pfe
 {
   uint32_t eligible=0;
   uint8_t weights[32]={0}, first=0;
-  PROXY_LOCK();
+  PROXY_RDLOCK();
   int weighted=pool->select==PROXY_SEL_WRR;
   for (int i=0;i<pool->n_eps && i<MAX_PROXY_EP;i++)
     if ((!pfe->mcp_route_active || (pfe->mcp_route_mask & (UINT32_C(1)<<i))) &&
@@ -112,7 +112,7 @@ static inline int sp_mcp_request_select(proxy_epval_t *pool, proxy_fd_ent_t *pfe
       pfe->mcp_selector_state : &pool->mcp_selector;
   uint64_t ticket=pfe->mcp_route_active ? pfe->mcp_route_ticket :
     atomic_fetch_add_explicit(&pool->mcp_rr_ticket,1,memory_order_relaxed);
-  PROXY_UNLOCK(); /* Never nest global lock and the guarded WRR state. */
+  PROXY_UNLOCK(); /* Never nest global read lock and the guarded WRR state. */
   if (weighted) {
     if (!state) return -1;
     return sp_mcp_wrr_index(state,eligible,weights);

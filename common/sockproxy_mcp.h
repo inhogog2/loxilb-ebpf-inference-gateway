@@ -4,7 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "sockproxy_json_unescape.h"
 
 /* These bounds reject requests rather than silently truncating routing keys. */
@@ -19,7 +21,7 @@ struct sp_mcp_request {
   char name[SP_MCP_NAME_MAX + 1], method[256], version[32];
   size_t field_len, value_len, name_len;
   unsigned int version_seen, method_seen, name_seen;
-  int error, active, value_started;
+  int error, active, value_started, rpc_error;
 };
 typedef struct sp_mcp_request mcp_request_state_t;
 static inline void sp_mcp_reset(struct sp_mcp_request *r) { memset(r, 0, sizeof(*r)); }
@@ -131,6 +133,11 @@ static inline void sp_mcp_header_end(struct sp_mcp_request *r) {
 }
 static inline void sp_mcp_header(struct sp_mcp_request *r, const char *name, size_t nl,
                                   const char *value, size_t vl) {
+  /* HTTP framing has already validated unrelated fields. Only mirrored
+   * operands need this bounded parser; a long Cookie/JWT is not an MCP name. */
+  if (name && !((nl==20 && !strncasecmp(name,"mcp-protocol-version",20)) ||
+                (nl==10 && !strncasecmp(name,"mcp-method",10)) ||
+                (nl==8 && !strncasecmp(name,"mcp-name",8)))) return;
   sp_mcp_header_begin(r); sp_mcp_header_name(r, name, nl);
   sp_mcp_header_value(r, value, vl); sp_mcp_header_end(r);
 }
@@ -139,8 +146,9 @@ static inline void sp_mcp_header(struct sp_mcp_request *r, const char *name, siz
  * Duplicate keys compare decoded Unicode scalars, so escaped aliases collide.
  * Work and storage are bounded by body, token and nesting limits. */
 struct sp_mcp_token { size_t start, end; unsigned next; char type; };
-struct sp_mcp_json { const char *s; size_t n, at, compare_budget; unsigned used; int error;
-  struct sp_mcp_token tokens[SP_MCP_TOKENS_MAX]; };
+struct sp_mcp_json { const char *s; size_t n, at; unsigned used; int error;
+  struct sp_mcp_token tokens[SP_MCP_TOKENS_MAX];
+  unsigned keys[SP_MCP_TOKENS_MAX], scratch[SP_MCP_TOKENS_MAX]; };
 static inline void sp_mcp_ws(struct sp_mcp_json *j) {
   while (j->at < j->n && strchr(" \t\r\n", j->s[j->at]) && j->s[j->at]) j->at++;
 }
@@ -186,6 +194,40 @@ static inline int sp_mcp_equal(const struct sp_mcp_json *j, unsigned a, unsigned
   }
   return x == j->tokens[a].end && y == j->tokens[b].end;
 }
+/* Sort decoded keys once per completed object. Unlike pairwise comparisons,
+ * this is bounded by O(total key bytes * log(token limit)), including malicious
+ * common prefixes and escaped aliases. Scratch is shared only after child
+ * objects have completed, so recursion does not multiply its fixed size. */
+static inline int sp_mcp_key_compare(const struct sp_mcp_json *j, unsigned a, unsigned b) {
+  size_t x=j->tokens[a].start, y=j->tokens[b].start;
+  while (x<j->tokens[a].end && y<j->tokens[b].end) {
+    uint32_t u, v;
+    if (sp_mcp_scalar(j->s,j->tokens[a].end,&x,&u) ||
+        sp_mcp_scalar(j->s,j->tokens[b].end,&y,&v)) return 0;
+    if (u!=v) return u<v ? -1:1;
+  }
+  return (x<j->tokens[a].end) - (y<j->tokens[b].end);
+}
+static inline int sp_mcp_unique_keys(struct sp_mcp_json *j, unsigned object) {
+  unsigned count=0;
+  for (unsigned k=object+1;k<j->used;k=j->tokens[k+1].next) j->keys[count++]=k;
+  for (unsigned width=1;width<count;width*=2) {
+    for (unsigned start=0;start<count;start+=2*width) {
+      unsigned mid=start+width<count ? start+width:count;
+      unsigned end=start+2*width<count ? start+2*width:count;
+      unsigned a=start,b=mid,out=start;
+      while (a<mid || b<end) {
+        if (b==end || (a<mid && sp_mcp_key_compare(j,j->keys[a],j->keys[b])<=0))
+          j->scratch[out++]=j->keys[a++];
+        else j->scratch[out++]=j->keys[b++];
+      }
+    }
+    memcpy(j->keys,j->scratch,count*sizeof(j->keys[0]));
+  }
+  for (unsigned i=1;i<count;i++)
+    if (!sp_mcp_key_compare(j,j->keys[i-1],j->keys[i])) return -1;
+  return 0;
+}
 static inline int sp_mcp_literal(const struct sp_mcp_json *j, unsigned t, const char *s) {
   size_t at = j->tokens[t].start, k = 0;
   if (j->tokens[t].type != 's') return 0;
@@ -206,16 +248,8 @@ static inline int sp_mcp_parse(struct sp_mcp_json *j, unsigned depth) {
     j->tokens[t].type = c; char close = c == '{' ? '}' : ']'; j->at++; sp_mcp_ws(j);
     if (j->at < j->n && j->s[j->at] == close) j->at++;
     else for (;;) {
-      unsigned key = j->used;
       if (c == '{') {
         if (j->at >= j->n || j->s[j->at] != '"' || sp_mcp_parse(j, depth + 1)) return -1;
-        for (unsigned prev = t + 1; prev < key; prev = j->tokens[prev + 1].next) {
-          size_t cost = j->tokens[prev].end - j->tokens[prev].start +
-                        j->tokens[key].end - j->tokens[key].start;
-          if (cost > j->compare_budget) { j->error = 413; return -1; }
-          j->compare_budget -= cost;
-          if (sp_mcp_equal(j, prev, key)) return -1;
-        }
         sp_mcp_ws(j); if (j->at == j->n || j->s[j->at++] != ':') return -1;
       }
       if (sp_mcp_parse(j, depth + 1)) return -1;
@@ -226,6 +260,7 @@ static inline int sp_mcp_parse(struct sp_mcp_json *j, unsigned depth) {
       sp_mcp_ws(j);
     }
     j->tokens[t].end = j->at;
+    if (j->tokens[t].type == '{' && sp_mcp_unique_keys(j,t)) return -1;
   } else {
     j->tokens[t].type = 'p';
     if (c == '-' || (c >= '0' && c <= '9')) {
@@ -274,18 +309,22 @@ static inline int sp_mcp_name_equal(const struct sp_mcp_json *j, unsigned t, con
 static inline int sp_mcp_validate_core(struct sp_mcp_request *r, const char *http_method,
                                   const char *body, size_t len, struct sp_mcp_json *j) {
   if (!http_method || strcmp(http_method, "POST")) return 405;
+  r->rpc_error=-32020;
   if (r->error) return r->error;
-  if (r->active || r->version_seen != 1 || r->method_seen != 1 ||
-      strcmp(r->version, SP_MCP_VERSION) || !r->method[0]) return 400;
+  if (r->version_seen==1 && strcmp(r->version,SP_MCP_VERSION)) {
+    r->rpc_error=-32022; return 400;
+  }
+  if (r->active || r->version_seen != 1 || r->method_seen != 1 || !r->method[0]) return 400;
   if (len > SP_MCP_BODY_MAX) return 413;
   if (!body || !len) return 400;
   j->s = body; j->n = len; j->at = 0; j->used = 0; j->error = 400;
-  j->compare_budget = 8U * SP_MCP_BODY_MAX;
+  r->rpc_error=-32600;
   if (sp_mcp_parse(j, 0)) return j->error;
   sp_mcp_ws(j); if (j->at != len || j->tokens[0].type != '{') return 400;
   unsigned rpc = sp_mcp_find(j, 0, "jsonrpc"), method = sp_mcp_find(j, 0, "method");
   if (rpc >= j->used || !sp_mcp_literal(j, rpc, "2.0") || method >= j->used ||
       !sp_mcp_literal(j, method, r->method)) return 400;
+  r->rpc_error=-32020;
   unsigned params = sp_mcp_find(j, 0, "params"), meta = sp_mcp_find(j, params, "_meta");
   unsigned version = sp_mcp_find(j, meta, "io.modelcontextprotocol/protocolVersion");
   unsigned caps = sp_mcp_find(j, meta, "io.modelcontextprotocol/clientCapabilities");
@@ -297,6 +336,7 @@ static inline int sp_mcp_validate_core(struct sp_mcp_request *r, const char *htt
     unsigned name = sp_mcp_find(j, params, key);
     if (r->name_seen != 1 || !sp_mcp_name_equal(j, name, r)) return 400;
   } else if (r->name_seen) return 400;
+  r->rpc_error=-32600;
   /* Responses/batches are not client requests. IDs, if present, must be valid. */
   if (sp_mcp_find(j, 0, "result") < j->used || sp_mcp_find(j, 0, "error") < j->used) return 400;
   unsigned id = sp_mcp_find(j, 0, "id");
@@ -317,5 +357,46 @@ static inline int sp_mcp_validate(struct sp_mcp_request *r, const char *http_met
   if (!j) return 503;
   int status = sp_mcp_validate_core(r, http_method, body, len, j);
   free(j); return status;
+}
+/* Structured intermediary denial. Echo an ID only after strict JSON parsing;
+ * otherwise null means it could not safely be recovered. Never interpolate
+ * unvalidated input into a message. The returned allocation belongs to caller. */
+static inline char *sp_mcp_error_json(const struct sp_mcp_request *r,int status,
+                                    const char *body,size_t len,size_t *out_len) {
+  const char *id="null"; size_t id_len=4;
+  struct sp_mcp_json *j=NULL;
+  if (body && len && len<=SP_MCP_BODY_MAX) {
+    j=calloc(1,sizeof(*j));
+    if (j) {
+      j->s=body;j->n=len;
+      if (!sp_mcp_parse(j,0)) {
+        sp_mcp_ws(j);
+        unsigned t=sp_mcp_find(j,0,"id");
+        if (j->at==len && t<j->used &&
+            (j->tokens[t].type=='s' || (j->tokens[t].type=='p' &&
+             (body[j->tokens[t].start]=='-' || (body[j->tokens[t].start]>='0' && body[j->tokens[t].start]<='9'))))) {
+          size_t start=j->tokens[t].start,end=j->tokens[t].end;
+          if (j->tokens[t].type=='s') {start--;end++;}
+          id=body+start;id_len=end-start;
+        }
+      }
+    }
+  }
+  int code=status==400 ? (r && r->rpc_error ? r->rpc_error:-32020):-32600;
+  if (status==503) code=-32000;
+  const char *message=code==-32022 ? "Unsupported protocol version":
+      code==-32020 ? "MCP header validation failed":
+      status==405 ? "Only POST is allowed":status==413 ? "Request exceeds gateway limits":
+      status==503 ? "Gateway unavailable":"Invalid MCP request";
+  const char *supported=code==-32022 ? ",\"data\":{\"supported\":[\"2026-07-28\"]}":"";
+  size_t cap=id_len+256;
+  char *out=malloc(cap);
+  if (out) {
+    int n=snprintf(out,cap,"{\"jsonrpc\":\"2.0\",\"id\":%.*s,\"error\":{\"code\":%d,\"message\":\"%s\"%s}}",
+        (int)id_len,id,code,message,supported);
+    if (n<0 || (size_t)n>=cap) {free(out);out=NULL;}
+    else *out_len=(size_t)n;
+  }
+  free(j);return out;
 }
 #endif

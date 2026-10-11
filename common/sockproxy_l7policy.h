@@ -266,6 +266,9 @@ typedef struct {
  * l7_send_reject / l7_send_redirect at the two dispatch seams.
  * ------------------------------------------------------------------------- */
 
+
+/* A modern request only captures headers the policy actually reads. */
+int l7_mcp_header_used(const proxy_map_ent_t *ent, const char *name, size_t len);
 /*
  * l7_policy_evaluate — walk the ordered route array (assumed position-sorted by
  * the attach path, Plan 05) for the parsed request on `pfe`, first-match-wins,

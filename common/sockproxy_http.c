@@ -972,11 +972,13 @@ proxy_sockmap_owned_dirs(proxy_map_ent_t *ent, proxy_epval_t *epv,
     return;
   in.has_l7_policy = ent->has_l7_policy ? 1 : 0;
   if (epv) {
+    in.mcp_stateless = epv->mcp_stateless;
     in.sse_mode = epv->sse_mode;
     in.pd_disagg_mode = epv->pd_disagg_enabled;
     in.ai_gw_mode = epv->ai_gw_mode;
     apikey_auth = epv->apikey_auth;
   } else if (ent->val.ephash) {
+    in.mcp_stateless = ent->val.ephash->mcp_stateless;
     in.sse_mode = ent->val.ephash->sse_mode;
     in.pd_disagg_mode = ent->val.ephash->pd_disagg_enabled;
     in.ai_gw_mode = ent->val.ephash->ai_gw_mode;
@@ -9348,20 +9350,33 @@ static int sp_mcp_enabled(const proxy_fd_ent_t *pfe)
 }
 static int sp_mcp_h1_refuse(proxy_fd_ent_t *pfe, int status)
 {
-  static const char body[] = "{\"error\":\"mcp_request_refused\"}\r\n";
-  char response[320];
+  struct sp_mcp_capture *c=pfe->mcp_capture;
+  size_t blen=0;
+  char *body=sp_mcp_error_json(c?&c->req:NULL,status,c?c->body:NULL,c?c->len:0,&blen);
+  size_t cap=blen+256;
+  char *response=malloc(cap);
   const char *reason = status == 405 ? "Method Not Allowed" : status == 413 ? "Content Too Large" :
                        status == 503 ? "Service Unavailable" : "Bad Request";
-  int n = snprintf(response, sizeof(response),
+  int n=response ? snprintf(response,cap,
       "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
-      "%sConnection: close\r\n\r\n%s", status, reason, sizeof(body)-1,
-      status == 405 ? "Allow: POST\r\n" : "", body);
-  pfe->ai_gw_denied = 1; /* Never enter llhttp's raw-relay fallback. */
-  pfe->lb_err_body_sent = 1;
-  if (n > 0 && (size_t)n < sizeof(response))
-    proxy_send_local_response_and_shutdown(pfe, response, (size_t)n);
-  else shutdown(pfe->fd, SHUT_RDWR);
+      "%sConnection: close\r\n\r\n%s",status,reason,blen,status==405?"Allow: POST\r\n":"",body?body:""):-1;
+  pfe->ai_gw_denied=1;
+  pfe->lb_err_body_sent=1;
+  if (n>0 && (size_t)n<cap) proxy_send_local_response_and_shutdown(pfe,response,(size_t)n);
+  else shutdown(pfe->fd,SHUT_RDWR);
+  free(response);free(body);
   return -1;
+}
+/* A known, bounded Content-Length can be consumed by the normal nonblocking
+ * parser before closing. No synchronous drain or unbounded upload wait. For
+ * oversized/ambiguous framing, keep the immediate fail-closed denial. */
+static int sp_mcp_h1_header_refuse(proxy_fd_ent_t *pfe,int status)
+{
+  if (pfe->mcp_capture && pfe->http_content_length<=SP_MCP_PROXY_BODY_MAX) {
+    pfe->mcp_capture->refusal_status=status;
+    return proxy_send_local_100_continue(pfe);
+  }
+  return sp_mcp_h1_refuse(pfe,status);
 }
 static int sp_mcp_h1_body(llhttp_t *parser, const char *at, size_t len)
 {
@@ -9378,19 +9393,19 @@ static int sp_mcp_h1_headers(proxy_fd_ent_t *pfe, llhttp_t *parser)
   const char *method, *path; int minor;
   if (!pfe->mcp_capture) {
     pfe->mcp_capture = calloc(1, sizeof(*pfe->mcp_capture));
-    if (!pfe->mcp_capture) return sp_mcp_h1_refuse(pfe, 503);
+    if (!pfe->mcp_capture) return sp_mcp_h1_header_refuse(pfe, 503);
   }
   sp_mcp_capture_reset(pfe->mcp_capture);
-  if (parser->method != HTTP_POST) return sp_mcp_h1_refuse(pfe, 405);
-  if (pfe->http_content_length > SP_MCP_PROXY_BODY_MAX) return sp_mcp_h1_refuse(pfe, 413);
+  if (parser->method != HTTP_POST) return sp_mcp_h1_header_refuse(pfe, 405);
+  if (pfe->http_content_length > SP_MCP_PROXY_BODY_MAX) return sp_mcp_h1_header_refuse(pfe, 413);
   int off = phr_parse_request((const char *)pfe->rcvbuf, pfe->rcv_off,
       &method, &ml, &path, &pl, &minor, headers, &nh, 0);
-  if (off < 0 || (size_t)off > 128U*1024U) return sp_mcp_h1_refuse(pfe, 400);
-  if (pl >= sizeof(pfe->url_path)) return sp_mcp_h1_refuse(pfe, 413);
+  if (off < 0 || (size_t)off > 128U*1024U) return sp_mcp_h1_header_refuse(pfe, 400);
+  if (pl >= sizeof(pfe->url_path)) return sp_mcp_h1_header_refuse(pfe, 413);
   memcpy(pfe->url_path,path,pl); pfe->url_path[pl]=0;
   size_t path_len=0;
   while (path_len<pl && path[path_len]!='?') path_len++;
-  if (path_len>=sizeof(pfe->request_path)) return sp_mcp_h1_refuse(pfe, 413);
+  if (path_len>=sizeof(pfe->request_path)) return sp_mcp_h1_header_refuse(pfe, 413);
   memcpy(pfe->request_path,path,path_len); pfe->request_path[path_len]=0;
   pfe->http_path_ok=pfe->http_is_post=1;
   pfe->host_url[0]=0;
@@ -9399,32 +9414,35 @@ static int sp_mcp_h1_headers(proxy_fd_ent_t *pfe, llhttp_t *parser)
   pfe->n_l7_headers = 0;
   struct sp_mcp_media media = {0};
   proxy_map_ent_t *head = pfe->head;
-  if (head->has_l7_policy && nh > L7_MAX_CAPTURED_HEADERS) return sp_mcp_h1_refuse(pfe, 413);
   for (size_t i=0; i<nh; i++) {
-    if (!headers[i].name) return sp_mcp_h1_refuse(pfe, 400);
+    if (!headers[i].name) return sp_mcp_h1_header_refuse(pfe, 400);
     /* MCP-Name is validated and normalized after decoding the full body;
      * its encoded wire value may be longer than its representable L7 value. */
     int mirrored_name=headers[i].name_len==8 &&
       !strncasecmp(headers[i].name,"mcp-name",8);
-    if (head->has_l7_policy &&
+    int used=l7_mcp_header_used(head,headers[i].name,headers[i].name_len);
+    if (used &&
         (headers[i].name_len>=L7_HDR_NAME_MAX ||
          (!mirrored_name && headers[i].value_len>=L7_HDR_VALUE_MAX)))
-      return sp_mcp_h1_refuse(pfe,413);
+      return sp_mcp_h1_header_refuse(pfe,413);
     if (headers[i].name_len==4 && !strncasecmp(headers[i].name,"host",4)) {
       if (++host_count!=1 || !headers[i].value_len || headers[i].value_len>=sizeof(pfe->host_url))
-        return sp_mcp_h1_refuse(pfe,400);
+        return sp_mcp_h1_header_refuse(pfe,400);
       memcpy(pfe->host_url,headers[i].value,headers[i].value_len);
       pfe->host_url[headers[i].value_len]=0;
     }
     sp_mcp_media_header(&media, headers[i].name, headers[i].name_len, headers[i].value, headers[i].value_len);
     sp_mcp_header(&pfe->mcp_capture->req, headers[i].name, headers[i].name_len,
                   headers[i].value, headers[i].value_len);
-    l7_store_header_n(pfe, NULL, headers[i].name, headers[i].name_len,
-                      headers[i].value, headers[i].value_len);
+    if (used) {
+      if (pfe->n_l7_headers>=L7_MAX_CAPTURED_HEADERS) return sp_mcp_h1_header_refuse(pfe,413);
+      l7_store_header_n(pfe, NULL, headers[i].name, headers[i].name_len,
+                        headers[i].value, headers[i].value_len);
+    }
   }
-  if (host_count!=1 || !sp_mcp_media_valid(&media)) return sp_mcp_h1_refuse(pfe, 400);
+  if (host_count!=1 || !sp_mcp_media_valid(&media)) return sp_mcp_h1_header_refuse(pfe, 400);
   pfe->http_hok=pfe->http_hvok=1;
-  if (pfe->mcp_capture->req.error) return sp_mcp_h1_refuse(pfe, pfe->mcp_capture->req.error);
+  if (pfe->mcp_capture->req.error) return sp_mcp_h1_header_refuse(pfe, pfe->mcp_capture->req.error);
   /* The body is withheld for validation; unblock Expect clients locally. */
   return proxy_send_local_100_continue(pfe);
 }
@@ -9432,13 +9450,15 @@ static int sp_mcp_h1_complete(proxy_fd_ent_t *pfe, llhttp_t *parser)
 {
   struct sp_mcp_capture *c = pfe->mcp_capture;
   if (!c) return sp_mcp_h1_refuse(pfe, 400);
+  if (c->refusal_status) return sp_mcp_h1_refuse(pfe,c->refusal_status);
   int status = sp_mcp_validate(&c->req, llhttp_method_name(parser->method), c->body, c->len);
   if (status) return sp_mcp_h1_refuse(pfe, status);
   proxy_map_ent_t *ent = pfe->head;
   if (ent->has_l7_policy) {
-    if (c->req.name_len >= L7_HDR_VALUE_MAX || memchr(c->req.name, 0, c->req.name_len))
+    int name_used=l7_mcp_header_used(ent,"mcp-name",8);
+    if (name_used && (c->req.name_len >= L7_HDR_VALUE_MAX || memchr(c->req.name, 0, c->req.name_len)))
       return sp_mcp_h1_refuse(pfe, 413);
-    int method_found=0, name_found=!c->req.name_seen;
+    int method_found=!l7_mcp_header_used(ent,"mcp-method",10), name_found=!name_used || !c->req.name_seen;
     for (uint16_t i=0; i<pfe->n_l7_headers; i++) {
       if (!strcasecmp(pfe->l7_headers[i].name, "mcp-method")) method_found=1;
       if (!strcasecmp(pfe->l7_headers[i].name, "mcp-name")) {
@@ -13184,8 +13204,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           return -1; // Restart
         }
 
-        // Reset buffer after processing (nghttp2 consumed all data)
+        // Reset buffer after processing (nghttp2 or llhttp consumed all data)
         pfe->rcv_off = 0;
+        if (pfe->read_paused) break; /* bridge high-water: wait for low-water re-arm */
 
         // HTTP/2 handler manages state, skip HTTP/1.1 forwarding below
         continue;

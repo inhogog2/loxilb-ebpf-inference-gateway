@@ -17,10 +17,12 @@ PREFIX = r'''
 #define MAX_PROXY_EP 32
 typedef struct {int n_eps,mcp_stateless;uint32_t _id;fc_state_t fc;
  struct {uint32_t xip;uint16_t xport;uint8_t protocol;} eps[32];} proxy_epval_t;
-typedef struct {fc_permit_t fc;void *epv;int mcp_route_active,ep_num,mcp_retry_pending;
+typedef struct {fc_permit_t fc;void *epv,*head;int mcp_route_active,ep_num,mcp_retry_pending;
  uint32_t mcp_route_mask,mcp_retry_excluded;} proxy_fd_ent_t;
 typedef struct {struct {int ep_cfd,ep_num,connect_pending;} ep_cfds[32];int n_eps;} proxy_ep_sel_t;
 static struct { _Atomic uint64_t pd_connect_failover;} global_stats;
+static int tls_enabled;
+static void *proxy_ent_epctx(void *head){(void)head;return tls_enabled ? (void *)1:NULL;}
 static int dial_result[32],dial_count[32],failed,answered,probes;
 static int sp_mcp_candidate(proxy_epval_t *pool,int c){(void)pool;(void)c;return 1;}
 static int sp_mcp_reserve_probe(proxy_epval_t *pool,int c){(void)pool;(void)c;probes++;return 1;}
@@ -51,6 +53,10 @@ int main(void){
  assert(fc_ep_acquire(&pool.fc,&req.fc,0,0)==FC_ADMIT);
  uint64_t admitted=atomic_load(&pool.fc.decisions[FC_R_ADMITTED]);
  proxy_ep_sel_t out={0};proxy_epval_t *selected=0;uint32_t rid=0;
+ tls_enabled=1;
+ assert(proxy_setup_mcp_retry(&req,&out,&selected,&rid,NULL,0)<0);
+ assert(dial_count[1]==0 && req.fc.ep[0]==0 && req.mcp_retry_pending);
+ tls_enabled=0;
  dial_result[1]=-1;dial_result[2]=1;
  assert(!proxy_setup_mcp_retry(&req,&out,&selected,&rid,NULL,0));
  assert(selected==&pool&&rid==42&&out.n_eps==1&&out.ep_cfds[0].ep_num==2);

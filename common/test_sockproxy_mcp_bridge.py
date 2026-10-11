@@ -30,6 +30,7 @@ PREFIX = r'''
 #define NGHTTP2_DATA 0
 #define NGHTTP2_FLAG_END_STREAM 1
 #define NGHTTP2_NO_ERROR 0
+#define NGHTTP2_ERR_PAUSE (-504)
 #define H2_SESSION_HIGH_WATER (50U*1024U*1024U)
 typedef struct {uint8_t *name,*value;size_t namelen,valuelen;uint8_t flags;} nghttp2_nv;
 typedef struct {struct {int type,stream_id,flags;} hd;} nghttp2_frame;
@@ -78,7 +79,8 @@ static int proxy_h2_backend_on_frame_recv_callback(void *sess,const nghttp2_fram
 }
 static int proxy_h2_backend_on_data_chunk_recv_callback(void *sess,int flags,int id,const uint8_t *data,size_t len,void *arg) {
  (void)sess;(void)flags;(void)id;backend_h2_session_t *bs=arg;
- CHECK(len<=sizeof(bs->body)-bs->body_len);memcpy(bs->body+bs->body_len,data,len);bs->body_len+=len;return 0;
+ CHECK(len<=sizeof(bs->body)-bs->body_len);memcpy(bs->body+bs->body_len,data,len);bs->body_len+=len;
+ return bs->client_session->total_response_buffer_size>=H2_SESSION_HIGH_WATER ? NGHTTP2_ERR_PAUSE:0;
 }
 static int proxy_h2_backend_on_stream_close_callback(void *sess,int id,int code,void *arg) {
  (void)sess;(void)id;(void)code;(void)arg;return 0;
@@ -126,7 +128,11 @@ int main(void){
  const char *first="HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n";
  CHECK(llhttp_execute(&bs.parser,first,strlen(first))==HPE_OK);CHECK(bs.body_len==3&&!bs.completed);
  cs.total_response_buffer_size=H2_SESSION_HIGH_WATER;
- CHECK(llhttp_execute(&bs.parser,"1\r\nx\r\n",6)!=HPE_OK);CHECK(!bs.completed);clear_headers(&m);
+ CHECK(llhttp_execute(&bs.parser,"1\r\nx\r\n",6)==HPE_OK);CHECK(!bs.completed);
+ CHECK(bs.body_len==4 && !memcmp(bs.body,"abcx",4));
+ cs.total_response_buffer_size=0;
+ CHECK(llhttp_execute(&bs.parser,"1\r\ny\r\n0\r\n\r\n",11)==HPE_PAUSED);
+ CHECK(bs.completed==1 && bs.body_len==5 && !memcmp(bs.body,"abcxy",5));clear_headers(&m);
  init(&bs,&cs,&m);bs.bridge_cancelled=1;
  CHECK(llhttp_execute(&bs.parser,first,strlen(first))!=HPE_OK);CHECK(!bs.body_len&&!bs.completed);clear_headers(&m);
  init(&bs,&cs,&m);const char *extra="HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
