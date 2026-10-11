@@ -5569,6 +5569,10 @@ proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
     if (fd_ent) {
       PROXY_ENT_LOCK(fd_ent);
       log_trace("sockproxy rfd %d release", fd_ent->fd);
+      /* Decided here, before the release clears the pause. */
+      if (abandon_leg_wants_reset(pfe->odir, fd_ent->odir, fd_ent->read_paused)) {
+        abandon_leg_arm_reset(fd_ent->fd);
+      }
       proxy_release_fd_ctx(fd_ent, 0);
       notify_delete_ent(proxy_struct->ns, fd_ent->fd, 1);
       pfe->rfd_ent[i] = NULL;
@@ -5788,6 +5792,14 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(s->model, sizeof(s->model), "%s", se_model ? se_model : "");
     pfe->sse_active = 0;
     pfe->stream_end_ts = time(NULL);
+    /* An open stream at the client's teardown: the client left (HUP, reset,
+     * EPIPE on its leg), unless the end was already attributed — the backend
+     * leg died first and marked it. The backend leg of this connection is
+     * shut in this same teardown (proxy_release_rfd_ctx below), which is
+     * what makes the engine abort; this record is the count and the depth. */
+    abandon_record(&global_stats.stream_abandon,
+                   pfe->abandon_reason ? pfe->abandon_reason - 1 : ABANDON_CLIENT_GONE,
+                   pfe->stream_start_ts > 0 ? (long)(pfe->stream_end_ts - pfe->stream_start_ts) : 0);
   }
 
   /* HTTP/2 client connection: settle every stream still in flight. On an
@@ -6326,6 +6338,17 @@ proxy_pdestroy(void *priv)
     }
 
     if (!is_listener) {
+      /* A backend leg ending under an open stream: attribute the end to the
+       * engine before the cascade shuts the client, whose own teardown then
+       * records it under that reason rather than as the client leaving. */
+      if (pfe->odir) {
+        for (int ri = 0; ri < pfe->n_rfd && ri < MAX_PROXY_EP; ri++) {
+          proxy_fd_ent_t *cl = pfe->rfd_ent[ri];
+          if (cl && cl->sse_active && cl->stream_end_ts == 0 && !cl->abandon_reason) {
+            cl->abandon_reason = ABANDON_BACKEND_DIED + 1;
+          }
+        }
+      }
       proxy_release_rfd_ctx(pfe);
     }
     proxy_release_fd_ctx(pfe, 1);
@@ -11042,6 +11065,8 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->inactive_timeout_sec = 0;
   npfe1->sse_active = 0;
   npfe1->stream_start_ts = 0;
+  npfe1->bp_since = 0;
+  npfe1->abandon_reason = 0;
   npfe1->stream_end_ts = 0;
   memset(npfe1->sse_tail, 0, sizeof(npfe1->sse_tail));
   npfe1->sse_tail_len = 0;
@@ -11674,6 +11699,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     }
     pfe->sse_active = 0;
     pfe->stream_start_ts = 0;
+    pfe->bp_since = 0;
+    pfe->abandon_reason = 0;
     pfe->stream_end_ts = 0;
     pfe->sse_tail_len = 0;
     pfe->pd_last_decode_ts = 0;
@@ -12913,6 +12940,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           }
           pfe->sse_active = 0;
           pfe->stream_start_ts = 0;
+          pfe->bp_since = 0;
+          pfe->abandon_reason = 0;
           pfe->stream_end_ts = 0;
           pfe->sse_tail_len = 0;
           pfe->pd_last_decode_ts = 0;
