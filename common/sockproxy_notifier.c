@@ -690,6 +690,42 @@ proxy_liveness_watchdog_thread(void *arg)
   return NULL;
 }
 
+/* Every per-worker table is sized by PROXY_MAX_THREADS; the notifier's
+ * shard table must have room for that many relay shards. */
+_Static_assert(PROXY_MAX_THREADS <= NOTIFY_MAX_RELAY_SHARDS,
+               "PROXY_MAX_THREADS exceeds the notifier's relay shard bound");
+
+/* The relay worker count: LLB_PROXY_WORKERS, read once. A value outside
+ * 1..PROXY_MAX_THREADS (or not a number) keeps the default, so a typo can
+ * neither starve the relay nor overrun the per-worker tables. */
+int
+proxy_num_workers(void)
+{
+  static int resolved = 0;
+  static int n = PROXY_DEFAULT_THREADS;
+
+  if (!__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) {
+    const char *e = getenv(PROXY_WORKERS_ENV);
+    int v = PROXY_DEFAULT_THREADS;
+    if (e && *e) {
+      char *end = NULL;
+      long l = strtol(e, &end, 10);
+      if (end && *end == '\0' && l >= 1 && l <= PROXY_MAX_THREADS) {
+        v = (int)l;
+      } else {
+        log_error("%s=%s is not in 1..%d, running %d relay workers",
+                  PROXY_WORKERS_ENV, e, PROXY_MAX_THREADS, PROXY_DEFAULT_THREADS);
+      }
+    }
+    n = v;
+    __atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
+    if (n != PROXY_DEFAULT_THREADS) {
+      log_info("sockproxy: %d relay workers (%s)", n, PROXY_WORKERS_ENV);
+    }
+  }
+  return n;
+}
+
 int
 proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
            verdict_map_cb_t verdict_map_cb, int ktls_enabled)
@@ -735,7 +771,7 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   proxy_struct->sockmap_cb = sockmap_cb;
   proxy_struct->peer_map_cb = peer_map_cb;
   proxy_struct->verdict_map_cb = verdict_map_cb;
-  proxy_struct->ns = notify_ctx_new(&cbs, PROXY_MAX_THREADS);
+  proxy_struct->ns = notify_ctx_new(&cbs, proxy_num_workers());
   assert(proxy_struct->ns);
 
   // Initialize GLOBAL SNI certificate store
