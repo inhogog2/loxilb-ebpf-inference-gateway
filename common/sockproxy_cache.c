@@ -155,9 +155,12 @@ proxy_add_xmitcache(proxy_fd_ent_t *ent, uint8_t *cache, size_t len)
 
   // ADAPTIVE BACKPRESSURE: Use lower threshold for chunked responses
   // Chunked encoding is fragile - lower threshold prevents SSL timeout corruption
-  // Binary transfers can tolerate higher cache without corruption risk
-  size_t high_water = ent->is_chunked_response ? 
-                      PROXY_CACHE_HIGH_WATER_CHUNKED : PROXY_CACHE_HIGH_WATER;
+  // Binary transfers can tolerate higher cache without corruption risk.
+  // The chunked flag sits on the backend leg (P7) while this cache sits on
+  // the client leg, so the mark is resolved over the entry and its legs
+  // (sockproxy_cache_mark.h); the entry's own flag alone never saw it.
+  size_t high_water;
+  int chunked = proxy_cache_marks(ent, &high_water, NULL);
 
   // Check and set backpressure AFTER updating size (handles large packets that jump over threshold)
   // This is NOT a "logic error" - it's the normal path for setting backpressure
@@ -173,7 +176,7 @@ proxy_add_xmitcache(proxy_fd_ent_t *ent, uint8_t *cache, size_t len)
              ent->fd,
              ent->cache_total_size / (1024.0 * 1024.0),
              high_water / (1024.0 * 1024.0),
-             ent->is_chunked_response);
+             chunked);
 #endif
   }
 
@@ -260,9 +263,12 @@ proxy_check_release_backpressure(proxy_fd_ent_t *ent)
     return; // No backpressure to release
   }
 
-  // ADAPTIVE BACKPRESSURE: Use appropriate threshold for chunked vs non-chunked
-  size_t low_water = ent->is_chunked_response ? 
-                     PROXY_CACHE_LOW_WATER_CHUNKED : PROXY_CACHE_LOW_WATER;
+  // ADAPTIVE BACKPRESSURE: Use appropriate threshold for chunked vs non-chunked,
+  // resolved over the entry and its legs (same selection as the high-water
+  // side in proxy_add_xmitcache, so a cache that armed at the chunked mark
+  // also releases at the chunked mark).
+  size_t low_water;
+  int chunked = proxy_cache_marks(ent, NULL, &low_water);
 
   if (ent->cache_total_size > low_water) {
     // Still above LOW_WATER, keep backpressure active
@@ -272,7 +278,7 @@ proxy_check_release_backpressure(proxy_fd_ent_t *ent)
               ent->fd,
               ent->cache_total_size / (1024.0 * 1024.0),
               low_water / (1024.0 * 1024.0),
-              ent->is_chunked_response);
+              chunked);
 #endif
     return;
   }
@@ -285,7 +291,7 @@ proxy_check_release_backpressure(proxy_fd_ent_t *ent)
            "size=%.2f MB <= %.2f MB threshold, RESUMING READS",
            ent->fd,
            ent->cache_total_size / (1024.0 * 1024.0),
-           PROXY_CACHE_LOW_WATER / (1024.0 * 1024.0));
+           low_water / (1024.0 * 1024.0));
 #endif
   
   // CRITICAL: Re-enable reading on the SOURCE connection that feeds this destination
