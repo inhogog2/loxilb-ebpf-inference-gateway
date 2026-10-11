@@ -800,9 +800,14 @@ test_l7or: test_l7origin
 test_notify_shard: test_notify_shard.c notify.c log.c notify.h
 	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c log.c -I. -lpthread
 
+# The relay shards wait with epoll: dispatch contract + per-event cost vs idle fds.
+test_notify_epoll: test_notify_epoll.c notify.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c log.c -I. -lpthread
+
 .PHONY: test_shard
-test_shard: test_notify_shard
+test_shard: test_notify_shard test_notify_epoll
 	./test_notify_shard
+	./test_notify_epoll
 
 # Global proxy lock accounting: wait and hold time land on the acquiring site,
 # nested and cross-function holds included; the off path records nothing.
@@ -857,3 +862,13 @@ clean:
 test_l2_reflection: test_l2_reflection.c llb_l2_reflection.h
 	$(CC) -g -Wall -Wextra -Werror -fsanitize=address,undefined -o test_l2_reflection test_l2_reflection.c
 	./test_l2_reflection
+
+.PHONY: test_security_aggregate
+test_security_aggregate: test_security_aggregate.c security_aggregate.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_security_aggregate.c -I. -lpthread
+	./test_security_aggregate
+
+.PHONY: test_security_ipv6
+test_security_ipv6: test_security_ipv6.c security_ipv6.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_security_ipv6.c
+	./$@
