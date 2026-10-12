@@ -422,6 +422,9 @@ fc_adapt_reset(fc_state_t *fc, const fc_cfg_t *old)
                         memory_order_relaxed);
 }
 
+static int fc_tenant_table_ensure(fc_state_t *fc);
+static uint32_t fc_tenant_slots_clamp(uint32_t n);
+
 void
 fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
 {
@@ -446,6 +449,12 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
     fc->cfg.ttft_target_ms = FC_TTFT_TARGET_MS_MAX;
   if (fc->cfg.tenant_share_pct > 100)
     fc->cfg.tenant_share_pct = 0;
+  /* The tenant table comes with the pool's first share. A pool that cannot
+   * have one runs without a share, and says so in its read-back. */
+  if (fc_share_active(fc) && fc_tenant_table_ensure(fc) != 0) {
+    fc->cfg.tenant_share_pct = 0;
+    fc->cfg.src[FC_L_TENANT_SHARE] = FC_SRC_DEFAULT;
+  }
   /* A window removed ends every warm-up at once. */
   if (fc->cfg.warmup_ms == 0)
     for (int e = 0; e < FC_MAX_EP; e++)
@@ -457,7 +466,7 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
 }
 
 void
-fc_state_init(fc_state_t *fc)
+fc_state_init_slots(fc_state_t *fc, uint32_t tenant_slots)
 {
   fc_cfg_t cfg;
 
@@ -465,8 +474,15 @@ fc_state_init(fc_state_t *fc)
     return;
   memset(fc, 0, sizeof(*fc));
   pthread_mutex_init(&fc->queue.lock, NULL);
+  fc->tenant_slots = fc_tenant_slots_clamp(tenant_slots);
   fc_cfg_from_env(&cfg);
   fc_state_apply(fc, &cfg);
+}
+
+void
+fc_state_init(fc_state_t *fc)
+{
+  fc_state_init_slots(fc, FC_TENANT_SLOTS);
 }
 
 void
@@ -562,35 +578,219 @@ fc_tenants_active(fc_state_t *fc)
   return n;
 }
 
-/* Lock held. The tenant's slot, taken when it has none: a free one, or the
- * shared last slot once the table is full. Hand it back with
- * fc_tenant_put when nothing was counted on it. */
-static int
-fc_tenant_get(fc_state_t *fc, uint64_t key)
+static uint32_t
+fc_tenant_slots_clamp(uint32_t n)
 {
-  int free_slot = -1;
+  if (n < FC_TENANT_SLOTS)
+    return FC_TENANT_SLOTS;
+  if (n > FC_TENANT_SLOTS_MAX)
+    return FC_TENANT_SLOTS_MAX;
+  return n;
+}
+
+uint32_t
+fc_tenant_slots_from_env(void)
+{
+  return fc_tenant_slots_clamp(fc_env_u32("LLB_FC_TENANT_SLOTS",
+                                          FC_TENANT_SLOTS_DEFAULT, NULL));
+}
+
+uint32_t
+fc_tenant_slots(const fc_state_t *fc)
+{
+  if (!fc)
+    return 0;
+  return fc->tenant_slots ? fc->tenant_slots : FC_TENANT_SLOTS;
+}
+
+/* The lookup index: a bucket is empty, a tombstone (its slot was freed and
+ * a later key's probe run still passes over it), or a slot number plus one. */
+#define FC_TIDX_EMPTY 0u
+#define FC_TIDX_TOMB  0xffffu
+
+_Static_assert(FC_TENANT_SLOTS_MAX + 1 < FC_TIDX_TOMB, "slot + 1 fits a bucket");
+
+static inline uint32_t
+fc_tidx_buckets(const fc_state_t *fc)
+{
+  return 2 * fc->tenant_slots;
+}
+
+static inline uint32_t
+fc_tidx_next(const fc_state_t *fc, uint32_t b)
+{
+  return b + 1 == fc_tidx_buckets(fc) ? 0 : b + 1;
+}
+
+/* Where a key's probe run starts. The key is FNV-1a, whose low bits alone
+ * spread poorly under a modulo: the high half is folded in first. */
+static inline uint32_t
+fc_tidx_home(const fc_state_t *fc, uint64_t key)
+{
+  key ^= key >> 33;
+  key *= 0xff51afd7ed558ccdULL;
+  key ^= key >> 33;
+  return (uint32_t)(key % fc_tidx_buckets(fc));
+}
+
+/* Lock held. The table and its index, made on the pool's first share.
+ * tenant_slots is not zero from here on. */
+static int
+fc_tenant_table_ensure(fc_state_t *fc)
+{
+  uint32_t n;
+
+  if (fc->tenants)
+    return 0;
+  if (fc->tenant_slots == 0)
+    fc->tenant_slots = FC_TENANT_SLOTS;
+  n = fc->tenant_slots;
+  fc->tenants = calloc((size_t)n + 1, sizeof(*fc->tenants));
+  fc->tenant_index = calloc(2 * (size_t)n, sizeof(*fc->tenant_index));
+  if (!fc->tenants || !fc->tenant_index) {
+    free(fc->tenants);
+    free(fc->tenant_index);
+    fc->tenants = NULL;
+    fc->tenant_index = NULL;
+    return -1;
+  }
+  for (uint32_t i = 0; i < n; i++)
+    fc->tenants[i].next_free = (uint16_t)(i + 1);
+  fc->tenant_free = 0;
+  fc->tenants_used = 0;
+  fc->tenant_tombs = 0;
+  fc->tenants_runnable_waiting = 0;
+  fc->tenant_bound = 0;
+  return 0;
+}
+
+/* Lock held. The bucket holding `key`'s slot, or the bucket count when the
+ * key has none; `free_out` is then the bucket a new slot for it goes in.
+ * At most tenant_slots of the 2 * tenant_slots buckets hold a slot, so a
+ * bucket to take always turns up. */
+static uint32_t
+fc_tidx_find(const fc_state_t *fc, uint64_t key, uint32_t *free_out)
+{
+  uint32_t nb = fc_tidx_buckets(fc);
+  uint32_t b = fc_tidx_home(fc, key);
+  uint32_t free_bkt = nb;
+
+  for (uint32_t k = 0; k < nb; k++) {
+    uint16_t v = fc->tenant_index[b];
+
+    if (v == FC_TIDX_EMPTY) {
+      if (free_bkt == nb)
+        free_bkt = b;
+      break;
+    }
+    if (v == FC_TIDX_TOMB) {
+      if (free_bkt == nb)
+        free_bkt = b;
+    } else if (fc->tenants[v - 1].key == key) {
+      return b;
+    }
+    b = fc_tidx_next(fc, b);
+  }
+  if (free_out)
+    *free_out = free_bkt;
+  return nb;
+}
+
+/* Lock held. Lay the index out again from the slots in use. The slots stay
+ * where they are: permits and queue entries name them by number. */
+static void
+fc_tidx_relay(fc_state_t *fc)
+{
+  uint32_t nb = fc_tidx_buckets(fc);
+
+  memset(fc->tenant_index, 0, (size_t)nb * sizeof(*fc->tenant_index));
+  fc->tenant_tombs = 0;
+  for (uint32_t i = 0; i < fc->tenant_slots; i++) {
+    uint32_t b;
+
+    if (!fc->tenants[i].used)
+      continue;
+    b = fc_tidx_home(fc, fc->tenants[i].key);
+    while (fc->tenant_index[b] != FC_TIDX_EMPTY)
+      b = fc_tidx_next(fc, b);
+    fc->tenant_index[b] = (uint16_t)(i + 1);
+  }
+}
+
+/* Lock held. Take a freed slot's bucket out of the index. At the end of
+ * its probe run the bucket is simply empty again, and so are the tombstones
+ * right before it; inside a run it has to stay as a tombstone. Tombstones
+ * lengthen every probe that misses, so past a quarter of the buckets the
+ * index is laid out again. */
+static void
+fc_tidx_drop(fc_state_t *fc, uint64_t key)
+{
+  uint32_t nb = fc_tidx_buckets(fc);
+  uint32_t b = fc_tidx_find(fc, key, NULL);
+
+  if (b == nb)
+    return;
+  if (fc->tenant_index[fc_tidx_next(fc, b)] == FC_TIDX_EMPTY) {
+    fc->tenant_index[b] = FC_TIDX_EMPTY;
+    for (;;) {
+      b = b == 0 ? nb - 1 : b - 1;
+      if (fc->tenant_index[b] != FC_TIDX_TOMB)
+        break;
+      fc->tenant_index[b] = FC_TIDX_EMPTY;
+      fc->tenant_tombs--;
+    }
+    return;
+  }
+  fc->tenant_index[b] = FC_TIDX_TOMB;
+  if (++fc->tenant_tombs > nb / 4)
+    fc_tidx_relay(fc);
+}
+
+/* Lock held. The tenant's slot, taken when it has none: a free one, or the
+ * shared last slot once the table is full (`count` says whether this call
+ * is the request's first look, the one the anomaly is counted on). Hand it
+ * back with fc_tenant_put when nothing was counted on it. -1 when the pool
+ * has no table. */
+static int
+fc_tenant_get(fc_state_t *fc, uint64_t key, int count)
+{
+  uint32_t nb, b, free_bkt = 0;
+  uint32_t slot;
   fc_tenant_t *t;
 
-  for (int i = 0; i < FC_TENANT_SLOTS; i++) {
-    t = &fc->tenants[i];
-    if (t->used && t->key == key)
-      return i;
-    if (!t->used && free_slot < 0)
-      free_slot = i;
+  if (fc_tenant_table_ensure(fc) != 0)
+    return -1;
+  nb = fc_tidx_buckets(fc);
+  b = fc_tidx_find(fc, key, &free_bkt);
+  if (b != nb)
+    return (int)fc->tenant_index[b] - 1;
+  slot = fc->tenant_free;
+  if (slot >= fc->tenant_slots) {
+    slot = fc->tenant_slots;
+    if (count)
+      atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_TENANT_TABLE_FULL], 1,
+                                memory_order_relaxed);
+    t = &fc->tenants[slot];
+    if (!t->used) {
+      t->used = 1;
+      t->key = key;
+      t->inflight = t->queued = 0;
+      t->waiting_runnable = 0;
+      fc->tenants_used++;
+    }
+    return (int)slot;
   }
-  if (free_slot < 0) {
-    free_slot = FC_TENANT_SLOTS;
-    atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_TENANT_TABLE_FULL], 1,
-                              memory_order_relaxed);
-  }
-  t = &fc->tenants[free_slot];
-  if (!t->used) {
-    t->used = 1;
-    t->key = key;
-    t->inflight = t->queued = 0;
-    fc->tenants_used++;
-  }
-  return free_slot;
+  t = &fc->tenants[slot];
+  fc->tenant_free = t->next_free;
+  t->used = 1;
+  t->key = key;
+  t->inflight = t->queued = 0;
+  t->waiting_runnable = 0;
+  fc->tenants_used++;
+  if (fc->tenant_index[free_bkt] == FC_TIDX_TOMB)
+    fc->tenant_tombs--;
+  fc->tenant_index[free_bkt] = (uint16_t)(slot + 1);
+  return (int)slot;
 }
 
 /* Lock held. A slot holding nothing is free again. */
@@ -599,29 +799,60 @@ fc_tenant_put(fc_state_t *fc, int slot)
 {
   fc_tenant_t *t;
 
-  if (slot < 0 || slot > FC_TENANT_SLOTS)
+  if (!fc->tenants || slot < 0 || (uint32_t)slot > fc->tenant_slots)
     return;
   t = &fc->tenants[slot];
-  if (t->used && t->inflight == 0 && t->queued == 0) {
-    t->used = 0;
-    fc->tenants_used--;
-  }
+  if (!t->used || t->inflight != 0 || t->queued != 0)
+    return;
+  t->used = 0;
+  fc->tenants_used--;
+  /* The shared slot has no bucket and is never on the free list. */
+  if ((uint32_t)slot == fc->tenant_slots)
+    return;
+  fc_tidx_drop(fc, t->key);
+  t->next_free = (uint16_t)fc->tenant_free;
+  fc->tenant_free = (uint32_t)slot;
+  /* The last named tenant left: whatever tombstones remain mark nothing. */
+  if (fc->tenant_tombs &&
+      fc->tenants_used == fc->tenants[fc->tenant_slots].used)
+    fc_tidx_relay(fc);
+}
+
+/* Lock held. Keep the slot's place in the count of tenants that wait and
+ * could run, after its inflight or queued count moved. */
+static void
+fc_tenant_mark(fc_state_t *fc, fc_tenant_t *t)
+{
+  uint8_t runnable = t->used && t->queued > 0 &&
+                     (fc->tenant_bound == 0 || t->inflight < fc->tenant_bound);
+
+  if (runnable == t->waiting_runnable)
+    return;
+  t->waiting_runnable = runnable;
+  if (runnable)
+    fc->tenants_runnable_waiting++;
+  else
+    fc->tenants_runnable_waiting--;
 }
 
 /* Lock held. Move one count of the slot down, never below zero. */
 static void
 fc_tenant_dec(fc_state_t *fc, int slot, int queued)
 {
+  fc_tenant_t *t;
   uint32_t *ctr;
 
-  if (slot < 0 || slot > FC_TENANT_SLOTS || !fc->tenants[slot].used)
+  if (!fc->tenants || slot < 0 || (uint32_t)slot > fc->tenant_slots ||
+      !fc->tenants[slot].used)
     return;
-  ctr = queued ? &fc->tenants[slot].queued : &fc->tenants[slot].inflight;
+  t = &fc->tenants[slot];
+  ctr = queued ? &t->queued : &t->inflight;
   if (*ctr == 0)
     atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_UNDERFLOW], 1,
                               memory_order_relaxed);
   else
     (*ctr)--;
+  fc_tenant_mark(fc, t);
   fc_tenant_put(fc, slot);
 }
 
@@ -629,20 +860,29 @@ fc_tenant_dec(fc_state_t *fc, int slot, int queued)
 static inline int
 fc_tenant_can_run(const fc_state_t *fc, int slot, uint32_t bound)
 {
-  return slot < 0 || bound == 0 || fc->tenants[slot].inflight < bound;
+  return slot < 0 || bound == 0 || !fc->tenants ||
+         fc->tenants[slot].inflight < bound;
 }
 
 /* Lock held. Whether anybody waiting could take a unit now: a newcomer
- * waits behind them, not behind waiters held back by their own share. */
+ * waits behind them, not behind waiters held back by their own share. The
+ * count is kept as the tenants' own counts move; it is taken again over the
+ * table only when the bound itself moved (a new share or ceiling, or a step
+ * of the adaptive ceiling). */
 static int
-fc_tenant_waiter_can_run(const fc_state_t *fc, uint32_t bound)
+fc_tenant_waiter_can_run(fc_state_t *fc, uint32_t bound)
 {
-  for (int i = 0; i <= FC_TENANT_SLOTS; i++) {
-    const fc_tenant_t *t = &fc->tenants[i];
-    if (t->used && t->queued > 0 && (bound == 0 || t->inflight < bound))
-      return 1;
+  if (!fc->tenants)
+    return 0;
+  if (bound != fc->tenant_bound) {
+    fc->tenant_bound = bound;
+    fc->tenants_runnable_waiting = 0;
+    for (uint32_t i = 0; i <= fc->tenant_slots; i++) {
+      fc->tenants[i].waiting_runnable = 0;
+      fc_tenant_mark(fc, &fc->tenants[i]);
+    }
   }
-  return 0;
+  return fc->tenants_runnable_waiting > 0;
 }
 
 void
@@ -763,11 +1003,14 @@ fc_service_acquire_shared(fc_state_t *fc, fc_permit_t *p, int can_queue,
   uint32_t bound = fc_tenant_svc_bound(fc);
   fc_verdict_t v = FC_ADMIT;
   int over = 0;
+  fc_tenant_t *t;
   int slot;
 
   pthread_mutex_lock(&fc->queue.lock);
-  slot = fc_tenant_get(fc, p->tkey);
-  if (bound && fc->tenants[slot].inflight >= bound) {
+  /* A woken request was looked up, and counted, when it first arrived. */
+  slot = fc_tenant_get(fc, p->tkey, !woken);
+  t = slot >= 0 ? &fc->tenants[slot] : NULL;
+  if (t && bound && t->inflight >= bound) {
     if (enforce) {
       /* At its share: it waits for one of its own units when it may, and
        * everyone else still admits. */
@@ -796,7 +1039,10 @@ fc_service_acquire_shared(fc_state_t *fc, fc_permit_t *p, int can_queue,
     fc_unit_take(&fc->inflight, 0);
   }
 admitted:
-  fc->tenants[slot].inflight++;
+  if (t) {
+    t->inflight++;
+    fc_tenant_mark(fc, t);
+  }
   pthread_mutex_unlock(&fc->queue.lock);
   p->tslot = (int16_t)slot;
   p->svc_held = 1;
@@ -1203,19 +1449,22 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
       (front || fc->queue.count < fc->cfg.max_queue_depth)) {
     if (fc_share_active(fc)) {
       uint32_t qbound = fc_tenant_queue_bound(fc);
-      tslot = fc_tenant_get(fc, tkey);
+      tslot = fc_tenant_get(fc, tkey, 0);
       /* A request going back to the head already held its place. */
-      if (!front && qbound && fc->tenants[tslot].queued >= qbound)
+      if (tslot >= 0 && !front && qbound &&
+          fc->tenants[tslot].queued >= qbound)
         rc = -2;
       e.tslot = (int16_t)tslot;
     }
     if (rc != -2)
       rc = fc_ring_insert(&fc->queue, &e, front, &slot);
     if (tslot >= 0) {
-      if (rc == 0)
+      if (rc == 0) {
         fc->tenants[tslot].queued++;
-      else
+        fc_tenant_mark(fc, &fc->tenants[tslot]);
+      } else {
         fc_tenant_put(fc, tslot);
+      }
     }
   }
   if (rc == 0) {

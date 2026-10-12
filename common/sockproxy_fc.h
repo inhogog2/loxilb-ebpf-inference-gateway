@@ -140,8 +140,14 @@ enum fc_limit {
 
 /* Tenants a pool tracks by name for the tenant share. Tenants past these are
  * held together to one share in a last, shared slot (counted as an anomaly):
- * the table stays bounded whatever the credentials in use. */
+ * the table stays bounded whatever the credentials in use. The size is fixed
+ * when the pool is created, because permits and queue entries hold slot
+ * numbers: FC_TENANT_SLOTS is the smallest table and what fc_state_init
+ * gives; the gateway creates its pools with LLB_FC_TENANT_SLOTS
+ * (fc_tenant_slots_from_env). */
 #define FC_TENANT_SLOTS 64
+#define FC_TENANT_SLOTS_DEFAULT 256
+#define FC_TENANT_SLOTS_MAX 4096
 
 typedef struct fc_cfg {
   uint8_t  mode;                 /* enum fc_mode */
@@ -284,13 +290,27 @@ typedef struct fc_queue {
 } fc_queue_t;
 
 /* One tenant's hold on a pool: the service units it executes on and the
- * queue entries it waits in. A slot is free again when both are zero. */
+ * queue entries it waits in. A slot is free again when both are zero.
+ * `waiting_runnable` is set while the tenant has a queue entry and room
+ * under its share (counted in fc_state_t.tenants_runnable_waiting);
+ * `next_free` links the free slots. */
 typedef struct fc_tenant {
   uint64_t key;
   uint32_t inflight;
   uint32_t queued;
   uint8_t  used;
+  uint8_t  waiting_runnable;
+  uint16_t next_free;
 } fc_tenant_t;
+
+/* Slot numbers travel as int16_t (permit, queue entry) and the lookup index
+ * holds slot + 1 in a uint16_t beside two reserved values. */
+_Static_assert(sizeof(fc_tenant_t) == 24, "fc_tenant_t size");
+_Static_assert(sizeof(fc_queue_ent_t) == 32, "fc_queue_ent_t size");
+_Static_assert(FC_TENANT_SLOTS_MAX < INT16_MAX, "tenant slot fits int16_t");
+_Static_assert(FC_TENANT_SLOTS <= FC_TENANT_SLOTS_DEFAULT &&
+               FC_TENANT_SLOTS_DEFAULT <= FC_TENANT_SLOTS_MAX,
+               "tenant slot bounds");
 
 /* Per-service (per model pool) admission state. Zero-initialised memory is a
  * valid `off` state, which is what a pool that predates this module looks
@@ -316,12 +336,24 @@ typedef struct fc_state {
   _Atomic uint64_t warm_since_ns[FC_MAX_EP];
   _Atomic uint32_t ttft_ewma_ms[FC_MAX_EP];
   _Atomic uint64_t ttft_ts_ns[FC_MAX_EP];
-  /* The tenant share: slots by tenant key, the last one shared by tenants
-   * past the table. Under queue.lock, which every path that moves a queue
-   * entry already holds; taken on the admission path only while a share is
-   * set. */
-  fc_tenant_t tenants[FC_TENANT_SLOTS + 1];
+  /* The tenant share: `tenant_slots` slots by tenant key and one more,
+   * shared by tenants past the table. Under queue.lock, which every path
+   * that moves a queue entry already holds; taken on the admission path only
+   * while a share is set. The table is allocated when the pool first runs
+   * with a share and stays with the pool from then on: a release may still
+   * arrive after fc_state_destroy. Slots never move while they are held;
+   * `tenant_index` finds a slot by key (open addressing, 2 * tenant_slots
+   * buckets) and is the only part that is ever re-laid. */
+  fc_tenant_t *tenants;
+  uint16_t *tenant_index;
+  uint32_t tenant_slots;         /* fixed at fc_state_init; 0 reads as FC_TENANT_SLOTS */
   uint32_t tenants_used;
+  uint32_t tenant_free;          /* head of the free slots, tenant_slots = none */
+  uint32_t tenant_tombs;         /* index buckets left behind by freed slots */
+  /* Tenants with a queue entry and room under `tenant_bound`, the per-tenant
+   * unit bound the count was last taken with. */
+  uint32_t tenants_runnable_waiting;
+  uint32_t tenant_bound;
 } fc_state_t;
 
 enum fc_permit_state {
@@ -369,6 +401,12 @@ void fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rul
 /* Whether two configurations differ in any value or source. */
 int fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b);
 void fc_state_init(fc_state_t *fc);
+/* The same with the tenant table sized: `tenant_slots` held to
+ * FC_TENANT_SLOTS..FC_TENANT_SLOTS_MAX. */
+void fc_state_init_slots(fc_state_t *fc, uint32_t tenant_slots);
+/* LLB_FC_TENANT_SLOTS held to the same range; FC_TENANT_SLOTS_DEFAULT when
+ * unset or not a number. Process-wide: there is no per-rule value. */
+uint32_t fc_tenant_slots_from_env(void);
 /* Apply a configuration to a live pool. The queue ring grows to the new
  * depth when needed; entries already waiting are kept in order. */
 void fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg);
@@ -446,6 +484,8 @@ uint32_t fc_tenant_svc_bound(const fc_state_t *fc);
 uint32_t fc_tenant_queue_bound(const fc_state_t *fc);
 /* Tenants holding a unit or a queue entry on the pool now. */
 uint32_t fc_tenants_active(fc_state_t *fc);
+/* Tenants the pool tracks by name: the table size in force. */
+uint32_t fc_tenant_slots(const fc_state_t *fc);
 
 /* Capacity permits apply to inference requests only: a POST on one of the
  * inference paths. Everything else on an AI service (model listings, health

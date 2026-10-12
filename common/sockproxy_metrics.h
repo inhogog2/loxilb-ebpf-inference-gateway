@@ -346,13 +346,15 @@ typedef struct proxy_fc_svc_stat {
     uint8_t  src_tenant;                   /* source of tenant_share_pct */
     uint8_t  expose_headers;               /* 1 when admitted responses carry the admission headers */
     uint8_t  src_expose;                   /* source of expose_headers */
+    uint32_t tenant_slots;                 /* tenants the pool tracks by name: the table size in force */
+    uint32_t pad3;
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
  * definition, and its test links a stub with a third: all three pin the
  * same layout, so a field moved in one without the others fails to build
  * instead of shifting every counter after it. */
-_Static_assert(sizeof(proxy_fc_svc_stat_t) == 368, "proxy_fc_svc_stat_t size");
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 376, "proxy_fc_svc_stat_t size");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 144, "pool offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 208, "queued offset");
@@ -366,6 +368,7 @@ _Static_assert(offsetof(proxy_fc_svc_stat_t, adaptive) == 332, "adaptive offset"
 _Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 338, "warming_eps offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 344, "adapt_down offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, tenants_active) == 360, "tenants_active offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, tenant_slots) == 368, "tenant_slots offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every

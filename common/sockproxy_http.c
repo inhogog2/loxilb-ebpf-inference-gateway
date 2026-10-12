@@ -3328,7 +3328,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * tepval calloc, untouched when LLB_PD_QUEUE_DEPTH_PER_EP is 0 (default-off). */
         pthread_mutex_init(&tepval->pd_parked_lock, NULL);
         fc_set_wake_hook(sp_fc_wake);
-        fc_state_init(&tepval->fc);
+        fc_state_init_slots(&tepval->fc, fc_tenant_slots_from_env());
         sp_fc_apply_rule(tepval, arg, new_ent, 1);
         tepval->hold_mode = arg->half_close_mode;
         /* allocate radix trie for Tier 1 cache affinity */
@@ -3749,7 +3749,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   /* bounded backpressured admission — per-EP parked FIFO lock. */
   pthread_mutex_init(&tepval->pd_parked_lock, NULL);
   fc_set_wake_hook(sp_fc_wake);
-  fc_state_init(&tepval->fc);
+  fc_state_init_slots(&tepval->fc, fc_tenant_slots_from_env());
   sp_fc_apply_rule(tepval, arg, new_ent, 1);
   tepval->hold_mode = arg->half_close_mode;
   /* allocate radix trie for Tier 1 cache affinity */
@@ -4723,6 +4723,7 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   st->adapt_down = atomic_load_explicit(&fc->adapt_moves[0], memory_order_relaxed);
   st->adapt_up = atomic_load_explicit(&fc->adapt_moves[1], memory_order_relaxed);
   st->tenants_active = fc_tenants_active((fc_state_t *)fc);
+  st->tenant_slots = fc_tenant_slots(fc);
   st->tenant_share_pct = fc->cfg.tenant_share_pct;
   st->src_tenant = fc->cfg.src[FC_L_TENANT_SHARE];
   st->expose_headers = fc->cfg.expose_headers;

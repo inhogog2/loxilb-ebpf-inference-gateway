@@ -381,13 +381,17 @@ test_fc_tenant: test_fc_tenant.c sockproxy_fc.c sockproxy_fc.h
 test_fc_expose: test_fc_expose.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_expose.c sockproxy_fc.c -I. -lpthread
 
+test_fc_tenant_slots: test_fc_tenant_slots.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -Wl,--wrap=calloc -o $@ test_fc_tenant_slots.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
 	./test_fc_tenant
 	./test_fc_expose
+	./test_fc_tenant_slots
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.
