@@ -38,6 +38,12 @@ int select_healthy_endpoint(proxy_epval_t *tepval, int algorithm_selection);
 
 /* Initialize circuit breaker state for an endpoint */
 void circuit_breaker_init(circuit_breaker_t *cb);
+/* Order: PROXY_LOCK -> CB guard. Never run reentrant callbacks under CB guard. */
+void circuit_breaker_lock(void);
+void circuit_breaker_unlock(void);
+int circuit_breaker_candidate(proxy_epval_t *pool, int ep);
+void circuit_breaker_configure_pool(proxy_epval_t *pool, uint8_t enabled,
+                                   uint32_t failure_threshold, uint32_t open_timeout_sec);
 
 /* Returns 1 if the circuit breaker says to skip this endpoint, 0 otherwise */
 int circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index);

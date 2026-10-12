@@ -40,6 +40,7 @@
 #include <sys/socket.h>  /* send / shutdown (terminal synthetic-response idiom) */
 
 #include "sockproxy_l7policy.h"
+#include "sockproxy_health.h" /* CB snapshot guard */
 #include "sockproxy_internal.h" /* proxy_struct_t, proxy_struct, PROXY_LOCK/UNLOCK (attach) */
 #include "sockproxy_cache.h"    /* cmp_proxy_ent — entry equality at attach/detach */
 #include "sockproxy_cookie.h"   /* stateless cookie token derive/verify (pure) */
@@ -326,6 +327,7 @@ l7_policy_evaluate(struct proxy_fd_ent *pfe, const l7_route_t *routes,
     /* First match wins — copy the route's action into the decision. */
     memset(decision_out, 0, sizeof(*decision_out));
     decision_out->kind = route->action.kind;
+    decision_out->route_index = i;
     switch (route->action.kind) {
     case L7A_FORWARD:
       decision_out->u.fwd = route->action.u.fwd;
@@ -556,7 +558,11 @@ l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
   /* Start from a byte copy of the base pool so the EP-select switch sees the same
    * shape, THEN strip every shared owned pointer (we must never free those via the
    * scratch) and reset the per-pool selection state. */
+  /* CB writers run independently of the proxy global lock; protect the
+   * byte snapshot too. The guard is static, so no locked object is copied. */
+  circuit_breaker_lock();
   memcpy(sub, base, sizeof(*sub));
+  circuit_breaker_unlock();
   sub->hash_ring        = NULL;     /* never touch CHWBL state through the scratch */
   sub->chwbl_config     = NULL;
   sub->pd_trie          = NULL;
@@ -732,13 +738,19 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
 {
   l7_decision_t d;
   const l7_route_t *routes;
+  int mcp_locked=ent && ent->val.ephash && ent->val.ephash->mcp_stateless;
+  /* Readers previously raced regfree/free at policy replacement. Hold the
+   * generation only while evaluating/copying; response callbacks run unlocked. */
+  if (mcp_locked) PROXY_RDLOCK();
 
   /* DISCRIMINATOR: no L7 policy attached => pure no-op fall-through, so
  * every AI/model service runs UNCHANGED (Pitfall 5). This is
    * the first reader of has_l7_policy (declared on proxy_map_ent by Plan 04;
    * populated by Plan 05's proxy_attach_l7_policy). */
-  if (!ent || !ent->has_l7_policy)
+  if (!ent || !ent->has_l7_policy) {
+    if (mcp_locked) PROXY_UNLOCK();
     return L7_DISPATCH_FALLTHROUGH;
+  }
 
   routes = (const l7_route_t *)ent->l7_routes; /* opaque void* on proxy_map_ent */
 
@@ -746,6 +758,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
   if (l7_policy_evaluate(pfe, routes, ent->n_l7_routes, &d) == 0) {
     switch (d.kind) {
     case L7A_REJECT:
+      if (mcp_locked) PROXY_UNLOCK();
       l7_send_reject(pfe, d.u.reject.status_code, d.reject_body);
       return L7_DISPATCH_TERMINATED;
     case L7A_REDIRECT:
@@ -755,15 +768,49 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
        * the per-connection (H1) / stream-mirrored (H2) request fields. On failure to
        * resolve a target, d.location stays empty and l7_send_redirect fails closed to
  * 400 rather than emitting an injectable/invalid header. */
+      if (mcp_locked) PROXY_UNLOCK();
       l7_assemble_redirect_location(pfe, &d.u.redir, d.location, sizeof(d.location));
       l7_send_redirect(pfe, d.u.redir.status_code, d.location);
       return L7_DISPATCH_TERMINATED;
     case L7A_FORWARD:
-      if (tepval_out)
+      if (ent->val.ephash && ent->val.ephash->mcp_stateless) {
+        /* Keep original endpoint indices and base-pool lifetime. A narrowed
+         * shared scratch would reset RR and be retained by backend legs. */
+        if (d.route_index < 0 || d.route_index >= 256) {
+          if (mcp_locked) PROXY_UNLOCK();
+          l7_send_reject(pfe, 503, NULL);
+          return L7_DISPATCH_TERMINATED;
+        }
+        pfe->mcp_route_mask=0;
+        memset(pfe->mcp_route_weights,0,sizeof(pfe->mcp_route_weights));
+        for (int ri=0; ri<d.u.fwd.n_refs && ri<MAX_PROXY_EP; ri++) {
+          uint32_t ei=d.u.fwd.refs[ri].ep;
+          if (ei >= (uint32_t)ent->val.ephash->n_eps || ei>=MAX_PROXY_EP) continue;
+          pfe->mcp_route_mask |= UINT32_C(1)<<ei;
+          pfe->mcp_route_weights[ei]=d.u.fwd.refs[ri].weight;
+        }
+        if (d.u.fwd.n_refs && !pfe->mcp_route_mask) {
+          if (mcp_locked) PROXY_UNLOCK();
+          l7_send_reject(pfe, 503, NULL);
+          return L7_DISPATCH_TERMINATED;
+        }
+        if (!d.u.fwd.n_refs) {
+          for (int ei=0; ei<ent->val.ephash->n_eps && ei<MAX_PROXY_EP; ei++)
+            pfe->mcp_route_mask |= UINT32_C(1)<<ei;
+        }
+        pfe->mcp_selector_state=&ent->mcp_l7_selector[d.route_index];
+        pfe->mcp_route_active=1;
+        pfe->mcp_route_ticket=atomic_fetch_add_explicit(
+            &ent->mcp_l7_rr_ticket[d.route_index],1,memory_order_relaxed);
+        if (tepval_out) *tepval_out=ent->val.ephash;
+      } else if (tepval_out) {
         *tepval_out = l7_resolve_pool(ent, &d.u.fwd);
+      }
+      if (mcp_locked) PROXY_UNLOCK();
       return L7_DISPATCH_FORWARD;
     default:
       /* Unknown action kind — terminal default reject. */
+      if (mcp_locked) PROXY_UNLOCK();
       l7_send_reject(pfe, 404, NULL);
       return L7_DISPATCH_TERMINATED;
     }
@@ -771,6 +818,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
 
   /* No route matched: Gateway no-match default is 404 (configurable, RESEARCH
    * Open-Questions resolution). */
+  if (mcp_locked) PROXY_UNLOCK();
   l7_send_reject(pfe, 404, NULL);
   return L7_DISPATCH_TERMINATED;
 }
@@ -913,6 +961,8 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
                      l7_hdr_emit_fn emit, void *ctx)
 {
   const l7_route_t *route;
+  l7_hdr_filter_t filters[L7_MAX_HDR_FILTERS];
+  int modern;
   char port_str[8];
   uint8_t i, n;
 
@@ -959,15 +1009,16 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
     emit(ctx, L7HDR_SET, "X-Forwarded-Proto", xfproto);
 
   /* (4) The matched route's bounded insertHeaders ops. */
+  modern=ent->val.ephash && ent->val.ephash->mcp_stateless;
+  if (modern) PROXY_RDLOCK();
   route = l7_first_matching_route(pfe, (proxy_map_ent_t *)ent);
-  if (!route)
-    return;
-
-  n = route->n_hdr_filters;
-  if (n > L7_MAX_HDR_FILTERS)
-    n = L7_MAX_HDR_FILTERS;               /* DoS bound */
+  n=route ? route->n_hdr_filters : 0;
+  if (n > L7_MAX_HDR_FILTERS) n=L7_MAX_HDR_FILTERS;
+  if (n) memcpy(filters,route->hdr_filters,(size_t)n*sizeof(filters[0]));
+  if (modern) PROXY_UNLOCK();
+  /* No route-owned pointer reaches emit, which can call protocol callbacks. */
   for (i = 0; i < n; i++) {
-    const l7_hdr_filter_t *f = &route->hdr_filters[i];
+    const l7_hdr_filter_t *f = &filters[i];
     /* Reject control-char names/values at APPLY time (defence-in-depth behind the
  * REST 400) — a bad entry is SKIPPED, never spliced. */
     if (!l7_hdr_name_valid(f->name))
@@ -1062,6 +1113,7 @@ l7_cookie_node_match(const struct proxy_map_ent *node,
 int
 l7_cookie_persist_active(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent)
 {
+  if (ent && ent->val.ephash && ent->val.ephash->mcp_stateless) return 0;
   const l7_route_t *route;
   if (!pfe || !ent || !ent->has_l7_policy)
     return 0;
@@ -1255,7 +1307,27 @@ int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
   node = proxy_struct->head;
   while (node) {
     if (cmp_proxy_ent(&node->key, key)) {
+      if (node->val.ephash && node->val.ephash->mcp_stateless) {
+        if (n_routes>256) {
+          PROXY_UNLOCK(); l7_free_routes(copy,n_routes); return -1;
+        }
+        for (int ri=0; ri<n_routes; ri++) {
+          if (copy[ri].cookie_persist || copy[ri].n_hdr_filters>L7_MAX_HDR_FILTERS) {
+            PROXY_UNLOCK(); l7_free_routes(copy,n_routes); return -1;
+          }
+          for (uint8_t hi=0; hi<copy[ri].n_hdr_filters; hi++) {
+            const char *name=copy[ri].hdr_filters[hi].name;
+            if (!memchr(name,0,L7_HDR_NAME_MAX) || !strncasecmp(name,"mcp-",4) ||
+                !strcasecmp(name,"content-type") || !strcasecmp(name,"content-length") ||
+                !strcasecmp(name,"transfer-encoding") || !strcasecmp(name,"accept")) {
+              PROXY_UNLOCK(); l7_free_routes(copy,n_routes); return -1;
+            }
+          }
+        }
+      }
       l7_clear_attached(node);          /* replace any prior policy (regfree) */
+      for (int ri=0; ri<256; ri++)
+        atomic_store_explicit(&node->mcp_l7_rr_ticket[ri],0,memory_order_relaxed);
       node->l7_routes = copy;           /* POPULATE Plan-04 discriminator field */
       node->n_l7_routes = n_routes;     /* POPULATE Plan-04 discriminator field */
       node->has_l7_policy = 1;          /* POPULATE Plan-04 discriminator field */
@@ -1366,4 +1438,21 @@ int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
   log_error("l7policy trusted ranges: NO PROXY SERVICE for xip=0x%08x xport=%u proto=%u",
             (unsigned)key->xip, (unsigned)key->xport, (unsigned)key->protocol);
   return -1;
+}
+
+/* Do not apply the 256-byte routing operand limit to unrelated credentials.
+ * Cookie predicates use the Cookie header as their operand source. */
+int l7_mcp_header_used(const proxy_map_ent_t *ent, const char *name, size_t len)
+{
+  if (!ent || !ent->has_l7_policy || !ent->l7_routes) return 0;
+  const l7_route_t *routes=ent->l7_routes;
+  for (int i=0;i<ent->n_l7_routes;i++)
+    for (unsigned j=0;j<routes[i].n_sets;j++)
+      for (unsigned k=0;k<routes[i].sets[j].n_conds;k++) {
+        const l7_condition_t *cond=&routes[i].sets[j].conds[k];
+        if (cond->field==L7F_HEADER && strlen(cond->key)==len &&
+            !strncasecmp(cond->key,name,len)) return 1;
+        if (cond->field==L7F_COOKIE && len==6 && !strncasecmp(name,"cookie",6)) return 1;
+      }
+  return 0;
 }

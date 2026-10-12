@@ -43,6 +43,8 @@
 #include "sockproxy_health.h"   /* is_endpoint_healthy, circuit_breaker_record_failure/success */
 #include "sockproxy_kv_exact.h" /* pd_kv_exact_select (single-role Tier-1.5 branch) */
 #include "sockproxy_conv_pool.h" /* conv_pool_tag_of_key, conv_pool_tag_matches */
+#define SP_MCP_PROXY_SELECTOR
+#include "sockproxy_mcp_rr.h"
 #include "sockproxy_ep.h"       /* own header */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 
@@ -86,6 +88,72 @@ sp_kv_sr_unit_move(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int to)
   atomic_fetch_add(&tepval->pd_ep_loads[to].active_conns, 1);
   pfe->kv_sr_load_held = 1;
   pfe->kv_sr_ep_idx = to;
+}
+
+/* Only the modern connect-retry path calls this: it keeps the original
+ * service permit, but an endpoint unit must precede each new socket dial.
+ * fc_permit_move reserves with CAS and does not admit the request twice. */
+static int
+sp_mcp_retry_reserve(proxy_epval_t *pool, proxy_fd_ent_t *pfe, int candidate)
+{
+  if (candidate < 0 || candidate >= pool->n_eps || candidate >= MAX_PROXY_EP ||
+      (pfe->mcp_route_active &&
+       !(pfe->mcp_route_mask & (UINT32_C(1) << candidate))))
+    return 0;
+  if (fc_permit_move(&pfe->fc, FC_ROLE_NORMAL, candidate) != 0)
+    return 0;                         /* full: never open this backend socket */
+  if (!sp_mcp_reserve_probe(pool, candidate)) {
+    fc_release_role(&pfe->fc, FC_ROLE_NORMAL);
+    return 0;
+  }
+  return 1;
+}
+
+/* Retry only the held request whose first TCP handshake failed. The base
+ * pool and route mask are the original validated dispatch snapshot. */
+int
+proxy_setup_mcp_retry(proxy_fd_ent_t *pfe, proxy_ep_sel_t *out,
+                      proxy_epval_t **epv, uint32_t *rid,
+                      const void *pp2hdr, int pp2len)
+{
+  proxy_epval_t *pool = (proxy_epval_t *)pfe->epv;
+  if (proxy_ent_epctx(pfe->head)) return -1; /* async retry is plaintext-only */
+  if (!pool || !pool->mcp_stateless || pool->n_eps <= 0 ||
+      pool->n_eps > MAX_PROXY_EP || !pfe->mcp_retry_pending)
+    return -1;
+  fc_release_role(&pfe->fc, FC_ROLE_NORMAL);
+  for (int a = 1; a <= pool->n_eps; a++) {
+    int c = (pfe->ep_num + a) % pool->n_eps;
+    uint32_t bit = UINT32_C(1) << c;
+    if (pfe->mcp_retry_excluded & bit) continue;
+    pfe->mcp_retry_excluded |= bit; /* every candidate considered at most once */
+    if (!sp_mcp_candidate(pool, c) || !sp_mcp_retry_reserve(pool, pfe, c))
+      continue;
+    int pending = 0;
+    int fd = proxy_setup_ep_connect_async(pool->eps[c].xip, pool->eps[c].xport,
+                                           pool->eps[c].protocol, pfe,
+                                           pp2hdr, pp2len, &pending);
+    if (fd < 0) {
+      fc_release_role(&pfe->fc, FC_ROLE_NORMAL);
+      circuit_breaker_record_failure(pool, c);
+      continue;
+    }
+    out->ep_cfds[0].ep_cfd = fd;
+    out->ep_cfds[0].ep_num = c;
+    out->ep_cfds[0].connect_pending = pending;
+    out->n_eps = 1;
+    *epv = pool;
+    *rid = pool->_id;
+    pfe->mcp_retry_pending = 0;
+    if (!pending) circuit_breaker_record_success(pool, c);
+    atomic_fetch_add(&global_stats.pd_connect_failover, 1);
+    return 0;
+  }
+  pfe->mcp_retry_pending = 0;
+  proxy_send_backend_unreachable(pfe,
+      "no eligible backend endpoint accepted the connection");
+  pfe->lb_err_body_sent = 1;
+  return -1;
 }
 
 /* =========================================================================
@@ -435,6 +503,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                  const void *pp2hdr, int pp2len)  // PROXY protocol v2 header (L7 fullproxy)
 {
   int sel = 0;
+  if (pfe) pfe->mcp_route_active=0;
   uint32_t epip;
   uint16_t epport;
   uint8_t epprotocol;
@@ -617,7 +686,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
          * the client socket and ends the request before any backend byte.
          * Only AI-gateway pools take the gate, so a plain rule's dispatch
          * is byte for byte what it was. */
-        if (pfe && tepval->ai_gw_mode) {
+        if (pfe && (tepval->ai_gw_mode || tepval->mcp_stateless)) {
           int fc_rc = sp_fc_h1_gate_service(pfe, tepval);
           if (fc_rc == SP_FC_H1_QUEUED)
             return PD_SETUP_PARKED;      /* parked: the caller suspends the client */
@@ -629,6 +698,16 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
+        if (tepval->mcp_stateless && pfe) {
+          algorithm_selection=sp_mcp_request_select(tepval,pfe);
+          if (algorithm_selection<0) {
+            static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            fc_permit_release(&pfe->fc);
+            pfe->lb_err_body_sent=1;
+            proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
+            return -1;
+          }
+        }
 
         /* L7 session-header stickiness overlay (default-off). Populated at the
          * selection point below (after the algorithmic selectors) so a learned
@@ -697,7 +776,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             break;
           
           case PROXY_SEL_WRR:  // P3: Weighted Round-Robin
-            algorithm_selection = wrr_select_endpoint(tepval);
+            if (!tepval->mcp_stateless) algorithm_selection = wrr_select_endpoint(tepval);
             if (algorithm_selection < 0) {
               log_error("P3: WRR selection failed, falling back to round-robin");
               algorithm_selection = -1;
@@ -755,14 +834,14 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             break;
             
           default:
-            // Will use round-robin below
-            algorithm_selection = -1;
+            // Modern RR was selected with an atomic request ticket above.
+            if (!tepval->mcp_stateless) algorithm_selection = -1;
             break;
         }
 #else
         // P3: WRR support (without HAVE_DP_GPU_ROUTING flag)
         if (tepval->select == PROXY_SEL_WRR) {
-          algorithm_selection = wrr_select_endpoint(tepval);
+          if (!tepval->mcp_stateless) algorithm_selection = wrr_select_endpoint(tepval);
           if (algorithm_selection < 0) {
             log_error("P3: WRR selection failed, falling back to round-robin");
             algorithm_selection = -1;
@@ -1100,7 +1179,7 @@ pd_fallback_normal:
         /* Capacity admission, endpoint level: the pick above is a preference,
          * the unit is the decision. A pick over its ceiling moves to another
          * eligible endpoint with room, or the request is refused. */
-        if (pfe && tepval->ai_gw_mode) {
+        if (pfe && (tepval->ai_gw_mode || tepval->mcp_stateless)) {
           int fc_sel = sp_fc_h1_gate_endpoint(pfe, tepval, sel);
           if (fc_sel < 0 && h2_load_units_active(tepval)) {
             /* Bounded-load selectors counted the pick as a connection unit,
@@ -1143,6 +1222,13 @@ pd_fallback_normal:
           }
         }
 
+        if (tepval->mcp_stateless && !sp_mcp_reserve_probe(tepval,sel)) {
+          static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+          fc_permit_release(&pfe->fc);
+          pfe->lb_err_body_sent=1;
+          proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
+          return -1;
+        }
         epip = tepval->eps[sel].xip;
         epport = tepval->eps[sel].xport;
         epprotocol = tepval->eps[sel].protocol;
@@ -1341,29 +1427,52 @@ pd_fallback_normal:
             uint32_t nx_excluded =
                 (sel >= 0 && sel < 32) ? (1u << (unsigned)sel) : 0;
             int nx_fd = -1, nx_sel = -1;
+            if (tepval->mcp_stateless) {
+              fc_release_role(&pfe->fc, FC_ROLE_NORMAL); /* failed original dial */
+              pfe->mcp_retry_excluded |= nx_excluded;
+            }
 
             for (int nx_try = 0; nx_try < tepval->n_eps; nx_try++) {
               int cand = -1;
               for (int a = 0; a < tepval->n_eps && a < 32; a++) {
-                int c = (tepval->ep_sel + a) % tepval->n_eps;
+                int c = tepval->mcp_stateless ?
+                    (sel + 1 + a) % tepval->n_eps :
+                    (tepval->ep_sel + a) % tepval->n_eps;
                 if (c < 0 || c >= 32) continue;
+                if (tepval->mcp_stateless && pfe->mcp_route_active &&
+                    !(pfe->mcp_route_mask & (UINT32_C(1)<<c))) continue;
                 if (nx_excluded & (1u << (unsigned)c)) continue;
-                if (!is_endpoint_healthy(tepval, c)) continue;
+                if (tepval->mcp_stateless ? !sp_mcp_candidate(tepval,c) :
+                    !is_endpoint_healthy(tepval,c)) continue;
                 cand = c;
                 break;
               }
               if (cand < 0) break;  /* no healthy candidates left */
 
-              nx_fd = proxy_setup_ep_connect(tepval->eps[cand].xip,
+              if (tepval->mcp_stateless && !sp_mcp_retry_reserve(tepval,pfe,cand)) {
+                nx_excluded |= UINT32_C(1)<<cand;
+                continue;
+              }
+              if (tepval->mcp_stateless)
+                pfe->mcp_retry_excluded |= UINT32_C(1) << cand;
+              if (tepval->mcp_stateless && pfe->connect_async_ok && !ssl_ctx) {
+                nx_fd = proxy_setup_ep_connect_async(tepval->eps[cand].xip,
+                    tepval->eps[cand].xport, tepval->eps[cand].protocol, pfe,
+                    pp2hdr, pp2len, &ep_sel->ep_cfds[0].connect_pending);
+              } else nx_fd = proxy_setup_ep_connect(tepval->eps[cand].xip,
                                              tepval->eps[cand].xport,
                                              tepval->eps[cand].protocol,
                                              ssl_ctx, ssl, pfe, pp2hdr, pp2len);
               if (nx_fd >= 0) {
                 nx_sel = cand;
-                tepval->ep_sel = cand + 1;  /* keep RR rotation moving */
+                if (!tepval->mcp_stateless)
+                  tepval->ep_sel = cand + 1;  /* keep legacy RR rotation moving */
                 break;
               }
-              /* This candidate is also unreachable — condemn and continue. */
+              /* This candidate is also unreachable — its endpoint unit goes
+               * back before another candidate is tried; service stays held. */
+              if (tepval->mcp_stateless)
+                fc_release_role(&pfe->fc, FC_ROLE_NORMAL);
               circuit_breaker_record_failure(tepval, cand);
               nx_excluded |= 1u << (unsigned)cand;
             }

@@ -14,6 +14,7 @@
 #define __SOCKPROXY_H2_H__
 
 #include <nghttp2/nghttp2.h>
+#include "llhttp.h"
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
@@ -261,6 +262,13 @@ typedef struct backend_send_buffer {
  * Manages HTTP/2 connection to backend server
  */
 typedef struct backend_h2_session {
+  /* MCP-only frontend H2 -> backend H1: one session/connection per stream.
+   * The backend pfe owns fd/TLS; this object owns framing and mapping only. */
+  uint8_t bridge_h1, bridge_done, bridge_cancelled, bridge_value_started;
+  llhttp_t bridge_parser;
+  llhttp_settings_t bridge_settings;
+  char bridge_field[128], bridge_value[16384];
+  size_t bridge_field_len, bridge_value_len, bridge_header_bytes;
   int backend_fd;                    // Backend socket FD
   nghttp2_session *session;          // nghttp2 backend session (client mode)
   proxy_h2_session_t *client_session; // Link to client-side session
@@ -400,6 +408,10 @@ int proxy_h2_handle_client_data(proxy_fd_ent_t *pfe);
  * @return 0 on success, -1 on error
  */
 int proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe);
+/* H1 bridge EOF/errors are isolated to their own H2 stream. */
+int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe, int clean_eof);
+/* Pure C detach; called under PROXY_LOCK before backend pair teardown. */
+void proxy_h2_h1_backend_detach(proxy_fd_ent_t *pfe);
 
 /**
  * Forward HTTP/2 stream to backend

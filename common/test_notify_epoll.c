@@ -35,6 +35,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
@@ -477,26 +479,85 @@ shard_rate(int n_relay, int pairs_per_shard, int rounds)
   return (double)rounds * total * 1e6 / (double)(t1 - t0);
 }
 
-static void
-case_many_shards(void)
+/* Each timed arm runs in a fresh exec: prior notifier workers and retained
+ * contexts cannot contaminate the next arm. This also preserves raw samples. */
+static double isolated_shard_rate(int shards)
 {
-  void *saved = g_ns;
-  double one, many;
-
-  one = shard_rate(1, 16, 200);
-  many = shard_rate(16, 1, 200);
-  g_ns = saved;
-  check("16-shard context: every shard dispatched", many > 0, (long)many, 1);
-  printf("     one shard: %.0f rt/s; 16 shards: %.0f rt/s (one client)\n", one, many);
-  /* One client drives both, so this is not a parallelism measurement; it
-   * only has to show that 16 shards are not SLOWER than one (a dispatch
-   * that serialized across shards would show here). */
-  check("16 shards are not slower than one (>= 0.5x)", many >= one * 0.5, (long)(many * 10 / one), 5);
+  int fds[2], status; char count[12]; double rate=-1;
+  snprintf(count,sizeof(count),"%d",shards);
+  if (pipe(fds)) return -1;
+  pid_t child=fork();
+  if (child==0) {
+    close(fds[0]);
+    if (dup2(fds[1],STDOUT_FILENO)<0) _exit(126);
+    close(fds[1]);
+    execl("/proc/self/exe","test_notify_epoll","--measure-shards",count,(char *)NULL);
+    _exit(127);
+  }
+  close(fds[1]);
+  if (child<0) {close(fds[0]);return -1;}
+  FILE *in=fdopen(fds[0],"r");
+  if (in) {if (fscanf(in,"RATE %lf",&rate)!=1) rate=-1;fclose(in);}
+  else close(fds[0]);
+  if (waitpid(child,&status,0)!=child || !WIFEXITED(status) || WEXITSTATUS(status)) rate=-1;
+  return rate;
+}
+static void measurement_environment(void)
+{
+  cpu_set_t affinity; CPU_ZERO(&affinity);
+  if (!sched_getaffinity(0,sizeof(affinity),&affinity))
+    printf("     measurement affinity CPU count=%d; online CPUs=%ld\n",CPU_COUNT(&affinity),sysconf(_SC_NPROCESSORS_ONLN));
+  const char *paths[]={"/sys/fs/cgroup/cpu.max","/sys/fs/cgroup/cpu.stat","/proc/stat"};
+  for (unsigned i=0;i<sizeof(paths)/sizeof(paths[0]);i++) {
+    FILE *f=fopen(paths[i],"r");char line[256];
+    if (!f) {printf("     telemetry unavailable: %s\n",paths[i]);continue;}
+    printf("     telemetry %s:\n",paths[i]);
+    unsigned limit=i==2 ? 1:16;
+    while (limit-- && fgets(line,sizeof(line),f)) printf("       %s",line);
+    fclose(f);
+  }
+  struct rusage usage;
+  if (!getrusage(RUSAGE_CHILDREN,&usage))
+    printf("     child context switches voluntary=%ld involuntary=%ld\n",usage.ru_nvcsw,usage.ru_nivcsw);
+}
+static void case_many_shards(void)
+{
+  enum { SAMPLES=6 };
+  double ratios[SAMPLES]; int valid=1;
+  measurement_environment();
+  for (unsigned i=0;i<SAMPLES;i++) {
+    double one,many;
+    if (i%2) {many=isolated_shard_rate(16);one=isolated_shard_rate(1);}
+    else {one=isolated_shard_rate(1);many=isolated_shard_rate(16);}
+    ratios[i]=(one>0 && many>0) ? many/one:-1;
+    if (ratios[i]<0) valid=0;
+    printf("     paired sample %u order=%s one=%.0f rt/s many=%.0f rt/s ratio=%.6f raw_threshold=%s\n",
+        i+1,i%2?"16,1":"1,16",one,many,ratios[i],ratios[i]>=0.5?"PASS":"FAIL");
+  }
+  measurement_environment();
+  check("16-shard context: every shard dispatched in all measured arms",valid,valid,1);
+  for (unsigned i=1;i<SAMPLES;i++) {
+    double v=ratios[i];unsigned j=i;
+    while (j && ratios[j-1]>v) {ratios[j]=ratios[j-1];j--;}
+    ratios[j]=v;
+  }
+  double median=(ratios[SAMPLES/2-1]+ratios[SAMPLES/2])/2;
+  /* Prespecified median of ALL six pairs; no retries or selected successful
+   * arms. This is a sequential-client dispatch check, not parallel scaling. */
+  printf("     all-pair median ratio=%.6f; unchanged threshold=0.5\n",median);
+  check("16 shards are not slower than one (all-pair median >= 0.5x)",valid && median>=0.5,(long)(median*10),5);
 }
 
 int
-main(void)
+main(int argc,char **argv)
 {
+  if (argc==3 && !strcmp(argv[1],"--measure-shards")) {
+    int shards=atoi(argv[2]);
+    if (shards!=1 && shards!=16) return 2;
+    double rate=shard_rate(shards,16/shards,200);
+    printf("RATE %.17g\n",rate);
+    return rate>0 ? 0:1;
+  }
   notify_cbs_t cbs;
   pthread_t thr;
   struct rlimit rl;
