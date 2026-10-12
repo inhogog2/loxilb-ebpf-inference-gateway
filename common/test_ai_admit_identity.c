@@ -49,12 +49,15 @@ estimate_prompt_tokens(const char *body, size_t len)
   return 7;
 }
 
+/* What the body declares as its completion ceiling; 0 = none. */
+static int max_tokens_stub = 32;
+
 int
 extract_max_tokens(const char *body, size_t len)
 {
   (void)body;
   (void)len;
-  return 32;
+  return max_tokens_stub;
 }
 
 /* ---- Go-export stubs recording what the gate handed them ---------------- */
@@ -101,6 +104,9 @@ static struct {
   char svc[64];
   int  prompt_est;
   int  max_tokens;
+  int  default_tokens;
+  int  rc;          /* forced return */
+  int  shrink;      /* tokens the quota takes off the default it was asked */
 } rs_stub;
 
 int
@@ -187,7 +193,9 @@ int
 llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                            char *user_id, char *key_id, char *svc_ident,
                            int prompt_est, int max_tokens,
-                           int64_t *res_epoch, ai_gw_decision_t *result)
+                           int default_tokens,
+                           int64_t *res_epoch, int *granted,
+                           ai_gw_decision_t *result)
 {
   rs_stub.calls++;
   snprintf(rs_stub.tenant, sizeof(rs_stub.tenant), "%s", tenant_id);
@@ -197,8 +205,15 @@ llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
   snprintf(rs_stub.svc, sizeof(rs_stub.svc), "%s", svc_ident);
   rs_stub.prompt_est = prompt_est;
   rs_stub.max_tokens = max_tokens;
-  (void)result;
+  rs_stub.default_tokens = default_tokens;
+  if (rs_stub.rc != 0) {
+    result->decision = 3;
+    result->retry_after = 5;
+    strcpy(result->error_code, "token_quota_would_exceed");
+    return rs_stub.rc;
+  }
   *res_epoch = 77;
+  *granted = prompt_est + max_tokens + default_tokens - rs_stub.shrink;
   return 0;
 }
 
@@ -212,6 +227,7 @@ reset_stubs(void)
   memset(&deny_stub, 0, sizeof(deny_stub));
   memset(&rl_stub, 0, sizeof(rl_stub));
   memset(&rs_stub, 0, sizeof(rs_stub));
+  max_tokens_stub = 32;
 }
 
 /* ---- cases --------------------------------------------------------------- */
@@ -370,6 +386,151 @@ test_prefix_only_sizes_reservation_from_declared_length(void)
   assert(rs_stub.calls == 1 && rs_stub.prompt_est == 7);
 }
 
+/* ---- default reservation -------------------------------------------------- */
+
+static ai_gw_req_ctx_t
+default_resv_req(int default_tokens)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "sk-abc",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .default_tokens = default_tokens,
+  };
+  return req;
+}
+
+/* The knob off: a request without a ceiling claims its prompt estimate and
+ * nothing else, and the quota is not told about a default. */
+static void
+test_default_reservation_off_claims_the_prompt_alone(void)
+{
+  ai_gw_req_ctx_t req = default_resv_req(0);
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  max_tokens_stub = 0;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(rs_stub.calls == 1);
+  assert(rs_stub.prompt_est == 7 && rs_stub.max_tokens == 0);
+  assert(rs_stub.default_tokens == 0);
+  assert(res.reserved_toks == 7 && res.res_epoch == 77);
+  assert(res.reservation_clamped == 0);
+}
+
+/* The knob on and no ceiling declared: the default is asked for beside the
+ * prompt estimate, and what the quota granted is what settlement will give
+ * back. */
+static void
+test_default_reservation_stands_in_for_an_absent_ceiling(void)
+{
+  ai_gw_req_ctx_t req = default_resv_req(512);
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  max_tokens_stub = 0;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(rs_stub.calls == 1);
+  assert(rs_stub.prompt_est == 7 && rs_stub.max_tokens == 0);
+  assert(rs_stub.default_tokens == 512);
+  assert(res.reserved_toks == 519 && res.res_epoch == 77);
+  assert(res.reservation_clamped == 0);
+}
+
+/* A declared ceiling is never replaced: the default is not passed at all. */
+static void
+test_default_reservation_leaves_a_declared_ceiling_alone(void)
+{
+  ai_gw_req_ctx_t req = default_resv_req(512);
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(rs_stub.calls == 1);
+  assert(rs_stub.max_tokens == 32 && rs_stub.default_tokens == 0);
+  assert(res.reserved_toks == 39);
+  assert(res.reservation_clamped == 0);
+}
+
+/* The quota shrank the default: the request is admitted all the same, the
+ * granted total rides to settlement (not the asked one), and the result
+ * says the claim was clamped. Shrunk to nothing is still an admission, on
+ * the prompt estimate alone. */
+static void
+test_clamped_default_is_admitted_with_what_was_granted(void)
+{
+  ai_gw_req_ctx_t req = default_resv_req(512);
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  max_tokens_stub = 0;
+  rs_stub.shrink = 412;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(res.reserved_toks == 107 && res.res_epoch == 77);
+  assert(res.reservation_clamped == 1);
+
+  reset_stubs();
+  max_tokens_stub = 0;
+  rs_stub.shrink = 512;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(res.reserved_toks == 7 && res.res_epoch == 77);
+  assert(res.reservation_clamped == 1);
+}
+
+/* A refusal is the firm part's: the record names the prompt estimate, and
+ * the default that was asked beside it is not in the figure. */
+static void
+test_reserve_refusal_reports_the_firm_claim(void)
+{
+  ai_gw_req_ctx_t req = default_resv_req(512);
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  max_tokens_stub = 0;
+  rs_stub.rc = -1;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.verdict == AI_GW_ADMIT_DENY);
+  assert(res.stage == AI_GW_STAGE_RESERVE);
+  assert(res.http_status == 429 && res.retry_after == 5);
+  assert(strcmp(res.error_code, "token_quota_would_exceed") == 0);
+  assert(rs_stub.default_tokens == 512);
+  assert(res.reserved_toks == 7);
+  assert(res.res_epoch == 0 && res.reservation_clamped == 0);
+}
+
+/* A streamed body shows the gate a prefix: a ceiling it does not show is a
+ * ceiling the gate cannot read, and the default covers it like an absent
+ * one, beside the claim sized from the declared length. */
+static void
+test_default_reservation_covers_a_streamed_body(void)
+{
+  static const char prefix[] = "{\"model\":\"m1\",\"messages\":[{\"role\":\"u";
+  ai_gw_req_ctx_t req = {
+    .api_key = "sk-abc",
+    .body = prefix,
+    .body_len = sizeof(prefix) - 1,
+    .prefix_model = "m1",
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .prefix_only = 1,
+    .declared_content_length = 40000,
+    .default_tokens = 512,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  max_tokens_stub = 0;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(rs_stub.prompt_est == 10000 && rs_stub.default_tokens == 512);
+  assert(res.reserved_toks == 10512);
+}
+
 /* No body and no declared length: the credential and rate ladder still
  * run, the model falls back to the header, and NOTHING is reserved. This
  * is the shape of a non-JSON upload (no prompt to size) and of the caller
@@ -403,6 +564,14 @@ test_prefix_only_without_length_reserves_nothing(void)
   assert(res.verdict == AI_GW_ADMIT_ALLOW);
   assert(res.effective_model[0] == '\0');
   assert(rs_stub.calls == 0);
+
+  /* A default reservation does not turn "nothing to size" into a claim. */
+  reset_stubs();
+  max_tokens_stub = 0;
+  req.default_tokens = 512;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(rs_stub.calls == 0);
+  assert(res.reserved_toks == 0 && res.res_epoch == 0);
 }
 
 /* A streamed request with no credential is refused on the credential
@@ -639,6 +808,12 @@ main(void)
   test_apikey_arm_forwards_key_and_service();
   test_keyless_probes_shared_bucket_only_with_ident();
   test_prefix_only_sizes_reservation_from_declared_length();
+  test_default_reservation_off_claims_the_prompt_alone();
+  test_default_reservation_stands_in_for_an_absent_ceiling();
+  test_default_reservation_leaves_a_declared_ceiling_alone();
+  test_clamped_default_is_admitted_with_what_was_granted();
+  test_reserve_refusal_reports_the_firm_claim();
+  test_default_reservation_covers_a_streamed_body();
   test_prefix_only_without_length_reserves_nothing();
   test_prefix_only_missing_credential_is_refused();
   test_svc_ident_format();

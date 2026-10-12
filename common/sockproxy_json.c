@@ -882,7 +882,8 @@ estimate_prompt_tokens(const char *body, size_t len)
 // number counts — a negative value (llama.cpp uses -1 for "unlimited"), a
 // string, or a nested/spoofed occurrence reads as undeclared. Returns the
 // ceiling, or 0 when the request declares none: an undeclared ceiling
-// cannot be guessed, so the caller reserves the prompt estimate alone.
+// cannot be guessed, so the caller reserves the prompt estimate alone, or
+// with it the rule's default reservation when one is configured.
 int
 extract_max_tokens(const char *body, size_t len)
 {

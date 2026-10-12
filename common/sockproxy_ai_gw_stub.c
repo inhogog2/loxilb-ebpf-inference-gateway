@@ -231,7 +231,9 @@ __attribute__((weak)) int
 llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                            char *user_id, char *key_id, char *svc_ident,
                            int prompt_est, int max_tokens,
-                           int64_t *res_epoch, ai_gw_decision_t *result)
+                           int default_tokens,
+                           int64_t *res_epoch, int *granted,
+                           ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
@@ -241,9 +243,12 @@ llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
     (void)svc_ident;
     (void)prompt_est;
     (void)max_tokens;
+    (void)default_tokens;
     (void)result;
     if (res_epoch)
         *res_epoch = 0;
+    if (granted)
+        *granted = 0;
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }
 

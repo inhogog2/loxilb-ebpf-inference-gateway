@@ -350,7 +350,8 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 
   /* Stage 4: pre-admission token reservation → 429 BEFORE dispatch. Claim
    * the request's worst case (prompt estimate + declared max_tokens
-   * ceiling) against the tenant quota now, while denial costs one cheap
+   * ceiling, or the rule's default when none is declared) against the
+   * tenant quota now, while denial costs one cheap
    * response — not a backend prefill whose tokens the latch only bills
    * afterwards. The claim and its window tag ride back to the caller for
    * the settle call. */
@@ -373,23 +374,38 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
       if ((int)from_bytes > resv_prompt)
         resv_prompt = (int)from_bytes;
     }
-    if (resv_prompt > 0 || resv_max > 0) {
+    /* No declared ceiling: the rule's default stands in for it, as a claim
+     * the quota may shrink but never refuses on. The prompt estimate (and a
+     * declared ceiling) stay the firm part, refused when they do not fit. */
+    int resv_default = 0;
+    if (resv_max <= 0 && req->default_tokens > 0)
+      resv_default = req->default_tokens;
+    if (resv_prompt > 0 || resv_max > 0 || resv_default > 0) {
       ai_gw_decision_t rs_dec = {0};
       int64_t rs_epoch = 0;
+      int rs_granted = 0;
       if (llb_ai_token_quota_reserve(key_dec.tenant_id, (char *)model,
                                      key_dec.user_id, key_dec.key_id,
                                      (char *)svc_ident,
-                                     resv_prompt, resv_max,
-                                     &rs_epoch, &rs_dec) != 0) {
+                                     resv_prompt, resv_max, resv_default,
+                                     &rs_epoch, &rs_granted, &rs_dec) != 0) {
         set_deny(res, AI_GW_STAGE_RESERVE, 429, rs_dec.retry_after, 1,
                  rs_dec.error_code, "");
-        /* Log parity: the inlined gate reported what it asked for. */
+        /* Log parity: the inlined gate reported what it asked for. The
+         * default is left out: it is never what was refused. */
         res->reserved_toks = (uint32_t)(resv_prompt + resv_max);
         return -1;
       }
       if (rs_epoch != 0) {
-        res->reserved_toks = (uint32_t)(resv_prompt + resv_max);
+        /* Settlement gives back exactly what is stored here, so it is the
+         * granted total and not the asked one. */
+        if (rs_granted < 0)
+          rs_granted = 0;
+        res->reserved_toks = (uint32_t)rs_granted;
         res->res_epoch = rs_epoch;
+        if (resv_default > 0 &&
+            rs_granted < resv_prompt + resv_max + resv_default)
+          res->reservation_clamped = 1;
       }
     }
   }

@@ -98,6 +98,12 @@ typedef struct ai_gw_req_ctx {
   int         prefix_only;
   size_t      declared_content_length;
 
+  /* Default reservation: completion tokens to claim for a request whose
+   * body declares no max_tokens, as the rule resolved it (0 = off, the
+   * prompt estimate alone is claimed). A declared ceiling is never
+   * replaced, and nothing is written into the forwarded body. */
+  int         default_tokens;
+
   /* Correlation, filled by the caller before the gate: the request ID that
    * the refusal, the completion and the settle records of this request all
    * carry (minted, or adopted from the client, before admission so a
@@ -145,9 +151,13 @@ typedef struct ai_gw_admit_result {
   int  auth_flags;
 
   /* ALLOW: pre-admission token reservation to ride the connection to its
-   * settle call. Zero epoch = nothing reserved. */
+   * settle call. Zero epoch = nothing reserved. reserved_toks is what the
+   * quota GRANTED, which is what settlement gives back: with a default
+   * reservation it can be less than what was asked, and
+   * reservation_clamped then says so. */
   uint32_t reserved_toks;
   int64_t  res_epoch;
+  uint8_t  reservation_clamped;
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);

@@ -624,6 +624,7 @@ typedef struct proxy_epval {
   uint8_t  hold_mode;              // enum sp_hold_mode: hold a client that half-closed after its request
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
+  uint32_t ai_default_tokens;      // completion tokens reserved for a request without max_tokens (0 = off)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
    * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG,
    * 2=trtllm ⇒ PD_ENGINE_TRTLLM) so the orchestration branch never reads a
@@ -2068,6 +2069,9 @@ struct proxy_arg {
   uint8_t  half_close_mode;
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
+  // Default reservation, same hop: completion tokens the admission gate
+  // reserves for a request that declares no max_tokens (0 = off).
+  uint32_t ai_default_tokens;
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
   // proxy_add). The nat2proxy hop of the additive chain
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).

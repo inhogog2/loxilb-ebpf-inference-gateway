@@ -3171,6 +3171,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * their order. */
         sp_fc_apply_rule(tepval, arg, new_ent, 0);
         tepval->hold_mode = arg->half_close_mode;   /* new holds only; held ones stay */
+        /* Requests admitted from here on; a claim already held settles
+         * for what it was granted. */
+        tepval->ai_default_tokens = arg->ai_default_tokens;
         /* The prefill timeout follows a rule update too: the reaper reads it
          * on every tick, so requests already waiting get the new value. */
         tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
@@ -3331,6 +3334,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         fc_state_init_slots(&tepval->fc, fc_tenant_slots_from_env());
         sp_fc_apply_rule(tepval, arg, new_ent, 1);
         tepval->hold_mode = arg->half_close_mode;
+        tepval->ai_default_tokens = arg->ai_default_tokens;
         /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
@@ -3752,6 +3756,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   fc_state_init_slots(&tepval->fc, fc_tenant_slots_from_env());
   sp_fc_apply_rule(tepval, arg, new_ent, 1);
   tepval->hold_mode = arg->half_close_mode;
+  tepval->ai_default_tokens = arg->ai_default_tokens;
   /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();
@@ -9225,6 +9230,7 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->prefix_model = pfe->prefix_key.model;
   req->hdr_model = pfe->x_model_header;
   req->auth_mode = hent->val.ephash->apikey_auth;
+  req->default_tokens = (int)hent->val.ephash->ai_default_tokens;
   /* The gate runs before the header splice, so a refused request normally
    * has no derived origin and proxy_origin_ip returns "" — which says "not
    * derived" and must not be read as the peer. The peer is known from

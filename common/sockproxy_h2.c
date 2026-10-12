@@ -4227,6 +4227,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .prefix_model = body_model,
       .hdr_model = stream->x_model_header,
       .auth_mode = ent->val.ephash->apikey_auth,
+      .default_tokens = (int)ent->val.ephash->ai_default_tokens,
       .svc_ident = adm_svc_ident,
       .request_id = stream->request_id,
       .producer_id = notify_worker_id(),

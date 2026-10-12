@@ -365,10 +365,18 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
  *               rule-scope defaults and the per-VIP shared bucket
  *   prompt_est  prompt-token estimate from the request body; 0 when unknown
  *   max_tokens  declared completion ceiling from the request body; 0 when
- *               the client did not declare one (only the prompt estimate is
- *               then reserved — an undeclared ceiling cannot be guessed)
+ *               the client did not declare one
+ *   default_tokens  the rule's default reservation, passed only when
+ *               max_tokens is 0; 0 = off (the prompt estimate alone is
+ *               reserved). It is an elastic claim: each bucket shrinks it to
+ *               what it still holds, down to nothing, and it is never the
+ *               reason for a denial
  *   res_epoch   output: the reservation's window tag to echo at settlement;
  *               0 when nothing was reserved (no quota configured)
+ *   granted     output: the tokens held on every bucket after the call —
+ *               prompt_est + max_tokens, plus what was left of
+ *               default_tokens. This, not the asked amount, is what the
+ *               caller echoes at settlement. Meaningful when *res_epoch != 0
  *   result      output structure; on denial decision=3, retry_after set and
  *               error_code = "token_quota_would_exceed" (distinct from the
  *               post-hoc "token_quota_exceeded" latch denial)
@@ -381,7 +389,8 @@ extern int llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                                       char *user_id, char *key_id,
                                       char *svc_ident,
                                       int prompt_est, int max_tokens,
-                                      int64_t *res_epoch,
+                                      int default_tokens,
+                                      int64_t *res_epoch, int *granted,
                                       ai_gw_decision_t *result);
 
 /*
