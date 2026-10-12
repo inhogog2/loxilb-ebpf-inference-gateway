@@ -58,6 +58,9 @@
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
 #include "sockproxy_epp.h"
+#define SP_MCP_PROXY_SELECTOR
+#include "sockproxy_mcp_rr.h"
+#include "sockproxy_fe_limit.h"   /* connectionLimit at accept */
 #include "sockproxy_fdlist.h"
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
@@ -86,6 +89,8 @@
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
 #include "sockproxy_pd_leak.h"
 #include "sockproxy_stream_fallback.h"
+#include "sockproxy_admit_response.h"
+#include "sockproxy_mcp_capture.h"
 
 #ifdef HAVE_MTLS
 #include "sockproxy_mtls.h"
@@ -295,10 +300,17 @@ pd_framing_v2_test_set(int on)
 static int handle_resp_headers_complete(llhttp_t *parser);
 static int handle_resp_body(llhttp_t *parser, const char *at, size_t length);
 static int handle_resp_message_complete(llhttp_t *parser);
+static void proxy_sse_activate(proxy_fd_ent_t *pfe);
 static void cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void cresp_note_backend_eof(proxy_fd_ent_t *client);
 static void cresp_note_local_answer(proxy_fd_ent_t *client);
+/* What proxy_backend_leg_unanswered did for the client of the leg. */
+#define PROXY_LEG_NOT_ANSWERED 0
+#define PROXY_LEG_ANSWERED_H1  1
+#define PROXY_LEG_ANSWERED_H2  2
+static int proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
+                                        const char *op, int sys_errno);
 
 static ssize_t
 proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
@@ -976,11 +988,13 @@ proxy_sockmap_owned_dirs(proxy_map_ent_t *ent, proxy_epval_t *epv,
     return;
   in.has_l7_policy = ent->has_l7_policy ? 1 : 0;
   if (epv) {
+    in.mcp_stateless = epv->mcp_stateless;
     in.sse_mode = epv->sse_mode;
     in.pd_disagg_mode = epv->pd_disagg_enabled;
     in.ai_gw_mode = epv->ai_gw_mode;
     apikey_auth = epv->apikey_auth;
   } else if (ent->val.ephash) {
+    in.mcp_stateless = ent->val.ephash->mcp_stateless;
     in.sse_mode = ent->val.ephash->sse_mode;
     in.pd_disagg_mode = ent->val.ephash->pd_disagg_enabled;
     in.ai_gw_mode = ent->val.ephash->ai_gw_mode;
@@ -1450,6 +1464,11 @@ skip_deferred_masking:
     if (ent->odir == 1 && rfd_ent && !rfd_ent->is_sticky && rfd_ent->last_activity != 0) {
       rfd_ent->last_activity = 0;
     }
+    /* Bytes for the client are activity on its connection: the per-rule
+     * inactiveTimeout clock (idle_since) counts from the last byte either way. */
+    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0) {
+      rfd_ent->idle_since = time(NULL);
+    }
 
     /* response-leg HTTP_RESPONSE parser feed, gated on
      * pd_framing_v2. This runs IN PARALLEL to (BEFORE) the three legacy memmem
@@ -1857,44 +1876,18 @@ skip_deferred_masking:
     if (ent->odir == 1 && len > 0 && rfd_ent &&
         !ent->pd_sg_drain &&
         rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
+      rfd_ent->cresp_payload_observed = 0;
       cresp_feed(rfd_ent, msg, len);
     }
 
-    /* C-1: SSE stream activation — detect "Content-Type: text/event-stream" in the
-     * first backend response packet and flip sse_active on the client-side pfe.
-     * Only triggered when the LB rule has sse_mode=1 and the stream is not yet live. */
-    if (ent->odir == 1 && rfd_ent->sse_mode == 1 &&
-        !rfd_ent->sse_active && len > 16) {
-      size_t sse_search_len = (len < 2048) ? len : 2048;
-      if (memmem(msg, sse_search_len, "Content-Type: text/event-stream", 31) != NULL ||
-          memmem(msg, sse_search_len, "content-type: text/event-stream", 31) != NULL) {
-        rfd_ent->sse_active = 1;
-        rfd_ent->stream_start_ts = time(NULL);
-        {
-          struct timespec _sse_ts;
-          clock_gettime(CLOCK_MONOTONIC, &_sse_ts);
-          rfd_ent->stream_start_mono_ns = (uint64_t)_sse_ts.tv_sec * 1000000000ULL +
-                                          (uint64_t)_sse_ts.tv_nsec;
-        }
-        /* Effective model: X-Model header > JSON body model > reset-boundary
-         * snapshot > "" */
-        const char *sse_model = proxy_effective_model(rfd_ent);
-        llb_ai_stream_start("", (char *)sse_model);
-        log_debug("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
-                 rfd_ent->fd, ent->fd, sse_model);
-
-        /* P/D decode streaming transition — decode EP is now streaming */
-        if (rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING) {
-          rfd_ent->pd_phase = PD_PHASE_DECODE_STREAMING;
-          rfd_ent->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
-          /* arm the backend-idle clock for the graceful-[DONE] safety-net
-           * reaper. This read carried the activation bytes, so "now" is the last
-           * backend activity. Refreshed per byte in the [DONE] scanner below. */
-          rfd_ent->pd_last_decode_ts = time(NULL);
-          log_debug("Decode streaming started — client_fd=%d backend_fd=%d",
-                   rfd_ent->fd, ent->fd);
-        }
-      }
+    /* The HTTP_RESPONSE parser observes header fragments and dechunked body.
+     * The raw sniff is only a fallback when that observer could not frame. */
+    if (ent->odir == 1 && !rfd_ent->cresp_payload_observed &&
+        rfd_ent->sse_mode == 1 && !rfd_ent->sse_active && len > 16) {
+      size_t scan = len < 2048 ? len : 2048;
+      if (memmem(msg, scan, "Content-Type: text/event-stream", 31) ||
+          memmem(msg, scan, "content-type: text/event-stream", 31))
+        proxy_sse_activate(rfd_ent);
     }
 
     /* Token accounting: maintain the response tail window and, for
@@ -1908,7 +1901,8 @@ skip_deferred_masking:
      * the NEXT request at the rate-limit gate. */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->ai_gw_mode && !rfd_ent->usage_consumed && len > 0) {
-      proxy_usage_tail_update(rfd_ent, (const uint8_t *)msg, len);
+      if (!rfd_ent->cresp_payload_observed)
+        proxy_usage_tail_update(rfd_ent, (const uint8_t *)msg, len);
       if (!rfd_ent->sse_active && rfd_ent->metric_response_status != 0) {
         const pd_dialect_ops_t *uops = proxy_usage_ops(rfd_ent);
         int up = 0, uc = 0;
@@ -2044,7 +2038,8 @@ skip_deferred_masking:
              (const uint8_t *)msg + (len - new_len),
              new_len);
 
-      if (memmem(window, window_len, PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
+      if (rfd_ent->cresp_sse.done ||
+          memmem(window, window_len, PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
           memmem(window, window_len, PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2)) {
@@ -2425,23 +2420,17 @@ skip_deferred_masking:
     } else {
       n = SSL_write(rfd_ent->ssl, msg, len);
       if (n <= 0) {
+        /* Read once, before anything can disturb either: the verdict of
+         * SSL_get_error depends on the thread's error queue, and the queue
+         * is popped only by the one log line that reports it below. */
+        int wr_errno = errno;
         int ssl_err = SSL_get_error(rfd_ent->ssl, n);
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_warn("ssl-write-fail fd=%d: err=%d (%s)", rfd_ent->fd, ssl_err,
                  ssl_err == SSL_ERROR_WANT_WRITE ? "WANT_WRITE" :
                  ssl_err == SSL_ERROR_WANT_READ ? "WANT_READ" : "ERROR");
 #endif
-        if (ssl_err == SSL_ERROR_SSL || ssl_err == SSL_ERROR_SYSCALL) {
-          unsigned long err_code = ERR_get_error();
-          char err_buf[256];
-          ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-          log_error("   OpenSSL error details: %s (code=0x%lx)", err_buf, err_code);
-        }
-      }
-      if (n <= 0) {
-        int ssl_err;
-        ssl_err = SSL_get_error(rfd_ent->ssl, n);
-
         switch (ssl_err) {
           case SSL_ERROR_WANT_WRITE:
             // CRITICAL: SSL has buffered data internally, we MUST retry with same buffer
@@ -2522,7 +2511,6 @@ skip_deferred_masking:
             return 0;
           case SSL_ERROR_SSL:
           case SSL_ERROR_SYSCALL:
-            log_error("ssl-error fd=%d: %s", rfd_ent->fd, ERR_error_string(ERR_get_error(), NULL));
           default:
 #ifdef HAVE_HTTP_TRACE
             // CRITICAL: Emit REQ_END for SSL errors before closing connection
@@ -2547,15 +2535,37 @@ skip_deferred_masking:
 
             if (ssl_err != SSL_ERROR_SSL && ssl_err != SSL_ERROR_SYSCALL) {
               SSL_shutdown(rfd_ent->ssl);
+              PROXY_ENT_UNLOCK(rfd_ent);
             } else {
+              int answered;
+
               rfd_ent->ssl_err = 1;
+              PROXY_ENT_UNLOCK(rfd_ent);
+              /* A backend leg that fails here before it answered anything
+               * turned the gateway away after the handshake, as a leg that
+               * fails on its first read did. The client is answered before
+               * its connection is closed, with nothing held and before the
+               * log below pops the error queue. */
+              answered = proxy_backend_leg_unanswered(rfd_ent, ssl_err,
+                                                      "ssl-write", wr_errno);
+              if (wr_errno != 0 && ERR_peek_error() == 0) {
+                log_error("ssl-error fd=%d: %s", rfd_ent->fd, strerror(wr_errno));
+              } else {
+                log_error("ssl-error fd=%d: %s", rfd_ent->fd,
+                          ERR_error_string(ERR_get_error(), NULL));
+              }
+              ERR_clear_error();   /* nothing of this failure is left for the next call */
+              if (answered == PROXY_LEG_ANSWERED_H2) {
+                /* The client's other streams live on: only the leg goes. */
+                shutdown(rfd_ent->fd, SHUT_RDWR);
+                return -1;
+              }
             }
             if (rfd_ent->odir) {
               shutdown(ent->fd, SHUT_RDWR);
             } else {
               shutdown(rfd_ent->fd, SHUT_RDWR);
             }
-            PROXY_ENT_UNLOCK(rfd_ent);
             return -1;
         }
       }
@@ -2642,6 +2652,214 @@ proxy_add_entry_abort(proxy_map_ent_t *node, void *ssl_ctx, void *ssl_epctx)
     SSL_CTX_free(ssl_ctx);
   }
   free(node);
+}
+
+/* Free a frontend context that is not in service. The rule's proxy_arg is
+ * detached first, as in proxy_add_entry_abort(). */
+static void
+proxy_frontend_ctx_drop(void *ssl_ctx)
+{
+  if (!ssl_ctx) {
+    return;
+  }
+#ifdef HAVE_MTLS
+  if (g_ssl_ctx_proxy_arg_index >= 0) {
+    SSL_CTX_set_ex_data((SSL_CTX *)ssl_ctx, g_ssl_ctx_proxy_arg_index, NULL);
+  }
+#endif
+  SSL_CTX_free(ssl_ctx);
+}
+
+/* Build the frontend TLS context of a listener from the rule's arguments:
+ * the certificate, the SNI callback and, when the rule asks for it, client
+ * certificate verification (which stores arg in the context). NULL when any
+ * part cannot be set up; the reason is logged. */
+static void *
+proxy_frontend_ctx_build(const proxy_ent_t *key, proxy_arg_t *arg)
+{
+  void *ssl_ctx;
+
+  // thread the rule's proxy_arg so version/cipher
+  // pinning is applied to the frontend listener SSL_CTX. arg is byte-for-byte
+  // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
+  ssl_ctx = proxy_server_ssl_ctx_init(arg);
+  if (ssl_ctx == NULL) {
+    log_error("sockproxy : %s:%u rule %u frontend TLS context init failed",
+        inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+        arg->_id);
+    return NULL;
+  }
+
+  if (proxy_ssl_cfg_opts(ssl_ctx,
+        strcmp(arg->host_url, "") ? arg->host_url : NULL, 0)) {
+    log_error("[LB Rule] Failed to load SSL certificates for hostname: '%s'",
+              strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+    proxy_frontend_ctx_drop(ssl_ctx);
+    return NULL;
+  }
+
+  // Register SNI callback for dynamic certificate selection (GLOBAL STORE)
+  SSL_CTX_set_tlsext_servername_callback((SSL_CTX *)ssl_ctx, sni_servername_callback);
+  SSL_CTX_set_tlsext_servername_arg((SSL_CTX *)ssl_ctx, NULL);  // Not used - callback uses global store
+
+#ifdef HAVE_MTLS
+  // Configure frontend mTLS (client certificate verification)
+  if (arg->frontend_mtls_mode > 0) {
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    log_debug("[mTLS] Frontend mTLS enabled in proxy_add_entry");
+    log_debug("[mTLS]   mode=%d (1=Optional, 2=Required)", arg->frontend_mtls_mode);
+    log_debug("[mTLS]   client_ca_path=%s", arg->client_ca_path[0] ? arg->client_ca_path : "(none)");
+    log_debug("[mTLS]   require_client_cn=%d, pattern=%s",
+              arg->require_client_cn, arg->client_cn_pattern[0] ? arg->client_cn_pattern : "(none)");
+    log_debug("[mTLS]   host_url=%s", strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+#endif
+    if (mtls_configure_frontend((SSL_CTX *)ssl_ctx, arg) != 0) {
+      log_error("[mTLS] Failed to configure frontend mTLS for %s",
+                strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+      proxy_frontend_ctx_drop(ssl_ctx);
+      return NULL;
+    }
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    log_debug("[mTLS] Frontend mTLS configured successfully for %s",
+              strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+    log_debug("[mTLS] Stored proxy_arg=%p in SSL_CTX=%p with index=%d",
+              (void*)arg, (void*)ssl_ctx, g_ssl_ctx_proxy_arg_index);
+#endif
+  }
+#endif
+  return ssl_ctx;
+}
+
+/* Build the backend TLS context of a listener from the rule's arguments.
+ * Only the write modes are set on it: the backend context presents what the
+ * rule names, never the listener's default certificate. NULL when it cannot
+ * be set up; the reason is logged. */
+static void *
+proxy_backend_ctx_build(const proxy_ent_t *key, proxy_arg_t *arg)
+{
+  void *ssl_epctx = proxy_client_ssl_ctx_init(arg);
+
+  if (ssl_epctx == NULL) {
+    log_error("sockproxy : %s:%u rule %u backend TLS context init failed",
+        inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+        arg->_id);
+    return NULL;
+  }
+  if (proxy_ssl_cfg_modes(ssl_epctx)) {
+    log_error("sockproxy : %s:%u rule %u backend TLS context setup failed",
+        inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+        arg->_id);
+    SSL_CTX_free(ssl_epctx);
+    return NULL;
+  }
+  return ssl_epctx;
+}
+
+/* ---- a listener kept without rules gets a rule again -----------------------
+ *
+ * Deleting the last pool of a listener keeps the listener (it answers 503) and
+ * frees the rule's proxy_arg, which the frontend context held for client
+ * certificate verification. The rule that comes back, the same one after an
+ * endpoint change or another one on the address, brings its own arguments:
+ * the listener takes them, and with them a frontend and a backend context
+ * built from them. The contexts left over from the deleted rule are not
+ * reconfigured: the frontend one verifies nothing any more (its arguments are
+ * gone) or verifies what the deleted rule asked for, and the backend one
+ * offers the endpoints the protocol and the certificate of the deleted rule.
+ *
+ * The accept path reads val.ssl_ctx without PROXY_LOCK, so the context taken
+ * out of service is not freed here. It is kept until the listener is revived
+ * once more or goes: a reader that loaded it just before the swap still holds
+ * a live one. The backend context goes on the retired list, as it does when a
+ * policy is replaced. */
+struct proxy_takeover {
+  void *ssl_ctx;                      /* NULL: the rule does not terminate TLS */
+  void *ssl_epctx;                    /* NULL: the rule does not re-encrypt */
+  struct proxy_retired_ctx *retire;   /* holds the backend context in service */
+};
+
+static void
+proxy_takeover_drop(struct proxy_takeover *t)
+{
+  proxy_frontend_ctx_drop(t->ssl_ctx);
+  if (t->ssl_epctx) {
+    SSL_CTX_free(t->ssl_epctx);
+  }
+  free(t->retire);
+  memset(t, 0, sizeof(*t));
+}
+
+/* Everything that can fail, before anything of the listener is touched. */
+static int
+proxy_takeover_prepare(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeover *t)
+{
+  memset(t, 0, sizeof(*t));
+  if (ent->val.ssl_epctx) {
+    t->retire = calloc(1, sizeof(*t->retire));
+    if (!t->retire) {
+      return -ENOMEM;
+    }
+  }
+  if (arg->have_ssl) {
+    t->ssl_ctx = proxy_frontend_ctx_build(&ent->key, arg);
+    if (t->ssl_ctx == NULL) {
+      proxy_takeover_drop(t);
+      return PROXY_ADD_ETLS;
+    }
+  }
+  if (arg->have_epssl) {
+    t->ssl_epctx = proxy_backend_ctx_build(&ent->key, arg);
+    if (t->ssl_epctx == NULL) {
+      proxy_takeover_drop(t);
+      return PROXY_ADD_ETLS;
+    }
+  }
+  return 0;
+}
+
+static void
+proxy_listener_revive(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeover *t)
+{
+  void *old = ent->val.ssl_ctx;
+  void *nctx = t->ssl_ctx;
+  int client_cert_mode = 0;
+
+#ifdef HAVE_MTLS
+  client_cert_mode = arg->frontend_mtls_mode;
+#endif
+
+  if (t->retire) {
+    t->retire->ctx = ent->val.ssl_epctx;
+    t->retire->next = ent->val.ssl_epctx_retired;
+    ent->val.ssl_epctx_retired = t->retire;
+    ent->val.be_tls_gen++;
+  }
+  __atomic_store_n(&ent->val.ssl_epctx, t->ssl_epctx, __ATOMIC_RELEASE);
+#ifdef HAVE_MTLS
+  memset(&ent->val.be_tls, 0, sizeof(ent->val.be_tls));
+  if (t->ssl_epctx) {
+    mtls_backend_installed(arg, &ent->val.be_tls);
+  }
+#endif
+
+  /* Modern MCP has a protocol bridge; keep both leg capabilities explicit. */
+  ent->val.backend_protocol_cap = arg->backend_protocol_cap;
+  ent->val.frontend_protocol_cap = arg->mcp_stateless ? 2 : arg->backend_protocol_cap;
+  if (nctx) {
+    SSL_CTX_set_alpn_select_cb(nctx, alpn_select_callback, &ent->val.frontend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(nctx, &ent->val.frontend_protocol_cap);
+  }
+  __atomic_store_n(&ent->val.ssl_ctx, nctx, __ATOMIC_RELEASE);
+  ent->val.have_ssl = arg->have_ssl;
+  proxy_frontend_ctx_drop(ent->val.ssl_ctx_retired);
+  ent->val.ssl_ctx_retired = old;
+  ent->arg_ptr = arg;
+  log_info("sockproxy : %s:%u rule %u takes over the kept listener: frontend TLS %s, "
+           "client certificate mode %d, backend TLS %s",
+           inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+           arg->_id, nctx ? "context built" : "off", client_cert_mode,
+           t->ssl_epctx ? "context built" : "off");
+  memset(t, 0, sizeof(*t));
 }
 
 int
@@ -2827,6 +3045,34 @@ proxy_get_backend_tls_state(proxy_ent_t *key, struct proxy_betls_state *out)
   return ret;
 }
 
+/* connectionLimit observability for a fullproxy listener: the live client
+ * gauge, the ceiling in force and the refusals so far. The control plane
+ * reads it per rule (DpCtStatsRollup) so activeConns reports the same count
+ * the gate enforces, as nat_ep_map.conc_conns does for NAT rules. */
+int
+proxy_get_fe_conn_stats(struct proxy_ent *key, uint32_t *conns, uint32_t *limit,
+                        uint64_t *refused)
+{
+  proxy_map_ent_t *ent;
+  int rc = -1;
+
+  if (!proxy_struct || !key) {
+    return -1;
+  }
+  PROXY_LOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      if (conns) *conns = atomic_load_explicit(&ent->fe_conns, memory_order_relaxed);
+      if (limit) *limit = atomic_load_explicit(&ent->fe_conn_limit, memory_order_relaxed);
+      if (refused) *refused = atomic_load_explicit(&ent->fe_conn_refused, memory_order_relaxed);
+      rc = 0;
+      break;
+    }
+  }
+  PROXY_UNLOCK();
+  return rc;
+}
+
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
@@ -2842,10 +3088,25 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   while (ent) {
     if (cmp_proxy_ent(&ent->key, new_ent)) {
+      /* A listener kept without rules holds no arguments. The frontend
+       * context of the rule that takes it over is built before anything of
+       * the listener is touched, and put in service once nothing below can
+       * refuse the rule any more. */
+      int revive = ent->arg_ptr == NULL;
+      struct proxy_takeover takeover = { 0 };
+
+      if (revive) {
+        int trc = proxy_takeover_prepare(ent, arg, &takeover);
+        if (trc != 0) {
+          PROXY_UNLOCK();
+          return trc;
+        }
+      }
 #ifdef HAVE_MTLS
       /* Before anything of the listener is touched: a policy that cannot be
-       * built refuses the update and leaves the rule as it was. */
-      int tls_rc = proxy_listener_epctx_refresh(ent, arg);
+       * built refuses the update and leaves the rule as it was. A takeover
+       * has built its backend context already. */
+      int tls_rc = revive ? 0 : proxy_listener_epctx_refresh(ent, arg);
       if (tls_rc != 0) {
         PROXY_UNLOCK();
         return tls_rc;
@@ -2887,6 +3148,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         candidate.select = arg->select;
         memcpy(candidate.eps, arg->eps, sizeof(arg->eps));
         if (chwbl_prepare_runtime(&candidate, arg, tepval) < 0) {
+          proxy_takeover_drop(&takeover);
           PROXY_UNLOCK();
           log_error("sockproxy: rejected CHWBL/WRR_HASH candidate for rule %u", arg->_id);
           return -ENOMEM;
@@ -2922,6 +3184,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * peer_map gate in setup_proxy_path would otherwise keep the old mode. */
         ent->val.sockmap_en = arg->sockmap_en;
         tepval->sockmap_en = arg->sockmap_en;
+        tepval->path_match_mode = arg->path_match_mode;
         /* The capacity queue's depth and wait follow a rule update the
          * same way: they may change at runtime, entries waiting keep
          * their order. */
@@ -2931,6 +3194,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * on every tick, so requests already waiting get the new value. */
         tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
+        if (revive) {
+          proxy_listener_revive(ent, arg, &takeover);
+        }
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
@@ -2949,6 +3215,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         if (chwbl_prepare_runtime(tepval, arg, NULL) < 0) {
           pthread_rwlock_destroy(&tepval->chwbl_state_lock);
           free(tepval);
+          proxy_takeover_drop(&takeover);
           PROXY_UNLOCK();
           return -ENOMEM;
         }
@@ -2957,6 +3224,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         // P6: Store composite key for hash table
         strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
         tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
+        tepval->path_match_mode = arg->path_match_mode;
+
+        tepval->mcp_stateless = arg->mcp_stateless;
 
         // Store custom header configuration
         if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
@@ -2986,6 +3256,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
         tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
         tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
+
+        /* connectionLimit of the rule taking this listener (0 = unlimited).
+         * The gauge itself stays: units live connections hold are theirs. */
+        atomic_store_explicit(&ent->fe_conn_limit, arg->fe_conn_limit,
+                              memory_order_relaxed);
 
         // P/D disaggregation configuration
         tepval->pd_disagg_enabled = arg->pd_disagg_mode;
@@ -3208,6 +3483,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
                         tepval->ephash_key, strlen(tepval->ephash_key),
                         tepval);
 
+        if (revive) {
+          proxy_listener_revive(ent, arg, &takeover);
+        }
         PROXY_UNLOCK();
         return 0;
       }
@@ -3243,85 +3521,18 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #endif
 
   if (arg->have_ssl) {
-    // thread the rule's proxy_arg so version/cipher
-    // pinning is applied to the frontend listener SSL_CTX. arg is byte-for-byte
-    // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
-    ssl_ctx = proxy_server_ssl_ctx_init(arg);
+    ssl_ctx = proxy_frontend_ctx_build(&node->key, arg);
     if (ssl_ctx == NULL) {
-      log_error("sockproxy : %s:%u rule %u frontend TLS context init failed",
-          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
-          arg->_id);
       proxy_add_entry_abort(node, NULL, NULL);
       PROXY_UNLOCK();
       return PROXY_ADD_ETLS;
     }
-
-    if (proxy_ssl_cfg_opts(ssl_ctx,
-          strcmp(arg->host_url, "") ? arg->host_url : NULL, 0)) {
-      log_error("[LB Rule] Failed to load SSL certificates for hostname: '%s'",
-                strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-      proxy_add_entry_abort(node, ssl_ctx, NULL);
-      PROXY_UNLOCK();
-      return PROXY_ADD_ETLS;
-    }
-
-    // Check if certificate exists in global store
-    if (strcmp(arg->host_url, "") != 0) {
-      ssl_cert_entry_t *cert_entry = NULL;
-      pthread_rwlock_rdlock(&proxy_struct->global_cert_lock);
-      HASH_FIND_STR(proxy_struct->global_cert_map, arg->host_url, cert_entry);
-      pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
-    }
-
-    // Register SNI callback for dynamic certificate selection (GLOBAL STORE)
-    SSL_CTX_set_tlsext_servername_callback((SSL_CTX *)ssl_ctx, sni_servername_callback);
-    SSL_CTX_set_tlsext_servername_arg((SSL_CTX *)ssl_ctx, NULL);  // Not used - callback uses global store
-
-#ifdef HAVE_MTLS
-    // Configure frontend mTLS (client certificate verification)
-    if (arg->frontend_mtls_mode > 0) {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("[mTLS] Frontend mTLS enabled in proxy_add_entry");
-      log_debug("[mTLS]   mode=%d (1=Optional, 2=Required)", arg->frontend_mtls_mode);
-      log_debug("[mTLS]   client_ca_path=%s", arg->client_ca_path[0] ? arg->client_ca_path : "(none)");
-      log_debug("[mTLS]   require_client_cn=%d, pattern=%s",
-                arg->require_client_cn, arg->client_cn_pattern[0] ? arg->client_cn_pattern : "(none)");
-      log_debug("[mTLS]   host_url=%s", strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-#endif
-      if (mtls_configure_frontend((SSL_CTX *)ssl_ctx, arg) != 0) {
-        log_error("[mTLS] Failed to configure frontend mTLS for %s",
-                  strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-        proxy_add_entry_abort(node, ssl_ctx, NULL);
-        PROXY_UNLOCK();
-        return PROXY_ADD_ETLS;
-      }
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("[mTLS] Frontend mTLS configured successfully for %s",
-                strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-      log_debug("[mTLS] Stored proxy_arg=%p in SSL_CTX=%p with index=%d",
-                (void*)arg, (void*)ssl_ctx, g_ssl_ctx_proxy_arg_index);
-#endif
-    }
-#endif
   }
 
   if (arg->have_epssl) {
-    ssl_epctx = proxy_client_ssl_ctx_init(arg);
+    ssl_epctx = proxy_backend_ctx_build(&node->key, arg);
     if (ssl_epctx == NULL) {
-      log_error("sockproxy : %s:%u rule %u backend TLS context init failed",
-          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
-          arg->_id);
       proxy_add_entry_abort(node, ssl_ctx, NULL);
-      PROXY_UNLOCK();
-      return PROXY_ADD_ETLS;
-    }
-    /* Only the write modes: the backend context presents what the rule
-     * names, never the listener's default certificate. */
-    if (proxy_ssl_cfg_modes(ssl_epctx)) {
-      log_error("sockproxy : %s:%u rule %u backend TLS context setup failed",
-          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
-          arg->_id);
-      proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
       PROXY_UNLOCK();
       return PROXY_ADD_ETLS;
     }
@@ -3364,14 +3575,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   // Initialize backend protocol capability (default: HTTP/1.1 only for safety)
   node->val.backend_protocol_cap = arg->backend_protocol_cap;
+  node->val.frontend_protocol_cap = arg->mcp_stateless ? 2 : arg->backend_protocol_cap;
   node->val.sockmap_en = arg->sockmap_en;
 
-  // Configure ALPN callback with backend protocol capability
+  // Configure ALPN with frontend capability, preserving backend protocol selection
   if (ssl_ctx) {
-    SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.backend_protocol_cap);
-    const char *proto_str = (node->val.backend_protocol_cap == 0) ? "http/1.1 only" :
-                            (node->val.backend_protocol_cap == 1) ? "h2 only" : "h2+http/1.1";
-    log_info("[ALPN] Configured for backend capability: %s", proto_str);
+    SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.frontend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, &node->val.frontend_protocol_cap);
+    const char *proto_str = (node->val.frontend_protocol_cap == 0) ? "http/1.1 only" :
+                            (node->val.frontend_protocol_cap == 1) ? "h2 only" : "h2+http/1.1";
+    log_info("[ALPN] Configured frontend capability: %s", proto_str);
   }
 
   // P0.3: Initialize conversation tracking
@@ -3448,8 +3661,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // P6: Store composite key in tepval for hash table
   strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
   tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
+  tepval->path_match_mode = arg->path_match_mode;
 
   // Store custom header configuration
+  tepval->mcp_stateless = arg->mcp_stateless;
   if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
     tepval->session_header_enabled = 1;
     strncpy(tepval->session_header_name, arg->session_header_name,
@@ -3473,6 +3688,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
   tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
   tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
+
+  /* connectionLimit (0 = unlimited); the gauge starts at zero with the node. */
+  atomic_store_explicit(&node->fe_conn_limit, arg->fe_conn_limit,
+                        memory_order_relaxed);
 
   // P/D disaggregation configuration (new entry path)
   tepval->pd_disagg_enabled = arg->pd_disagg_mode;
@@ -3869,7 +4088,7 @@ ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
     }
     /* Back in service: its admission ceiling ramps up over the pool's
      * warm-up window instead of taking a full share of a burst cold. */
-    if (tepval->ai_gw_mode)
+    if (tepval->ai_gw_mode || tepval->mcp_stateless)
       fc_ep_warm_start(&tepval->fc, ep_index, 0);
   }
 
@@ -4564,7 +4783,7 @@ proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
   PROXY_RDLOCK();
   for (ent = proxy_struct->head; ent && n < max; ent = ent->next) {
     HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-      if (!tepval->ai_gw_mode) {
+      if (!tepval->ai_gw_mode && !tepval->mcp_stateless) {
         continue;
       }
       if (n >= max) {
@@ -4679,7 +4898,7 @@ proxy_get_fc_inflight_total(void)
   PROXY_RDLOCK();
   for (ent = proxy_struct->head; ent; ent = ent->next) {
     HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-      if (tepval->ai_gw_mode) {
+      if (tepval->ai_gw_mode || tepval->mcp_stateless) {
         total += fc_inflight(&tepval->fc);
       }
     }
@@ -4749,7 +4968,7 @@ proxy_fc_drain_set(int on)
   PROXY_LOCK();
   for (ent = proxy_struct->head; ent; ent = ent->next) {
     HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-      if (!tepval->ai_gw_mode) {
+      if (!tepval->ai_gw_mode && !tepval->mcp_stateless) {
         continue;
       }
       drained += fc_queued(&tepval->fc);
@@ -4928,22 +5147,7 @@ proxy_set_circuit_breaker(proxy_ent_t *key, uint8_t enabled,
     if (cmp_proxy_ent(&ent->key, key)) {
       // Entry found - update circuit breaker config
       HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-        tepval->cb_enabled = enabled;
-
-        if (enabled) {
-          // Initialize circuit breakers for all endpoints
-          for (int i = 0; i < tepval->n_eps; i++) {
-            circuit_breaker_init(&tepval->circuit_breakers[i]);
-
-            // Apply custom thresholds if provided
-            if (failure_threshold > 0) {
-              tepval->circuit_breakers[i].failure_threshold = failure_threshold;
-            }
-            if (open_timeout_sec > 0) {
-              tepval->circuit_breakers[i].open_timeout_sec = open_timeout_sec;
-            }
-          }
-        }
+        circuit_breaker_configure_pool(tepval, enabled, failure_threshold, open_timeout_sec);
 
         PROXY_UNLOCK();
         return 0;
@@ -5357,8 +5561,17 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
       /* Bug3-fix (US-H201): guard against uint32_t underflow on double-cleanup */
       uint32_t cur_dec = atomic_load(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns);
 
-      if (cur_dec > 0)
+      if (cur_dec > 0) {
         atomic_fetch_sub(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns, 1);
+      } else {
+        /* A decode index on a connection whose unit was never taken (the
+         * selection was refused after pd_select_decode wrote it) used to be
+         * released here — stealing a unit when the gauge was above zero and
+         * masked by this guard when it was not. The refusal exits now clear
+         * the index; this line is the canary that they did. */
+        log_warn("[PD_LOAD] decode EP%d unit release with zero gauge (never taken) fd=%d",
+                 fd_ent->pd_decode_ep_idx, fd_ent->fd);
+      }
     }
   }
 
@@ -5412,6 +5625,10 @@ proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
     if (fd_ent) {
       PROXY_ENT_LOCK(fd_ent);
       log_trace("sockproxy rfd %d release", fd_ent->fd);
+      /* Decided here, before the release clears the pause. */
+      if (abandon_leg_wants_reset(pfe->odir, fd_ent->odir, fd_ent->read_paused)) {
+        abandon_leg_arm_reset(fd_ent->fd);
+      }
       proxy_release_fd_ctx(fd_ent, 0);
       notify_delete_ent(proxy_struct->ns, fd_ent->fd, 1);
       pfe->rfd_ent[i] = NULL;
@@ -5631,6 +5848,14 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(s->model, sizeof(s->model), "%s", se_model ? se_model : "");
     pfe->sse_active = 0;
     pfe->stream_end_ts = time(NULL);
+    /* An open stream at the client's teardown: the client left (HUP, reset,
+     * EPIPE on its leg), unless the end was already attributed — the backend
+     * leg died first and marked it. The backend leg of this connection is
+     * shut in this same teardown (proxy_release_rfd_ctx below), which is
+     * what makes the engine abort; this record is the count and the depth. */
+    abandon_record(&global_stats.stream_abandon,
+                   pfe->abandon_reason ? pfe->abandon_reason - 1 : ABANDON_CLIENT_GONE,
+                   pfe->stream_start_ts > 0 ? (long)(pfe->stream_end_ts - pfe->stream_start_ts) : 0);
   }
 
   /* HTTP/2 client connection: settle every stream still in flight. On an
@@ -5692,6 +5917,11 @@ proxy_pdestroy(void *priv)
              pfe->fd, pfe->session_key, pfe->sticky_server_id, pfe->session_created);
   }
 
+  /* A fatal HUP can bypass the read/EOF path. Refuse only this unfinished
+   * bridge stream before entering PROXY_LOCK: framing and stream settling
+   * may re-enter control-plane locks through the client callbacks. */
+  proxy_h2_h1_backend_eof(pfe, 0);
+
   PROXY_LOCK();
   if (pfe) {
     PROXY_ENT_LOCK(pfe);
@@ -5716,6 +5946,7 @@ proxy_pdestroy(void *priv)
         }
       }
     }
+    proxy_h2_h1_backend_detach(pfe); /* isolate one bridge leg from its H2 client */
     ent = pfe->head;
     if (!ent) {
       assert(0);
@@ -6169,6 +6400,17 @@ proxy_pdestroy(void *priv)
     }
 
     if (!is_listener) {
+      /* A backend leg ending under an open stream: attribute the end to the
+       * engine before the cascade shuts the client, whose own teardown then
+       * records it under that reason rather than as the client leaving. */
+      if (pfe->odir) {
+        for (int ri = 0; ri < pfe->n_rfd && ri < MAX_PROXY_EP; ri++) {
+          proxy_fd_ent_t *cl = pfe->rfd_ent[ri];
+          if (cl && cl->sse_active && cl->stream_end_ts == 0 && !cl->abandon_reason) {
+            cl->abandon_reason = ABANDON_BACKEND_DIED + 1;
+          }
+        }
+      }
       proxy_release_rfd_ctx(pfe);
     }
     proxy_release_fd_ctx(pfe, 1);
@@ -6185,6 +6427,8 @@ proxy_pdestroy(void *priv)
               ntohs(ent->key.xport));
       if (ent->val.ssl_ctx)
         SSL_CTX_free(ent->val.ssl_ctx);
+      if (ent->val.ssl_ctx_retired)
+        SSL_CTX_free(ent->val.ssl_ctx_retired);
       if (ent->val.ssl_epctx)
         SSL_CTX_free(ent->val.ssl_epctx);
       while (ent->val.ssl_epctx_retired) {
@@ -6270,7 +6514,7 @@ proxy_pdestroy(void *priv)
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
                             e->prompt_toks, e->complet_toks, 0, 0, "",
                             e->request_id, e->user, e->key, e->svc_ident,
-                            0, notify_worker_id(),
+                            e->response_is_sse, notify_worker_id(),
                             e->client_ip, e->origin_ip, e->trusted_hops);
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
@@ -6976,14 +7220,6 @@ proxy_sock_read(proxy_fd_ent_t *pfe, int fd, void *buf, size_t len)
  *
  * Reaching across the pair is fine and already happens, as long as the reach is
  * the only lock held at the time. */
-/* A TLS backend leg failed on a read before one application byte came from
- * it. The handshake completed, or this read would not have run, so the
- * endpoint turned the gateway away afterwards: a TLS 1.3 server checks the
- * client certificate after the client has finished, and answers a missing or
- * untrusted one with an alert or a reset, whichever its close gets out first.
- * The request the leg was made for has no answer and cannot get one, so the
- * client is told what a failed connect tells it, and the endpoint is named
- * in the log. Call before the error queue is popped, with nothing held. */
 /* The endpoint a backend leg was made to, as "address:port". The pool and the
  * index are read where the connect path reads them; the socket is asked last,
  * because a leg that was reset no longer has a peer to name. */
@@ -7021,41 +7257,67 @@ proxy_backend_leg_name(proxy_fd_ent_t *pfe, proxy_fd_ent_t *client,
   snprintf(out, outlen, "fd=%d", pfe->fd);
 }
 
-static void
-proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error)
+/* A TLS backend leg failed before one application byte came from it, on a
+ * read or on a write. The handshake completed, or neither would have run, so
+ * the endpoint turned the gateway away afterwards: a TLS 1.3 server checks
+ * the client certificate after the client has finished, and answers a missing
+ * or untrusted one with an alert or a reset, whichever its close gets out
+ * first. A reset that arrives before the request is written fails the write;
+ * one that arrives after it fails the read of the answer. Either way the
+ * request the leg was made for has no answer and cannot get one, so the
+ * client is told what a failed connect tells it, and the endpoint is named
+ * in the log.
+ *
+ * `op` is the operation that failed, as the log names it, and `sys_errno`
+ * what the system said when no alert came (0 when it said nothing). Call
+ * before the error queue is popped, with nothing held. The read and the
+ * write of one leg can fail on two workers at once, so the leg is claimed
+ * atomically and answered once.
+ *
+ * Returns PROXY_LEG_ANSWERED_H1 when the HTTP/1.1 client was given its 502
+ * and told the stream ends, PROXY_LEG_ANSWERED_H2 when the HTTP/2 client was
+ * handed the leg's streams to answer, and PROXY_LEG_NOT_ANSWERED otherwise. */
+static int
+proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
+                             const char *op, int sys_errno)
 {
   proxy_fd_ent_t *client;
   char ep[INET_ADDRSTRLEN + 16];
   char why[160];
   unsigned long e = ERR_peek_error();
+  int answered = PROXY_LEG_NOT_ANSWERED;
 
-  if (pfe->odir != 1 || pfe->leg_rx_seen) {
-    return;
+  if (pfe->odir != 1 ||
+      __atomic_exchange_n(&pfe->leg_rx_seen, 1, __ATOMIC_ACQ_REL)) {
+    return PROXY_LEG_NOT_ANSWERED;   /* once per leg */
   }
-  pfe->leg_rx_seen = 1;              /* once per leg */
 
   client = pfe->n_rfd > 0 ? pfe->rfd_ent[0] : NULL;
   proxy_backend_leg_name(pfe, client, ep, sizeof(ep));
   if (ssl_error == SSL_ERROR_SSL && e != 0) {
     ERR_error_string_n(e, why, sizeof(why));
+  } else if (sys_errno != 0) {
+    snprintf(why, sizeof(why), "connection closed without a TLS alert (%s)",
+             strerror(sys_errno));
   } else {
     snprintf(why, sizeof(why), "connection closed without a TLS alert");
   }
-  log_error("ssl-read %s(failed after handshake, before any response): %s", ep, why);
+  log_error("%s %s(failed after handshake, before any response): %s", op, ep, why);
 
   if (!client || client->odir != 0 || client->fd <= 0 ||
       client->pd_phase != PD_PHASE_NONE) {
-    return;
+    return PROXY_LEG_NOT_ANSWERED;
   }
   if (client->h2_session && client->h2_session->h2_enabled) {
     (void)proxy_h2_backend_leg_unanswered(client, pfe);
-    return;
+    return PROXY_LEG_ANSWERED_H2;
   }
   PROXY_ENT_LOCK(client);
   if (!atomic_load_explicit(&client->cresp_answer_open, memory_order_relaxed)) {
     if (proxy_send_backend_unreachable(client,
             "the backend endpoint closed the connection before it answered") == 0) {
       cresp_note_local_answer(client);
+      answered = PROXY_LEG_ANSWERED_H1;
     }
     /* The answer says Connection: close; a TLS client is told the stream
      * ended here, so it does not read the close that follows as a cut. */
@@ -7064,6 +7326,7 @@ proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error)
     }
   }
   PROXY_ENT_UNLOCK(client);
+  return answered;
 }
 
 static int
@@ -7348,7 +7611,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         /* Before the log below pops the error queue: a FIN without
          * close_notify, or a reset, for the half-close observation. */
         hc_tls_read_failed(pfe, ssl_error, rval, errno);
-        proxy_backend_leg_unanswered(pfe, ssl_error);
+        (void)proxy_backend_leg_unanswered(pfe, ssl_error, "ssl-read", 0);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_SYSCALL] fd=%d odir=%d ssl_error=%d | SSL or syscall error, shutting down",
                   pfe->fd, pfe->odir, ssl_error);
@@ -7925,7 +8188,11 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
    * too (llb_conv_nat2proxy: pent->xport = nat_key->dport), so pass it as-is.
    * NEVER reintroduce `>> 16` here: it yields xport=0 and every fullproxy
    * connection gets an empty response. */
-  int psep_rc = proxy_setup_ep__(key->sip, (uint16_t)key->sport, (uint8_t)(protocol),
+  if (pfe->mcp_retry_pending) seltype = 0;
+  int psep_rc = pfe->mcp_retry_pending ?
+      proxy_setup_mcp_retry(pfe, &ep_sel, &tepval, &rid,
+                            (pp2len ? pp2buf : NULL), pp2len) :
+      proxy_setup_ep__(key->sip, (uint16_t)key->sport, (uint8_t)(protocol),
                        flt_url,
                        pfe->http_path_ok ? pfe->request_path : "/",  // P6: Pass request path
                        pfe->has_conv_id ? pfe->conversation_id : NULL,  // P0.3: Pass conversation ID
@@ -8029,7 +8296,46 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       memset(rkey, 0, sizeof(*rkey));
       connecting_legs++;
     } else if (proxy_skmap_key_from_fd(ep_cfd, rkey, &epprotocol)) {
+      char lost_ep[INET_ADDRSTRLEN + 16] = "?";
+
       log_error("skmap key from ep_cfd failed");
+      /* The leg was connected, and a TLS leg had finished its handshake, and
+       * it has no peer any more: the endpoint reset it before the request
+       * could be written. A TLS 1.3 server that refuses the client
+       * certificate does that, and this is the earliest of the three places
+       * the gateway can learn of it (the write of the request and the read
+       * of an answer are the other two). The request has no answer and
+       * cannot get one, so the client is told what a failed connect tells
+       * it before its connection is closed. Only a client that is owed an
+       * answer is given one: a request of its was framed and not answered
+       * yet, which a connection that carries no HTTP never has. An HTTP/2
+       * client and a request in a prefill/decode phase are answered by
+       * their own paths. */
+      if (tepval && ep_num >= 0 && ep_num < tepval->n_eps) {
+        char lost_ip[INET_ADDRSTRLEN] = "";
+
+        inet_ntop(AF_INET, &tepval->eps[ep_num].xip, lost_ip, sizeof(lost_ip));
+        snprintf(lost_ep, sizeof(lost_ep), "%s:%u", lost_ip,
+                 ntohs(tepval->eps[ep_num].xport));
+      }
+      if (ssl) {
+        log_error("ssl-setup %s(failed after handshake, before any response): "
+                  "connection reset before the request was written", lost_ep);
+      } else {
+        log_error("setup %s(failed after connect, before any response): "
+                  "connection reset before the request was written", lost_ep);
+      }
+      if (!(pfe->h2_session && pfe->h2_session->h2_enabled) &&
+          pfe->pd_phase == PD_PHASE_NONE &&
+          atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) >
+          atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed) &&
+          proxy_send_backend_unreachable(pfe,
+              "the backend endpoint closed the connection before it answered") == 0 &&
+          pfe->ssl) {
+        /* The answer says Connection: close; a TLS client is told the
+         * stream ended here. */
+        (void)SSL_shutdown(pfe->ssl);
+      }
       proxy_destroy_eps(pfe->fd, &ep_sel);
       if (ssl) {
         SSL_shutdown(ssl);
@@ -8261,6 +8567,9 @@ handle_on_message_begin(llhttp_t* parser)
    * the header is present, so without this reset a keyless request N+1 on a
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
+    pfe->http_hdrs_done = 0;   /* request N+1's header block starts here */
+    pfe->mcp_retry_pending = 0;
+    pfe->mcp_retry_excluded = 0;
     /* Request N may have left an unsettled claim (no countable usage came
      * back, or its response was cut). Zeroing it here would strand it in the
      * quota store until the window rolls; release it so request N+1 on this
@@ -8323,6 +8632,19 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->effective_model[0] = '\0';
     pfe->json_stream_route_pending = 0;
     pfe->json_stream_continue_sent = 0;
+    /* The routing keys the body of request N yielded are request N's too.
+     * user_id (the JSON "user" field) is the Tier-0 session key fallback and
+     * the normal-mode session key; it was set once and never cleared, so a
+     * keyless request N+1 on this connection — a different user behind the
+     * same upstream proxy — was pinned to request N's session and endpoint.
+     * is_chat/body_off/body_len locate the body for the KV-exact tokenize
+     * stage and were only ever assigned when a body was present, so a
+     * bodyless request N+1 could hand the tokenizer request N's span. */
+    pfe->user_id[0] = '\0';
+    pfe->has_user_id = 0;
+    pfe->is_chat = 0;
+    pfe->body_off = 0;
+    pfe->body_len = 0;
     /* Token-accounting state is per-response: without this reset, request
      * N+1 on a reused connection would inherit request N's consumed flag
      * (never charging again) or its stale counts. */
@@ -8348,41 +8670,8 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
 {
   char resp_buf[640];
   int n;
-  const char *status_line =
-    status == 400 ? "400 Bad Request" :
-    status == 401 ? "401 Unauthorized" :
-    status == 403 ? "403 Forbidden" :
-    status == 413 ? "413 Content Too Large" :
-    status == 429 ? "429 Too Many Requests" :
-                    "503 Service Unavailable";
-
-  if (retry_body) {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 %s\r\n"
-      "Content-Type: application/json\r\n"
-      "Retry-After: %d\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-      status_line, retry_after, code, retry_after);
-  } else if (retry_after > 0) {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 %s\r\n"
-      "Content-Type: application/json\r\n"
-      "Retry-After: %d\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-      status_line, retry_after, code, msg);
-  } else {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 %s\r\n"
-      "Content-Type: application/json\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-      status_line, code, msg);
-  }
+  n = sp_h1_format_admit_deny(resp_buf, sizeof(resp_buf), status,
+                              retry_after, retry_body, code, msg);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
       log_error("[AIGateway] fd=%d failed to send complete bounded %d "
@@ -8500,6 +8789,7 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->http_pok = 0;
   pfe->http_hok = 0;
   pfe->http_hvok = 0;
+  pfe->http_hdrs_done = 0;
   pfe->http_body_complete = 0;
   pfe->http_content_length = 0;
   pfe->is_streamable = 0;
@@ -8672,6 +8962,7 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
    * a keep-alive connection can never accumulate units. */
   fc_permit_release(&pfe->fc);
   if (fc_active(&tepval->fc) &&
+      !(tepval->mcp_stateless && pfe->http_is_post) &&
       !fc_is_inference_request(pfe->http_is_post, pfe->request_path)) {
     fc_bypass(&tepval->fc, &pfe->fc);
     return 0;
@@ -8700,8 +8991,11 @@ sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel)
     return sel;                          /* off, bypassed, or already refused */
   if (pfe->fc.ep[FC_ROLE_PREFILL] >= 0 || pfe->fc.ep[FC_ROLE_DECODE] >= 0)
     return sel;                          /* a P/D request: its role legs hold the units */
+  sp_mcp_fc_scope mcp_scope={.pool=tepval,.request=pfe};
   ep = fc_ep_acquire_any(&tepval->fc, &pfe->fc, FC_ROLE_NORMAL, sel,
-                         tepval->n_eps, sp_fc_normal_eligible, tepval, &v);
+                         tepval->n_eps,
+                         tepval->mcp_stateless ? sp_mcp_fc_eligible : sp_fc_normal_eligible,
+                         tepval->mcp_stateless ? (void *)&mcp_scope : (void *)tepval, &v);
   if (ep < 0)
     return sp_fc_h1_refuse(pfe, tepval, v, FC_ROLE_NORMAL, 1);
   return ep;
@@ -8746,7 +9040,7 @@ sp_fc_warm_returning(proxy_epval_t *tepval, const proxy_ent_t *old_eps,
   uint64_t now;
   int n;
 
-  if (!tepval->ai_gw_mode || tepval->fc.cfg.warmup_ms == 0)
+  if ((!tepval->ai_gw_mode && !tepval->mcp_stateless) || tepval->fc.cfg.warmup_ms == 0)
     return;
   now = fc_now_ns();
   n = tepval->n_eps < FC_MAX_EP ? tepval->n_eps : FC_MAX_EP;
@@ -9112,6 +9406,156 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
   }
 }
 
+/* Explicit MCP mode validates before selecting a backend. */
+static int sp_mcp_enabled(const proxy_fd_ent_t *pfe)
+{
+  const proxy_map_ent_t *ent = pfe ? pfe->head : NULL;
+  return pfe && pfe->odir == 0 && ent && ent->val.ephash && ent->val.ephash->mcp_stateless;
+}
+static int sp_mcp_h1_refuse(proxy_fd_ent_t *pfe, int status)
+{
+  struct sp_mcp_capture *c=pfe->mcp_capture;
+  size_t blen=0;
+  char *body=sp_mcp_error_json(c?&c->req:NULL,status,c?c->body:NULL,c?c->len:0,&blen);
+  size_t cap=blen+256;
+  char *response=malloc(cap);
+  const char *reason = status == 405 ? "Method Not Allowed" : status == 413 ? "Content Too Large" :
+                       status == 503 ? "Service Unavailable" : "Bad Request";
+  int n=response ? snprintf(response,cap,
+      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+      "%sConnection: close\r\n\r\n%s",status,reason,blen,status==405?"Allow: POST\r\n":"",body?body:""):-1;
+  pfe->ai_gw_denied=1;
+  pfe->lb_err_body_sent=1;
+  if (n>0 && (size_t)n<cap) proxy_send_local_response_and_shutdown(pfe,response,(size_t)n);
+  else shutdown(pfe->fd,SHUT_RDWR);
+  free(response);free(body);
+  return -1;
+}
+/* A known, bounded Content-Length can be consumed by the normal nonblocking
+ * parser before closing. No synchronous drain or unbounded upload wait. For
+ * oversized/ambiguous framing, keep the immediate fail-closed denial. */
+static int sp_mcp_h1_header_refuse(proxy_fd_ent_t *pfe,int status)
+{
+  if (pfe->mcp_capture && pfe->http_content_length<=SP_MCP_PROXY_BODY_MAX) {
+    pfe->mcp_capture->refusal_status=status;
+    return proxy_send_local_100_continue(pfe);
+  }
+  return sp_mcp_h1_refuse(pfe,status);
+}
+static int sp_mcp_h1_body(llhttp_t *parser, const char *at, size_t len)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe = settings ? settings->uarg : NULL;
+  if (!sp_mcp_enabled(pfe)) return 0;
+  int status = sp_mcp_capture_body(pfe->mcp_capture, at, len);
+  return status ? sp_mcp_h1_refuse(pfe, status) : 0;
+}
+static int sp_mcp_h1_headers(proxy_fd_ent_t *pfe, llhttp_t *parser)
+{
+  struct phr_header headers[256];
+  size_t nh = sizeof(headers)/sizeof(headers[0]), ml, pl;
+  const char *method, *path; int minor;
+  if (!pfe->mcp_capture) {
+    pfe->mcp_capture = calloc(1, sizeof(*pfe->mcp_capture));
+    if (!pfe->mcp_capture) return sp_mcp_h1_header_refuse(pfe, 503);
+  }
+  sp_mcp_capture_reset(pfe->mcp_capture);
+  if (parser->method != HTTP_POST) return sp_mcp_h1_header_refuse(pfe, 405);
+  if (pfe->http_content_length > SP_MCP_PROXY_BODY_MAX) return sp_mcp_h1_header_refuse(pfe, 413);
+  int off = phr_parse_request((const char *)pfe->rcvbuf, pfe->rcv_off,
+      &method, &ml, &path, &pl, &minor, headers, &nh, 0);
+  if (off < 0 || (size_t)off > 128U*1024U) return sp_mcp_h1_header_refuse(pfe, 400);
+  if (pl >= sizeof(pfe->url_path)) return sp_mcp_h1_header_refuse(pfe, 413);
+  memcpy(pfe->url_path,path,pl); pfe->url_path[pl]=0;
+  size_t path_len=0;
+  while (path_len<pl && path[path_len]!='?') path_len++;
+  if (path_len>=sizeof(pfe->request_path)) return sp_mcp_h1_header_refuse(pfe, 413);
+  memcpy(pfe->request_path,path,path_len); pfe->request_path[path_len]=0;
+  pfe->http_path_ok=pfe->http_is_post=1;
+  pfe->host_url[0]=0;
+  unsigned host_count=0;
+  /* Full fields avoid split llhttp name/value callbacks and prefix matches. */
+  pfe->n_l7_headers = 0;
+  struct sp_mcp_media media = {0};
+  proxy_map_ent_t *head = pfe->head;
+  for (size_t i=0; i<nh; i++) {
+    if (!headers[i].name) return sp_mcp_h1_header_refuse(pfe, 400);
+    /* MCP-Name is validated and normalized after decoding the full body;
+     * its encoded wire value may be longer than its representable L7 value. */
+    int mirrored_name=headers[i].name_len==8 &&
+      !strncasecmp(headers[i].name,"mcp-name",8);
+    int used=l7_mcp_header_used(head,headers[i].name,headers[i].name_len);
+    if (used &&
+        (headers[i].name_len>=L7_HDR_NAME_MAX ||
+         (!mirrored_name && headers[i].value_len>=L7_HDR_VALUE_MAX)))
+      return sp_mcp_h1_header_refuse(pfe,413);
+    if (headers[i].name_len==4 && !strncasecmp(headers[i].name,"host",4)) {
+      if (++host_count!=1 || !headers[i].value_len || headers[i].value_len>=sizeof(pfe->host_url))
+        return sp_mcp_h1_header_refuse(pfe,400);
+      memcpy(pfe->host_url,headers[i].value,headers[i].value_len);
+      pfe->host_url[headers[i].value_len]=0;
+    }
+    sp_mcp_media_header(&media, headers[i].name, headers[i].name_len, headers[i].value, headers[i].value_len);
+    sp_mcp_header(&pfe->mcp_capture->req, headers[i].name, headers[i].name_len,
+                  headers[i].value, headers[i].value_len);
+    if (used) {
+      if (pfe->n_l7_headers>=L7_MAX_CAPTURED_HEADERS) return sp_mcp_h1_header_refuse(pfe,413);
+      l7_store_header_n(pfe, NULL, headers[i].name, headers[i].name_len,
+                        headers[i].value, headers[i].value_len);
+    }
+  }
+  if (host_count!=1 || !sp_mcp_media_valid(&media)) return sp_mcp_h1_header_refuse(pfe, 400);
+  pfe->http_hok=pfe->http_hvok=1;
+  if (pfe->mcp_capture->req.error) return sp_mcp_h1_header_refuse(pfe, pfe->mcp_capture->req.error);
+  /* The body is withheld for validation; unblock Expect clients locally. */
+  return proxy_send_local_100_continue(pfe);
+}
+static int sp_mcp_h1_complete(proxy_fd_ent_t *pfe, llhttp_t *parser)
+{
+  struct sp_mcp_capture *c = pfe->mcp_capture;
+  if (!c) return sp_mcp_h1_refuse(pfe, 400);
+  if (c->refusal_status) return sp_mcp_h1_refuse(pfe,c->refusal_status);
+  int status = sp_mcp_validate(&c->req, llhttp_method_name(parser->method), c->body, c->len);
+  if (status) return sp_mcp_h1_refuse(pfe, status);
+  proxy_map_ent_t *ent = pfe->head;
+  if (ent->has_l7_policy) {
+    int name_used=l7_mcp_header_used(ent,"mcp-name",8);
+    if (name_used && (c->req.name_len >= L7_HDR_VALUE_MAX || memchr(c->req.name, 0, c->req.name_len)))
+      return sp_mcp_h1_refuse(pfe, 413);
+    int method_found=!l7_mcp_header_used(ent,"mcp-method",10), name_found=!name_used || !c->req.name_seen;
+    for (uint16_t i=0; i<pfe->n_l7_headers; i++) {
+      if (!strcasecmp(pfe->l7_headers[i].name, "mcp-method")) method_found=1;
+      if (!strcasecmp(pfe->l7_headers[i].name, "mcp-name")) {
+        memcpy(pfe->l7_headers[i].value, c->req.name, c->req.name_len);
+        pfe->l7_headers[i].value[c->req.name_len]=0; name_found=1;
+      }
+    }
+    if (!method_found || !name_found) return sp_mcp_h1_refuse(pfe, 413);
+  }
+  pfe->has_conv_id = pfe->has_custom_session_header = pfe->has_user_id = 0;
+  atomic_store_explicit(&pfe->mcp_inflight, 1, memory_order_release);
+  return 0;
+}
+
+static int
+handle_on_headers_complete(llhttp_t* parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe = settings ? settings->uarg : NULL;
+
+  if (!pfe) {
+    return 0;
+  }
+  /* The whole header block (through its CRLF CRLF) has been parsed. This is
+   * the only writer of http_hdrs_done; the header-completion deadline reads
+   * it. http_hok cannot stand in for it: it flips on the first "Host:" name,
+   * which is the first line every HTTP/1.1 client -- and every slowloris --
+   * sends. */
+  pfe->http_hdrs_done = 1;
+  if (sp_mcp_enabled(pfe)) return sp_mcp_h1_headers(pfe, parser);
+  return 0;                          /* 0: parse the body that follows */
+}
+
 int
 handle_on_message_complete(llhttp_t* parser)
 {
@@ -9123,6 +9567,7 @@ handle_on_message_complete(llhttp_t* parser)
 
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
+  if (sp_mcp_enabled(pfe) && sp_mcp_h1_complete(pfe, parser)) return -1;
   // L7 Metrics: capture request start timestamp for TTFB. Kept independent of
   // HAVE_HTTP_TRACE — the metric_* fields and record_latency_sample() are always
   // compiled (see sockproxy.h "L7 Metrics (independent of Jaeger tracing)"), so
@@ -9592,7 +10037,7 @@ handle_on_message_complete(llhttp_t* parser)
 #ifdef HAVE_PROXY_EXTRA_DEBUG
 	log_debug("http completed %p!\n", settings->uarg);
 #endif
-	return 0;
+	return sp_mcp_enabled(pfe) ? HPE_PAUSED : 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -9905,6 +10350,75 @@ cresp_is_answer(int status)
   return status >= 200 || status == 101;
 }
 
+static void
+proxy_sse_activate(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || pfe->sse_mode != 1 || pfe->sse_active) return;
+  pfe->sse_active = 1;
+  pfe->stream_start_ts = time(NULL);
+  {
+    struct timespec _sse_ts;
+    clock_gettime(CLOCK_MONOTONIC, &_sse_ts);
+    pfe->stream_start_mono_ns = (uint64_t)_sse_ts.tv_sec * 1000000000ULL +
+                                    (uint64_t)_sse_ts.tv_nsec;
+  }
+  /* Effective model: X-Model header > JSON body model > reset-boundary
+   * snapshot > "" */
+  const char *sse_model = proxy_effective_model(pfe);
+  llb_ai_stream_start("", (char *)sse_model);
+  log_debug("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
+           pfe->fd, -1, sse_model);
+
+  /* P/D decode streaming transition — decode EP is now streaming */
+  if (pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
+    pfe->pd_phase = PD_PHASE_DECODE_STREAMING;
+    pfe->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
+    /* arm the backend-idle clock for the graceful-[DONE] safety-net
+     * reaper. This read carried the activation bytes, so "now" is the last
+     * backend activity. Refreshed per byte in the [DONE] scanner below. */
+    pfe->pd_last_decode_ts = time(NULL);
+    log_debug("Decode streaming started — client_fd=%d backend_fd=%d",
+             pfe->fd, -1);
+  }
+}
+
+static int
+cresp_on_message_begin(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+  return 0;
+}
+static int cresp_on_field(llhttp_t *parser, const char *at, size_t len)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) sp_sse_field(&pfe->cresp_sse, at, len);
+  return 0;
+}
+static int cresp_on_value(llhttp_t *parser, const char *at, size_t len)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) sp_sse_value(&pfe->cresp_sse, at, len);
+  return 0;
+}
+static int cresp_on_value_done(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) sp_sse_header_done(&pfe->cresp_sse);
+  return 0;
+}
+static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) {
+    pfe->cresp_payload_observed = 1;
+    if (pfe->ai_gw_mode && !pfe->usage_consumed)
+      proxy_usage_tail_update(pfe, (const uint8_t *)at, len);
+    sp_sse_body(&pfe->cresp_sse, at, len);
+  }
+  return 0;
+}
+
 static int
 cresp_on_headers_complete(llhttp_t *parser)
 {
@@ -9919,6 +10433,8 @@ cresp_on_headers_complete(llhttp_t *parser)
   if (!cresp_is_answer(parser->status_code)) {
     return 0;
   }
+  pfe->metric_response_status = parser->status_code;
+  if (pfe->cresp_sse.is_sse) proxy_sse_activate(pfe);
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
   epp_report_resp_headers(pfe, parser->status_code);
@@ -9944,6 +10460,11 @@ cresp_on_message_complete(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
 
   if (pfe && cresp_is_answer(parser->status_code)) {
+    /* Capture ownership survives a policy change and names modern H1
+     * requests independently of the AI accounting marker. Release execution
+     * before admitting the client's next request; the framer holds its lock. */
+    if (pfe->mcp_capture) fc_permit_release(&pfe->fc);
+    atomic_store_explicit(&pfe->mcp_inflight, 0, memory_order_release);
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     hc_resp_done(pfe);
@@ -9962,6 +10483,7 @@ cresp_on_message_complete(llhttp_t *parser)
 static void
 cresp_note_local_answer(proxy_fd_ent_t *client)
 {
+  atomic_store_explicit(&client->mcp_inflight, 0, memory_order_release);
   (void)cresp_head_pop(client);
   atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
 }
@@ -9972,6 +10494,11 @@ cresp_parser_init(proxy_fd_ent_t *pfe)
 {
   if (!cresp_settings_inited) {
     llhttp_settings_init(&cresp_settings);
+    cresp_settings.on_message_begin = cresp_on_message_begin;
+    cresp_settings.on_header_field = cresp_on_field;
+    cresp_settings.on_header_value = cresp_on_value;
+    cresp_settings.on_header_value_complete = cresp_on_value_done;
+    cresp_settings.on_body = cresp_on_body;
     cresp_settings.on_headers_complete = cresp_on_headers_complete;
     cresp_settings.on_message_complete = cresp_on_message_complete;
     cresp_settings_inited = 1;
@@ -10022,6 +10549,16 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
    * without the entry lock the framer holds: only the caller that actually
    * clears it counts the completion, so two legs closing cannot count one
    * response twice. */
+  if (client->mcp_capture) {
+    /* EOF also ends execution when a final HTTP boundary never arrived.
+     * This backend-worker site normally has no client-entry lock. */
+    PROXY_ENT_LOCK(client);
+    fc_permit_release(&client->fc);
+    atomic_store_explicit(&client->mcp_inflight, 0, memory_order_release);
+    PROXY_ENT_UNLOCK(client);
+  } else {
+    atomic_store_explicit(&client->mcp_inflight, 0, memory_order_release);
+  }
   if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     hc_resp_done(client);
@@ -10054,6 +10591,9 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
 
   pfe = settings->uarg;
   assert(pfe);
+  /* Trailers must never replace already-validated routing operands. */
+  if (sp_mcp_enabled(pfe) && (parser->flags & F_TRAILING))
+    return sp_mcp_h1_refuse(pfe, 400);
 
   if (length >= sizeof(str)-1) {
     return 0;
@@ -10490,6 +11030,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   int retry;
   proxy_fd_ent_t *npfe1 = NULL;
   SSL *ssl = NULL;
+  uint8_t fe_counted = 0;  /* this accept holds one fe_conns unit (connectionLimit) */
 
   /* : global total-footprint ingress backpressure (knob
    * LLB_PD_MAX_TOTAL_INFLIGHT). BEFORE accept(), if the bound is enabled
@@ -10542,6 +11083,37 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     return PROXY_ACCEPT_DONE; // backlog drained, or an error poll re-reports
   }
 
+  /* connectionLimit of the rule (proxy_map_ent.fe_conn_limit): the per-rule
+   * client-connection ceiling the NAT datapath enforces at SYN time for NAT
+   * rules and could never see for this listener. The unit is taken here, the
+   * one point where a client leg comes into being, with a single fetch_add so
+   * concurrent accept shards cannot both slip under the ceiling; it is
+   * released once, in proxy_release_fd_ctx(reset=1), keyed on fe_counted.
+   * Over the ceiling the connection is reset at once (SO_LINGER 0): an LLM
+   * client learns in one RTT instead of waiting on a timeout, and no
+   * listener pause/re-arm state is needed. With the limit unset (0) the unit
+   * is still taken and nothing is ever refused: the gauge is what
+   * activeConnections reports for a fullproxy rule, limit or no limit. */
+  {
+    uint32_t fe_lim = atomic_load_explicit(&ent->fe_conn_limit, memory_order_relaxed);
+    uint64_t refused = 0;
+    enum fe_limit_rc fe_rc = fe_limit_take(&ent->fe_conns, fe_lim,
+                                           &ent->fe_conn_refused, &refused);
+    if (fe_rc == FE_LIMIT_REFUSED) {
+      struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+      setsockopt(new_sd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+      close(new_sd);
+      if ((refused & 1023u) == 1u) {
+        log_info("[FE_CONN_LIMIT] %s:%u refused accept at limit=%u "
+                 "(refused_total=%lu)",
+                 inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+                 fe_lim, (unsigned long)refused);
+      }
+      return PROXY_ACCEPT_NEXT;
+    }
+    fe_counted = (fe_rc == FE_LIMIT_TAKEN);
+  }
+
   new_sd = get_mapped_proxy_fd(new_sd, 1);
 
   if (proxy_skmap_key_from_fd(new_sd, key, &protocol)) {
@@ -10551,17 +11123,22 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_free(ssl);
     }
     close(new_sd);
+    if (fe_counted) {
+      fe_limit_release(&ent->fe_conns);
+    }
     return PROXY_ACCEPT_NEXT;
   }
 
   proxy_sock_set_opts(new_sd, protocol);
 
   // SSL handshake if configured
-  if (ent->val.ssl_ctx) {
+  /* Read once: a rule taking over a kept listener replaces the context. */
+  void *front_ctx = __atomic_load_n(&ent->val.ssl_ctx, __ATOMIC_ACQUIRE);
+  if (front_ctx) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-    log_debug("[SSL_HANDSHAKE_START] fd=%d: ssl_ctx=%p, starting SSL_accept", new_sd, ent->val.ssl_ctx);
+    log_debug("[SSL_HANDSHAKE_START] fd=%d: ssl_ctx=%p, starting SSL_accept", new_sd, front_ctx);
 #endif
-    ssl = SSL_new(ent->val.ssl_ctx);
+    ssl = SSL_new(front_ctx);
     assert(ssl);
     SSL_set_fd(ssl, new_sd);
     if (proxy_ssl_accept(ssl, new_sd) < 0) {
@@ -10571,6 +11148,9 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_free(ssl);
       close(new_sd);
       ssl = NULL;
+      if (fe_counted) {
+        fe_limit_release(&ent->fe_conns);
+      }
       return PROXY_ACCEPT_NEXT;
     }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -10601,6 +11181,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->head = ent;
   npfe1->ssl = ssl;
   npfe1->odir = 0;  // Client-facing connection
+  npfe1->fe_counted = fe_counted;  // the fe_conns unit now belongs to this leg
 
   /* The address this connection came from, in text, for everything that
    * reports a request on it. Captured HERE rather than where the header
@@ -10681,6 +11262,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->session_key[0] = '\0';
   npfe1->session_created = 0;
   npfe1->last_activity = 0;
+  npfe1->idle_since = time(NULL);   /* the inactiveTimeout clock starts at accept */
   npfe1->affinity_type = PROXY_AFFINITY_NONE;
 
   // Initialize custom session header fields
@@ -10714,6 +11296,8 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->inactive_timeout_sec = 0;
   npfe1->sse_active = 0;
   npfe1->stream_start_ts = 0;
+  npfe1->bp_since = 0;
+  npfe1->abandon_reason = 0;
   npfe1->stream_end_ts = 0;
   memset(npfe1->sse_tail, 0, sizeof(npfe1->sse_tail));
   npfe1->sse_tail_len = 0;
@@ -10757,6 +11341,8 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   // Initialize HTTP parser
   llhttp_settings_init(&npfe1->settings);
   npfe1->settings.on_message_begin = handle_on_message_begin;
+  npfe1->settings.on_headers_complete = handle_on_headers_complete;
+  npfe1->settings.on_body = sp_mcp_h1_body;
   npfe1->settings.on_message_complete = handle_on_message_complete;
   npfe1->settings.on_header_field = handle_header_name;
   npfe1->settings.on_header_value = handle_header_val;
@@ -10888,7 +11474,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * own service and endpoint units before a byte rides the leg. A
      * refusal is answered on the client socket and closes the connection
      * (the leg goes with it). */
-    if (pfe->epv && ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+    if (pfe->epv && (((proxy_epval_t *)pfe->epv)->ai_gw_mode ||
+                     ((proxy_epval_t *)pfe->epv)->mcp_stateless)) {
       proxy_epval_t *ka_epv = (proxy_epval_t *)pfe->epv;
       int g = sp_fc_h1_gate_service(pfe, ka_epv);
       if (g == 0)
@@ -10896,8 +11483,24 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       if (g == SP_FC_H1_QUEUED) {
         /* Parked: the kept leg is let go so the resumed request selects
          * afresh (the way the P/D boundary releases a stale leg), and the
-         * client is suspended until its turn. */
+         * client is suspended until its turn. The endpoint pin goes with
+         * the leg: the resumed request runs setup_proxy_path, whose
+         * selection takes a fresh bounded-load unit and overwrites ep_num,
+         * and the parse-phase stale-unit guard does not run on the resume
+         * path — so the unit this connection holds on ep_num is handed
+         * back here, exactly as that guard would have. */
         proxy_release_rfd_ctx(pfe);
+#ifdef HAVE_DP_GPU_ROUTING
+        if (pfe->ep_num >= 0 && pfe->epv) {
+          if ((ka_epv->select == PROXY_SEL_CHWBL ||
+               ka_epv->select == PROXY_SEL_WRR_HASH) &&
+              ka_epv->chwbl_config) {
+            chwbl_dec_runtime(ka_epv, pfe->ep_num);
+          }
+          pfe->ep_num = -1;
+          pfe->epv = NULL;
+        }
+#endif
         sp_fc_h1_park(pfe);
         return SP_FWD_PARKED;
       }
@@ -10952,7 +11555,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * accumulated bodies are left untouched (not contiguous/complete
      * here); non-streaming requests carry usage without the flag. */
     if (pfe->epv && pfe->odir == 0 && pfe->rcv_off > 4 && !pfe->is_streamable &&
-        ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+        ((proxy_epval_t *)pfe->epv)->ai_gw_mode &&
+        !((proxy_epval_t *)pfe->epv)->mcp_stateless) {
       size_t ug_scan = pfe->rcv_off < 2048 ? pfe->rcv_off : 2048;
       if (memmem(pfe->rcvbuf, ug_scan, "Transfer-Encoding: chunked", 26) == NULL &&
           memmem(pfe->rcvbuf, ug_scan, "transfer-encoding: chunked", 26) == NULL) {
@@ -11268,6 +11872,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->http_pok = 0;
     pfe->http_hok = 0;
     pfe->http_hvok = 0;
+    pfe->http_hdrs_done = 0;
     pfe->http_body_complete = 0;
     pfe->http_content_length = 0;
     pfe->is_streamable = 0;
@@ -11342,6 +11947,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     }
     pfe->sse_active = 0;
     pfe->stream_start_ts = 0;
+    pfe->bp_since = 0;
+    pfe->abandon_reason = 0;
     pfe->stream_end_ts = 0;
     pfe->sse_tail_len = 0;
     pfe->pd_last_decode_ts = 0;
@@ -11541,10 +12148,24 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
   int protocol = 0;
   int epprotocol = 0;
   int err;
+  int preconnect_error = 0;
+  socklen_t error_len = sizeof(preconnect_error);
+  /* SO_ERROR proves handshake failure before any HTTP bytes are forwarded.
+   * A successful connection that later closes is never replayed. */
+  if (epv && epv->mcp_stateless) {
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &preconnect_error, &error_len) != 0)
+    preconnect_error = errno;
+  if (!preconnect_error && (type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != 0)
+      preconnect_error = ETIMEDOUT;
+  }
+  }
 
   proxy_connect_pending_clear(pfe);
 
-  err = proxy_setup_ep_connect_complete(fd, pfe->connect_pp2_len ? pfe->connect_pp2 : NULL,
+  err = preconnect_error ? preconnect_error : proxy_setup_ep_connect_complete(fd, pfe->connect_pp2_len ? pfe->connect_pp2 : NULL,
                                         pfe->connect_pp2_len);
   if (err == 0 && (type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
     /* No socket error but the leg is gone: the backstop's shutdown. */
@@ -11567,6 +12188,30 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
       circuit_breaker_record_failure(epv, client->ep_num);
     } else {
       log_error("connect backend fd=%d(%s)", fd, strerror(err));
+    }
+    /* A reset can follow a successful accept before the event is consumed.
+     * Restrict replay to unambiguous handshake failures, never ECONNRESET. */
+    if ((preconnect_error == ECONNREFUSED || preconnect_error == ETIMEDOUT ||
+         preconnect_error == ENETUNREACH || preconnect_error == EHOSTUNREACH) &&
+        client && client->fd > 0 && epv &&
+        epv->mcp_stateless && client->ep_num >= 0 &&
+        client->ep_num < epv->n_eps && client->ep_num < MAX_PROXY_EP) {
+      client->mcp_retry_excluded |= UINT32_C(1) << client->ep_num;
+      client->mcp_retry_pending = 1;
+      /* Both legs have the same notifier owner. Detach the failed leg and
+       * keep the client request buffer + service permit intact. Its deferred
+       * destroy sees no client peer; the stale event generation cannot destroy
+       * a newly registered replacement. */
+      proxy_release_rfd_ctx(client);
+      client->connect_wait = 0;
+      client->read_paused = 0;
+      sp_notify_arm(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
+                    client, client->gen);
+      const char *phurl = client->http_hvok ? client->host_url : NULL;
+      int rc = pd_setup_and_forward(client->fd, client, &key, &rkey, phurl);
+      if (rc == SP_FWD_RESTART)
+        notify_delete_ent(proxy_struct->ns, client->fd, 0);
+      return 0;
     }
     if (client && client->fd > 0) {
       static const char lb_502[] =
@@ -11747,6 +12392,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     if (rc > 0) {
       pfe_rcv_note_len(pfe, pfe->rcv_off + (size_t)rc);
       pfe->leg_rx_seen = 1;
+      if (pfe->odir == 0) {
+        pfe->idle_since = time(NULL);   /* client bytes: the inactiveTimeout clock restarts */
+      }
     }
 
     if (qos_b) {
@@ -11808,6 +12456,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       log_trace("📭 [NO_MORE_DATA] fd=%d (odir=%d): No more data available (EAGAIN/EWOULDBLOCK), exiting burst loop",
                 fd, pfe->odir);
       break;
+    }
+
+    if (rc<=0 && pfe->backend_h2_session &&
+        ((backend_h2_session_t *)pfe->backend_h2_session)->bridge_h1) {
+      proxy_h2_h1_backend_eof(pfe,rc==0); /* reset is not a valid close delimiter */
+      return -1;
     }
 
     errno = saved_errno;  // Restore errno before error checking
@@ -11947,6 +12601,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * the P/D arm, this assumes the client does not pipeline request N+1
        * before N's response drains. */
       int ai_gw_boundary = 0;
+      int mcp_boundary = sp_mcp_enabled(pfe);
+      if (mcp_boundary && atomic_load_explicit(&pfe->mcp_inflight, memory_order_acquire))
+        return sp_mcp_h1_refuse(pfe, 400);
       if (pfe->head) {
         proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
         if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode &&
@@ -11970,7 +12627,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           log_debug("[EPP] fd=%d keep-alive boundary on an EPP rule: releasing the backend leg "
                     "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
-        } else if (ai_gw_boundary) {
+        } else if (mcp_boundary || ai_gw_boundary) {
           log_trace("[KA_FIX] fd=%d gate re-arm on live backend leg "
                     "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           pfe->ka_reparse = 1;
@@ -11997,7 +12654,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
           if (pfe->l7_hdr_accum_start == 0) {
             pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
-          } else if (pfe->http_hok == 0 &&
+          } else if (!pfe->http_hdrs_done &&
                      proxy_hdr_deadline_expired(hent, pfe, time(NULL))) {
             pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
@@ -12086,6 +12743,13 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         enum llhttp_errno err = llhttp_execute(&pfe->parser,
                                 (char *)pfe->rcvbuf + pfe->parsed_off, to_parse);
 
+        if (sp_mcp_enabled(pfe) && err == HPE_PAUSED) {
+          const char *end = llhttp_get_error_pos(&pfe->parser);
+          if (end != (const char *)pfe->rcvbuf + pfe->rcv_off)
+            return sp_mcp_h1_refuse(pfe, 400); /* pipelining refused before any delivery */
+          llhttp_resume(&pfe->parser); err = HPE_OK;
+        }
+
         // Update how much we've parsed
         pfe->parsed_off = pfe->rcv_off;
 
@@ -12093,15 +12757,18 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
          * An oversize JSON request deliberately spans another read while we
          * wait for its body model, so restore the already-proven header state
          * for that continuation read. */
-        if (json_stream_was_pending) {
+        if (json_stream_was_pending || (sp_mcp_enabled(pfe) && pfe->http_hdrs_done)) {
           pfe->http_hok = 1;
           pfe->http_hvok = pfe->host_url[0] != '\0';
         }
 
         if (err == HPE_OK) {
           /* headers complete — clear the accumulation anchor so the tcp_inspect
-           * deadline never bounds the body-upload phase (it guards header accumulation only). */
-          if (pfe->http_hok) {
+           * deadline never bounds the body-upload phase (it guards header accumulation only).
+           * Keyed on the header block being complete, not on http_hok: that flag
+           * flips on the first "Host:" name, so a slowloris that sends "Host:" first
+           * had its anchor cleared on its first partial read and was never dropped. */
+          if (pfe->http_hdrs_done) {
             pfe->l7_hdr_accum_start = 0;
             /* arm the member-data idle baseline. The request is now fully received and
              * about to be relayed to the member, so the timeoutMemberData deadline must start counting
@@ -12147,7 +12814,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           //                application/octet-stream, image/*, video/*, application/pdf, etc.
           // 
           // Detection: Check if Content-Type is one of the types that needs buffering
-          int needs_body_inspection = 0;
+          int needs_body_inspection = sp_mcp_enabled(pfe);
           if (pfe->http_hok && pfe->rcv_off >= 100) {
             size_t search_len = (pfe->rcv_off < 2048) ? pfe->rcv_off : 2048;
             // Only these types require full body buffering for routing logic
@@ -12168,7 +12835,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // other KV miss path. Requires Content-Length (chunked TE has none;
           // those already skip inspection via the content_length==0 gate).
           int json_stream_fallback = pfe->json_stream_route_pending;
-          if (needs_body_inspection &&
+          if (!sp_mcp_enabled(pfe) && needs_body_inspection &&
               pfe->http_content_length > SP_JSON_INSPECT_MAX) {
             if (!pfe->json_stream_route_pending) {
               log_debug("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
@@ -12259,7 +12926,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
             // P0.2: Extract LLM prefix from JSON body
             // SKIP for streamable content - only inspect JSON/form data
-            if (!pfe->is_streamable && pfe->http_content_length > 0 && pfe->rcv_off > 0) {
+            if (!sp_mcp_enabled(pfe) && !pfe->is_streamable && pfe->http_content_length > 0 && pfe->rcv_off > 0) {
               // Find start of body (after headers)
               // The parser has consumed headers, body starts at current parse position
               // For llhttp, we need to find body start by looking for "\r\n\r\n"
@@ -12408,7 +13075,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                   proxy_leg_tls_stale((proxy_map_ent_t *)pfe->head,
                                                       pfe->rfd_ent[0])),
               };
-              if (ka_leg_reusable(&ka_ctx, &ka_reason)) {
+              if (!sp_mcp_enabled(pfe) && ka_leg_reusable(&ka_ctx, &ka_reason)) {
                 pfe->ka_keep_leg = 1;
                 log_trace("[KA_FIX] fd=%d keeping backend leg fd=%d ep=%d",
                           pfe->fd, pfe->rfd[0], pfe->ep_num);
@@ -12467,6 +13134,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             // With 1MB buffer, this gives 972KB usable space before overflow protection
             // Early backend connection (at 512KB) should prevent reaching this threshold
             if (pfe->rcv_off >= (SP_SOCK_MSG_LEN * 95 / 100)) {
+              if (sp_mcp_enabled(pfe)) return sp_mcp_h1_refuse(pfe,413);
               /* On an AI-gateway service the client gets a deterministic
                * answer before the reset: a chunked (or length-less) body
                * that outgrows the buffer is refused 413, not cut mid-upload
@@ -12534,7 +13202,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           {
             proxy_map_ent_t *perr_head = (proxy_map_ent_t *)pfe->head;
             if (pfe->odir == 0 && perr_head && perr_head->val.ephash &&
-                perr_head->val.ephash->ai_gw_mode) {
+                (perr_head->val.ephash->ai_gw_mode || perr_head->val.ephash->mcp_stateless)) {
+              if (sp_mcp_enabled(pfe)) return sp_mcp_h1_refuse(pfe, 400);
               static const char smuggle_400[] =
                 "HTTP/1.1 400 Bad Request\r\n"
                 "Content-Type: application/json\r\n"
@@ -12555,6 +13224,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->http_pok = 0;
           pfe->http_hok = 0;
           pfe->http_hvok = 0;
+          pfe->http_hdrs_done = 0;
           pfe->http_body_complete = 0;
           pfe->http_content_length = 0;
           pfe->ai_gw_stream_gated = 0;
@@ -12584,6 +13254,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           }
           pfe->sse_active = 0;
           pfe->stream_start_ts = 0;
+          pfe->bp_since = 0;
+          pfe->abandon_reason = 0;
           pfe->stream_end_ts = 0;
           pfe->sse_tail_len = 0;
           pfe->pd_last_decode_ts = 0;
@@ -12624,8 +13296,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           return -1; // Restart
         }
 
-        // Reset buffer after processing (nghttp2 consumed all data)
+        // Reset buffer after processing (nghttp2 or llhttp consumed all data)
         pfe->rcv_off = 0;
+        if (pfe->read_paused) break; /* bridge high-water: wait for low-water re-arm */
 
         // HTTP/2 handler manages state, skip HTTP/1.1 forwarding below
         continue;

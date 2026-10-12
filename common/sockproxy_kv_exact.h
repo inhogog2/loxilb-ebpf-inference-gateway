@@ -226,6 +226,22 @@ enum kv_stage {
  */
 void record_kv_stage(int stage, int is_hit, uint64_t latency_us);
 
+/* Match-depth axis of the stage histograms: index 0 = blocks the prompt
+ * hashed to, index 1 = blocks that overlapped on the chosen endpoint. */
+#define KV_BLOCKS_PROMPT   0
+#define KV_BLOCKS_OVERLAP  1
+#define KV_N_BLOCKS_KINDS  2
+#define KV_BLOCKS_N_BUCKETS 12
+
+/*
+ * record_kv_blocks — accumulate one lookup's match depth: the prompt's block
+ * count and the overlap the scorer found (0 when no endpoint held any of it).
+ * Off-path atomic adds only, like record_kv_stage. Called once per lookup that
+ * reached the scorer, on the hit and the no_worker path alike, so
+ * overlap/prompt reads as the cached share of what was asked.
+ */
+void record_kv_blocks(int prompt_blocks, int overlap_blocks);
+
 /* ---------- Function Declarations ---------- */
 
 /*

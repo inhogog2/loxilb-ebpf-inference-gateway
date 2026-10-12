@@ -1038,7 +1038,7 @@ struct dp_proxy_tacts {
   uint8_t session_header_name[128];  // Custom session header for stickiness (e.g., "mcp-session-id")
   uint8_t session_header_enabled;    // Enable session learning from backend responses (0=disabled, 1=enabled)
   uint8_t model_name[MAX_MODEL_LEN]; // AI model name for pool selection (e.g. "llama-70b"); empty = wildcard
-  uint8_t  pad3a;                    // Explicit padding: align pd_kv_params_max to 2-byte boundary
+  uint8_t  mcp_stateless;            // MCP 2026-07-28; replaces pad3a, preserving all ABI offsets
   uint16_t pd_kv_params_max;         // Runtime KV params buffer limit (0 = use PD_KV_PARAMS_MAX_LEN)
   // SSE (Server-Sent Events) streaming configuration
   uint8_t  sse_mode;                 // SSE mode: 1=enabled, 0=disabled per-rule

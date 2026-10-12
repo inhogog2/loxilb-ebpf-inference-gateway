@@ -22,6 +22,7 @@
 #include <stdatomic.h>
 #include <netdb.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <ifaddrs.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -36,8 +37,15 @@
 #include "notify.h"
 
 #define MAX_NOTIFY_FDS 65535
+/* Per-worker registration bound. It was the size of the pollfd array a
+ * worker copied and scanned on every wakeup; with epoll it is only a cap on
+ * how many fds one shard owns (the kernel holds the interest list). */
 #define MAX_NOTIFY_POLL_FDS 8192
-#define MAX_NOTIFY_THREADS (8)
+/* How many ready events one epoll_wait returns at most. Level-triggered, so
+ * whatever is still ready after this batch is returned by the next call. */
+#define MAX_NOTIFY_EVENTS 1024
+/* Relay shards plus the listener shard (NOTIFY_MAX_RELAY_SHARDS, notify.h). */
+#define MAX_NOTIFY_THREADS (NOTIFY_MAX_RELAY_SHARDS + 1)
 #define MAX_NOTIFY_POLL_TIMEO (10)
 
 /* (R1): bound on the per-worker resume-pending MPSC ring. A parked conn
@@ -54,7 +62,9 @@
 typedef struct notify_ent {
   int fd;
   notify_type_t type;
-  int poll_slot;
+  /* The epoll interest mask this fd is armed with right now (0 while
+   * paused or disarmed; EPOLLHUP/EPOLLERR are reported regardless). */
+  uint32_t events;
   int thr_id;
   void *priv;
   uint64_t gen;   /* D2 root fix: pfe generation stamp at registration time */
@@ -66,10 +76,15 @@ typedef struct notify_ent {
   /* Paused by notify_pause_ent: its poll events are held in paused_events
    * and restored by notify_rearm_paused. Reset with the registration. */
   uint8_t paused;
-  short paused_events;
+  uint32_t paused_events;
 } notify_ent_t;
 
 #define NOTI_LOCK(C) pthread_rwlock_wrlock(&(C)->lock)
+/* The read side, for lookups that change nothing: the dispatch of every
+ * event takes it to pair a fd with its registration, so with one write lock
+ * every worker's dispatch serialized against every other's. Readers run
+ * together; a registration change still waits for them and excludes them. */
+#define NOTI_RDLOCK(C) pthread_rwlock_rdlock(&(C)->lock)
 #define NOTI_UNLOCK(C) pthread_rwlock_unlock(&(C)->lock)
 
 typedef struct notify_thr {
@@ -77,17 +92,21 @@ typedef struct notify_thr {
   int thrid;
 } notify_thr_t;
 
-typedef struct notify_pollfd {
-  int evict;
-} notify_pollfd_t;
-
 typedef struct notify_poll_ctx {
+  /* Registrations on this shard (bounded by MAX_NOTIFY_POLL_FDS). */
   int n_pfds;
-  notify_pollfd_t npfds[MAX_NOTIFY_POLL_FDS];
-  struct pollfd pfds[MAX_NOTIFY_POLL_FDS];
+  /* This shard's epoll instance. Created with the context so a fd can be
+   * registered before the worker runs; the worker only waits on it. */
+  int epfd;
+#ifdef HAVE_NOTIFY_EVICT
+  /* fds whose teardown was requested by notify_delete_ent(evict=1); the
+   * owner worker synthesizes an error event for them at its next idle tick. */
+  int evict_fds[MAX_NOTIFY_EVENTS];
+  int n_evict_fds;
+#endif
 
   /* (R1): per-worker wake primitive + resume-pending MPSC ring.
-   * wake_fd is an eventfd registered in THIS worker's pfds[] (so poll() returns on
+   * wake_fd is an eventfd in THIS worker's epoll set (so the wait returns on
    * a wake). Any thread appends a parked client fd to rq[] under rq_lock and writes
    * wake_fd; the owner worker drains rq[] in notify_run and calls cbs.resume(fd) on
    * its own thread — keeping all dispatch on the owning worker (Phase-89/90 UAF
@@ -120,49 +139,69 @@ typedef struct notify_ctx {
   notify_poll_ctx_t poll_ctx[MAX_NOTIFY_THREADS];
 } notify_ctx_t ;
 
-static short
+static uint32_t
 notify_conv2poll_events(notify_type_t type)
 {
-  short events = 0;
+  uint32_t events = 0;
   if (type & NOTI_TYPE_IN) {
-    events |= POLLIN;
+    events |= EPOLLIN;
   }
   if (type & NOTI_TYPE_OUT) {
-    events |= POLLOUT;
+    events |= EPOLLOUT;
   }
   if (type & NOTI_TYPE_HUP) {
-    events |= (POLLRDHUP|POLLHUP);
+    events |= (EPOLLRDHUP|EPOLLHUP);
   }
   if (type & NOTI_TYPE_ERROR) {
-    events |= POLLERR;
+    events |= EPOLLERR;
   }
   return events;
 }
 
+/* One epoll_ctl on a shard's instance. ADD/MOD carry the mask; DEL ignores
+ * it. A DEL on a fd the kernel already dropped (closed before the delete)
+ * answers EBADF/ENOENT and is not an error for the caller. */
+static int
+notify_ep_ctl(notify_poll_ctx_t *pctx, int op, int fd, uint32_t events)
+{
+  struct epoll_event ev;
+
+  memset(&ev, 0, sizeof(ev));
+  ev.events = events;
+  ev.data.fd = fd;
+  if (pctx->epfd < 0) {
+    return -EBADF;
+  }
+  if (epoll_ctl(pctx->epfd, op, fd, &ev) < 0) {
+    return -errno;
+  }
+  return 0;
+}
+
 static notify_type_t
-notify_conv4mpoll_events(short events)
+notify_conv4mpoll_events(uint32_t events)
 {
   notify_type_t type = 0;
 
-  if (events & POLLIN) {
+  if (events & EPOLLIN) {
     type |= NOTI_TYPE_IN;
   }
-  if (events & POLLOUT) {
+  if (events & EPOLLOUT) {
     type |= NOTI_TYPE_OUT;
   }
-  /* POLLHUP (peer fully gone / reset) stays fatal; POLLRDHUP is only a
+  /* EPOLLHUP (peer fully gone / reset) stays fatal; EPOLLRDHUP is only a
    * half-close — data can still be queued ahead of the FIN, and our write
    * side is still open. Mapping RDHUP to the fatal HUP type made the
    * dispatcher cascade proxy_pdestroy on a backend's FIN while the (slow)
    * client's xmit cache still held up to a full high-water mark of
    * undelivered response — the client saw a truncated body. */
-  if (events & POLLHUP) {
+  if (events & EPOLLHUP) {
     type |= NOTI_TYPE_HUP;
   }
-  if (events & POLLRDHUP) {
+  if (events & EPOLLRDHUP) {
     type |= NOTI_TYPE_RDHUP;
   }
-  if (events & (POLLERR|POLLNVAL)) {
+  if (events & EPOLLERR) {
     type |= NOTI_TYPE_ERROR;
   }
 
@@ -197,7 +236,24 @@ notify_ctx_new(notify_cbs_t *cbs, int n_thrs)
   for (int t = 0; t < MAX_NOTIFY_THREADS; t++) {
     pthread_mutex_init(&nc->poll_ctx[t].rq_lock, NULL);
     nc->poll_ctx[t].wake_fd = -1;
+    nc->poll_ctx[t].epfd = -1;
     nc->poll_ctx[t].rq_head = nc->poll_ctx[t].rq_tail = nc->poll_ctx[t].rq_count = 0;
+  }
+
+  /* One epoll instance per shard (relay shards and the listener shard),
+   * created here rather than on the worker so registrations made before
+   * notify_start (listeners, the first accepts) land in the interest list. */
+  for (int t = 0; t < n_thrs + 1; t++) {
+    nc->poll_ctx[t].epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (nc->poll_ctx[t].epfd < 0) {
+      char estr[128];
+      log_error("notify:epoll_create1:error(%s)", strerror_r(errno, estr, sizeof(estr)));
+      for (int u = 0; u < t; u++) {
+        close(nc->poll_ctx[u].epfd);
+      }
+      free(nc);
+      return NULL;
+    }
   }
 
   return nc;
@@ -214,7 +270,7 @@ notify_owner_thr(void *ctx, int fd)
     return -1;
   }
   int thr;
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   if (nctx->earr[fd].fd > 0) {
     thr = nctx->earr[fd].thr_id;       /* registered (possibly pinned) owner */
   } else {
@@ -237,7 +293,7 @@ notify_priv_of_fd(void *ctx, int fd, uint64_t *gen_out)
   if (!nctx || fd <= 0 || fd >= MAX_NOTIFY_FDS) {
     return NULL;
   }
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   if (nctx->earr[fd].fd > 0) {
     priv = nctx->earr[fd].priv;
     if (gen_out) *gen_out = nctx->earr[fd].gen;
@@ -294,7 +350,7 @@ notify_check_slot(void *ctx, int fd)
     return 0;
   }
 
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   ent = &nctx->earr[fd];
   if (ent->fd > 0) {
     NOTI_UNLOCK(nctx);
@@ -320,8 +376,9 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
   notify_ctx_t *nctx = ctx;
   notify_ent_t *ent;
   notify_poll_ctx_t *pctx;
-  short events;
+  uint32_t events;
   int tslot = 0;
+  int rc;
 
   assert(ctx);
 
@@ -346,8 +403,14 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
     if (ent->priv == priv) {
       if (ent->paused) {
         ent->paused_events = events;   /* applied when it is re-armed */
-      } else if (pctx->pfds[ent->poll_slot].events != events) {
-        pctx->pfds[ent->poll_slot].events = events;
+      } else if (ent->events != events) {
+        rc = notify_ep_ctl(pctx, EPOLL_CTL_MOD, fd, events);
+        if (rc < 0) {
+          NOTI_UNLOCK(nctx);
+          log_error("notify:epoll_ctl(MOD):fd %d error %d", fd, rc);
+          return rc;
+        }
+        ent->events = events;
       }
       NOTI_UNLOCK(nctx);
       return 0;
@@ -380,18 +443,21 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
     return -EINVAL;
   }
 
+  rc = notify_ep_ctl(pctx, EPOLL_CTL_ADD, fd, events);
+  if (rc < 0) {
+    NOTI_UNLOCK(nctx);
+    log_error("notify:epoll_ctl(ADD):fd %d error %d", fd, rc);
+    return rc;
+  }
+
   ent->type = type;
   ent->fd = fd;
-  ent->poll_slot = pctx->n_pfds;
+  ent->events = events;
   ent->priv = priv;
   ent->gen = gen;
   ent->thr_id = tslot;
   ent->evict = 0;
   ent->paused = 0;
-  
-  pctx->pfds[pctx->n_pfds].fd = fd;
-  pctx->pfds[pctx->n_pfds].events = events;
-  pctx->npfds[pctx->n_pfds].evict = 0;
 
   nctx->n_fds++;
   pctx->n_pfds++;
@@ -439,7 +505,7 @@ notify_ent_thr(void *ctx, int fd)
   if (!nctx || fd <= 0 || fd >= MAX_NOTIFY_FDS) {
     return -1;
   }
-  NOTI_LOCK(nctx);
+  NOTI_RDLOCK(nctx);
   if (nctx->earr[fd].fd > 0) {
     thr = nctx->earr[fd].thr_id;
   }
@@ -470,12 +536,9 @@ notify_forget_pause(notify_ctx_t *nctx, notify_ent_t *ent)
 int
 __notify_delete_ent(void *ctx, int fd, uint64_t gen, int check_gen)
 {
-  int i = 0;
   notify_ctx_t *nctx = ctx;
   notify_ent_t *ent;
-  notify_ent_t *pent;
   notify_poll_ctx_t *pctx;
-  int poll_slot;
   int tslot;
   void *priv;
 
@@ -500,13 +563,7 @@ __notify_delete_ent(void *ctx, int fd, uint64_t gen, int check_gen)
     return -ESTALE;
   }
 
-  if (ent->poll_slot < 0 || ent->poll_slot >= MAX_NOTIFY_POLL_FDS) {
-    NOTI_UNLOCK(nctx);
-    assert(0);
-  }
-
   priv = ent->priv;
-  poll_slot = ent->poll_slot;
   tslot = ent->thr_id;
 
   if (tslot < 0 || tslot >= MAX_NOTIFY_THREADS) {
@@ -516,28 +573,14 @@ __notify_delete_ent(void *ctx, int fd, uint64_t gen, int check_gen)
 
   ent->fd = -1;
   ent->type = 0;
-  ent->poll_slot = -1;
+  ent->events = 0;
   ent->priv = NULL;
   ent->thr_id = 0;
   notify_forget_pause(nctx, ent);
 
   pctx = &nctx->poll_ctx[tslot];
-
-  for (i = poll_slot; i < pctx->n_pfds - 1; i++) {
-
-    pent = NULL;
-    if (pctx->pfds[i+1].fd > 0 && pctx->pfds[i+1].fd < MAX_NOTIFY_FDS) {
-      pent = &nctx->earr[pctx->pfds[i+1].fd];
-    }
-
-    pctx->pfds[i].fd = pctx->pfds[i+1].fd;
-    pctx->pfds[i].events = pctx->pfds[i+1].events;
-    pctx->npfds[i].evict = 0;
-
-    if (pent) {
-      pent->poll_slot = i;
-    }
-  }
+  /* A fd closed before its delete was dropped by the kernel already. */
+  (void)notify_ep_ctl(pctx, EPOLL_CTL_DEL, fd, 0);
 
   nctx->n_fds--;
   pctx->n_pfds--;
@@ -574,9 +617,7 @@ notify_delete_ent_evict__(void *ctx, int fd)
 {
   notify_ctx_t *nctx = ctx;
   notify_ent_t *ent;
-  notify_ent_t *pent;
   notify_poll_ctx_t *pctx;
-  int poll_slot;
   int tslot;
 
   assert(ctx);
@@ -593,31 +634,21 @@ notify_delete_ent_evict__(void *ctx, int fd)
     return -ENOENT;
   }
 
-  if (ent->poll_slot < 0) {
-    NOTI_UNLOCK(nctx);
-    assert(0);
-  }
-
   tslot = ent->thr_id;
   if (tslot < 0 || tslot >= MAX_NOTIFY_THREADS) {
     NOTI_UNLOCK(nctx);
     assert(0);
   }
 
-  poll_slot = ent->poll_slot;
-  if (poll_slot < 0 || poll_slot >= MAX_NOTIFY_POLL_FDS) {
-    NOTI_UNLOCK(nctx);
-    assert(0);
-  }
-
   pctx = &nctx->poll_ctx[tslot];
-  if (pctx->pfds[poll_slot].fd <= 0) {
-    NOTI_UNLOCK(nctx);
-    assert(0);
+  if (!ent->evict) {
+    if (pctx->n_evict_fds >= MAX_NOTIFY_EVENTS) {
+      NOTI_UNLOCK(nctx);
+      return -ENOSPC;
+    }
+    pctx->evict_fds[pctx->n_evict_fds++] = fd;
+    ent->evict = 1;
   }
-
-  pctx->npfds[poll_slot].evict = 1;
-  ent->evict = 1;
   NOTI_UNLOCK(nctx);
 
   return 0;
@@ -667,12 +698,9 @@ notify_delete_ent(void *ctx, int fd, int evict)
 int
 notify_deregister_ent(void *ctx, int fd)
 {
-  int i = 0;
   notify_ctx_t *nctx = ctx;
   notify_ent_t *ent;
-  notify_ent_t *pent;
   notify_poll_ctx_t *pctx;
-  int poll_slot;
   int tslot;
 
   assert(ctx);
@@ -688,12 +716,6 @@ notify_deregister_ent(void *ctx, int fd)
     return -ENOENT;
   }
 
-  if (ent->poll_slot < 0 || ent->poll_slot >= MAX_NOTIFY_POLL_FDS) {
-    NOTI_UNLOCK(nctx);
-    assert(0);
-  }
-
-  poll_slot = ent->poll_slot;
   tslot = ent->thr_id;
 
   if (tslot < 0 || tslot >= MAX_NOTIFY_THREADS) {
@@ -703,28 +725,13 @@ notify_deregister_ent(void *ctx, int fd)
 
   ent->fd = -1;
   ent->type = 0;
-  ent->poll_slot = -1;
+  ent->events = 0;
   ent->priv = NULL;
   ent->thr_id = 0;
   notify_forget_pause(nctx, ent);
 
   pctx = &nctx->poll_ctx[tslot];
-
-  for (i = poll_slot; i < pctx->n_pfds - 1; i++) {
-
-    pent = NULL;
-    if (pctx->pfds[i+1].fd > 0 && pctx->pfds[i+1].fd < MAX_NOTIFY_FDS) {
-      pent = &nctx->earr[pctx->pfds[i+1].fd];
-    }
-
-    pctx->pfds[i].fd = pctx->pfds[i+1].fd;
-    pctx->pfds[i].events = pctx->pfds[i+1].events;
-    pctx->npfds[i].evict = 0;
-
-    if (pent) {
-      pent->poll_slot = i;
-    }
-  }
+  (void)notify_ep_ctl(pctx, EPOLL_CTL_DEL, fd, 0);
 
   nctx->n_fds--;
   pctx->n_pfds--;
@@ -735,7 +742,7 @@ notify_deregister_ent(void *ctx, int fd)
 }
 
 /* Disarm poll events for a registered fd WITHOUT removing its entry (see
- * notify.h). The worker polls a snapshot of pfds, so one already-queued event
+ * notify.h). The worker dispatches a batch it already collected, so one queued event
  * may still dispatch after this returns; callers must tolerate that. */
 int
 notify_disarm_ent(void *ctx, int fd)
@@ -756,15 +763,19 @@ notify_disarm_ent(void *ctx, int fd)
     NOTI_UNLOCK(nctx);
     return -ENOENT;
   }
-  if (ent->poll_slot < 0 || ent->poll_slot >= MAX_NOTIFY_POLL_FDS ||
-      ent->thr_id < 0 || ent->thr_id >= MAX_NOTIFY_THREADS) {
+  if (ent->thr_id < 0 || ent->thr_id >= MAX_NOTIFY_THREADS) {
     NOTI_UNLOCK(nctx);
     return -EINVAL;
   }
   ent->type = 0;
   notify_forget_pause(nctx, ent);
   pctx = &nctx->poll_ctx[ent->thr_id];
-  pctx->pfds[ent->poll_slot].events = 0;
+  /* An empty mask keeps the fd in the interest list; EPOLLHUP/EPOLLERR are
+   * still reported for it, as POLLHUP/POLLERR were. */
+  if (ent->events != 0) {
+    (void)notify_ep_ctl(pctx, EPOLL_CTL_MOD, fd, 0);
+    ent->events = 0;
+  }
   NOTI_UNLOCK(nctx);
 
   return 0;
@@ -797,7 +808,9 @@ notify_rearm_locked(notify_ctx_t *nctx, unsigned *mask)
     if (ent->fd <= 0 || !ent->paused) {
       continue;   /* released (and maybe registered again) since its pause */
     }
-    nctx->poll_ctx[ent->thr_id].pfds[ent->poll_slot].events = ent->paused_events;
+    (void)notify_ep_ctl(&nctx->poll_ctx[ent->thr_id], EPOLL_CTL_MOD,
+                        ent->fd, ent->paused_events);
+    ent->events = ent->paused_events;
     ent->paused = 0;
     atomic_fetch_sub(&nctx->n_paused, 1);
     *mask |= 1u << ent->thr_id;
@@ -851,8 +864,9 @@ notify_pause_ent(void *ctx, int fd, int (*gate)(void))
       return -ENOSPC;
     }
   }
-  ent->paused_events = nctx->poll_ctx[ent->thr_id].pfds[ent->poll_slot].events;
-  nctx->poll_ctx[ent->thr_id].pfds[ent->poll_slot].events = 0;
+  ent->paused_events = ent->events;
+  (void)notify_ep_ctl(&nctx->poll_ctx[ent->thr_id], EPOLL_CTL_MOD, fd, 0);
+  ent->events = 0;
   ent->paused = 1;
   nctx->paused_fds[nctx->n_paused_fds++] = fd;
   atomic_fetch_add(&nctx->n_paused, 1);
@@ -948,29 +962,30 @@ notify_run(void *ctx, int thread)
   int rc = 0;
   int nproc = 0;
   int i = 0;
-  size_t parr_sz;
-  int n_pfds = 0;
+  int n_evs = 0;
   void *priv = NULL;
   uint64_t gen = 0;
-  char estr[128];;
-  struct pollfd *pfds;
+  char estr[128];
+  struct epoll_event *evs;
   notify_ent_t *ent;
   notify_ctx_t *nctx = ctx;
+  notify_poll_ctx_t *pctx;
 
   assert(nctx);
 
   if (thread >= MAX_NOTIFY_THREADS) {
     assert(0);
   }
+  pctx = &nctx->poll_ctx[thread];
+  assert(pctx->epfd >= 0);
 
-  parr_sz = MAX_NOTIFY_POLL_FDS*sizeof(struct pollfd);
-  pfds = calloc(1, MAX_NOTIFY_POLL_FDS*sizeof(struct pollfd));
-  assert(pfds);
+  evs = calloc(MAX_NOTIFY_EVENTS, sizeof(struct epoll_event));
+  assert(evs);
 
-  /* (R1): create THIS worker's wake eventfd and register it in this
-   * worker's own pfds[] so poll() returns when another thread writes it. Created on
+  /* (R1): create THIS worker's wake eventfd and add it to this worker's
+   * epoll set so the wait returns when another thread writes it. Created on
    * the worker thread (here) so it is owned/polled by exactly this worker. When the
-   * admission layer never wakes a worker, the eventfd sits idle in poll() — never
+   * admission layer never wakes a worker, the eventfd sits idle — never
    * readable — so the relay path is byte-identical to pre- (default-off). */
   {
     int wfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -979,15 +994,15 @@ notify_run(void *ctx, int thread)
                 strerror_r(errno, estr, sizeof(estr)), thread);
     } else {
       NOTI_LOCK(nctx);
-      notify_poll_ctx_t *pc = &nctx->poll_ctx[thread];
-      pc->wake_fd = wfd;
-      if (pc->n_pfds < MAX_NOTIFY_POLL_FDS) {
-        /* Register at a reserved poll slot; it has NO earr[] entry (not a relayed
-         * fd) — notify_run special-cases wake_fd below before the earr lookup. */
-        pc->pfds[pc->n_pfds].fd = wfd;
-        pc->pfds[pc->n_pfds].events = POLLIN;
-        pc->npfds[pc->n_pfds].evict = 0;
-        pc->n_pfds++;
+      /* It has NO earr[] entry (not a relayed fd) — the dispatch below
+       * special-cases wake_fd before the earr lookup. */
+      if (pctx->n_pfds < MAX_NOTIFY_POLL_FDS &&
+          notify_ep_ctl(pctx, EPOLL_CTL_ADD, wfd, EPOLLIN) == 0) {
+        pctx->wake_fd = wfd;
+        pctx->n_pfds++;
+      } else {
+        close(wfd);
+        log_error("notify: worker %d could not add its wake fd — resume-wake disabled", thread);
       }
       NOTI_UNLOCK(nctx);
     }
@@ -995,22 +1010,22 @@ notify_run(void *ctx, int thread)
 
   while(1) {
 
-    /* This is seemingly expensive operation */
-    NOTI_LOCK(nctx);
-    memcpy(pfds, nctx->poll_ctx[thread].pfds, parr_sz);
-    n_pfds = nctx->poll_ctx[thread].n_pfds;
-    NOTI_UNLOCK(nctx);
-
     nproc = 0;
-    rc = poll(pfds, n_pfds, MAX_NOTIFY_POLL_TIMEO);
+    /* Only the ready fds come back: the cost of a wakeup no longer grows
+     * with the number of idle connections the shard owns. */
+    rc = epoll_wait(pctx->epfd, evs, MAX_NOTIFY_EVENTS, MAX_NOTIFY_POLL_TIMEO);
     if (rc < 0) {
-      log_error("notify:poll:error(%s)", strerror_r(errno, estr, sizeof(estr)));
+      if (errno == EINTR) {
+        continue;
+      }
+      log_error("notify:epoll_wait:error(%s)", strerror_r(errno, estr, sizeof(estr)));
       usleep(200*1000);
       continue;
     }
+    n_evs = rc;
 
     /* maintenance hook runs on every iteration, not just the timeout branch:
-     * under sustained event load poll never returns 0, and the hook's work
+     * under sustained event load the wait never times out, and the hook's work
      * (e.g. shaper refill/wake) must not starve behind traffic */
     if (nctx->cbs.tick && thread != nctx->acc_thr) {
       nctx->cbs.tick(thread);
@@ -1020,26 +1035,31 @@ notify_run(void *ctx, int thread)
       int evict = 0;
 
 #ifdef HAVE_NOTIFY_EVICT
-      for (i = 0; i < n_pfds; i++) {
-        int efd = pfds[i].fd;   /* the fd this copied slot really carries */
-        NOTI_LOCK(nctx);
+      /* Synthesize an error event for each registration whose teardown was
+       * requested, so it is dispatched and released on its owner worker. */
+      NOTI_LOCK(nctx);
+      for (i = 0; i < pctx->n_evict_fds && n_evs < MAX_NOTIFY_EVENTS; i++) {
+        int efd = pctx->evict_fds[i];
         if (efd > 0 && efd < MAX_NOTIFY_FDS &&
             nctx->earr[efd].fd == efd && nctx->earr[efd].evict) {
+          evs[n_evs].events = EPOLLERR;
+          evs[n_evs].data.fd = efd;
+          n_evs++;
           evict = 1;
-          pfds[i].revents = POLLERR;
         }
-        NOTI_UNLOCK(nctx);
       }
+      pctx->n_evict_fds = 0;
+      NOTI_UNLOCK(nctx);
 #endif
       if (!evict) {
-        //log_trace("notify:poll:timeout (n_pfds %d)", n_pfds);
+        //log_trace("notify:epoll:timeout");
         continue;
       }
     }
 
-    for (i = 0 ; i < n_pfds; i++) {
-      int fd = pfds[i].fd;
-      notify_type_t type = notify_conv4mpoll_events(pfds[i].revents);
+    for (i = 0 ; i < n_evs; i++) {
+      int fd = evs[i].data.fd;
+      notify_type_t type = notify_conv4mpoll_events(evs[i].events);
       if (type == 0) {
         continue;
       }
@@ -1048,23 +1068,27 @@ notify_run(void *ctx, int thread)
        * the earr lookup below. A readable wake_fd means parked fds are pending for
        * this owner worker: drain the ring + re-drive each via cbs.resume on THIS
        * thread, then move on (never fall through to the relay dispatch). */
-      if (nctx->poll_ctx[thread].wake_fd >= 0 && fd == nctx->poll_ctx[thread].wake_fd) {
+      if (pctx->wake_fd >= 0 && fd == pctx->wake_fd) {
         notify_drain_resume(nctx, thread);
         nproc++;
         continue;
       }
 
       if (fd <= 0 || fd >= MAX_NOTIFY_FDS) {
-        log_trace("notify:poll:fd invaild (n_pfds %d)", n_pfds);
+        log_trace("notify:epoll:fd invalid (%d)", fd);
         continue;
       }
 
-      NOTI_LOCK(nctx);
+      /* Read side: the lookup pairs the fd with its live registration and
+       * captures priv + gen; nothing is written. Registration changes take
+       * the write side and wait for in-flight lookups, as before. */
+      NOTI_RDLOCK(nctx);
       ent = &nctx->earr[fd];
       if (ent->fd <= 0) {
+        /* Released after this batch was collected (its delete already
+         * removed it from the epoll set): nothing to dispatch. */
         NOTI_UNLOCK(nctx);
-        log_trace("notify:poll:ent fd %d invalid (n_pfds %d)", fd, n_pfds);
-        notify_delete_ent__(nctx, fd);
+        log_trace("notify:epoll:ent fd %d released", fd);
         continue;
       }
       priv = ent->priv;

@@ -55,6 +55,19 @@ static int checks, failures;
 proxy_struct_t *proxy_struct;
 int proxy_lock_trace_state = 0;      /* tracing off: the lock path stays plain */
 
+/* Production L7 narrowed-pool snapshots share the CB transition guard.
+ * Keep the standalone link fixture synchronized with that contract: this
+ * is a real mutex, not a no-op that would hide accidental nested locking. */
+static pthread_mutex_t cb_fixture_lock = PTHREAD_MUTEX_INITIALIZER;
+void circuit_breaker_lock(void)
+{
+  if (pthread_mutex_lock(&cb_fixture_lock) != 0) abort();
+}
+void circuit_breaker_unlock(void)
+{
+  if (pthread_mutex_unlock(&cb_fixture_lock) != 0) abort();
+}
+
 void log_log(int level, const char *file, int line, const char *fmt, ...)
 {
   (void)level; (void)file; (void)line; (void)fmt;

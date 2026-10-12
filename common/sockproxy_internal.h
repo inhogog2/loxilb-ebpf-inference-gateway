@@ -28,11 +28,24 @@
  * ========================================================================= */
 
 /*
- * PROXY_MAX_THREADS - number of per-thread epoll / FD-mapping slots.
- * Used in proxy_mapfd_t mapfd[PROXY_MAX_THREADS] inside proxy_struct_t.
+ * PROXY_MAX_THREADS - the MOST relay workers the proxy can run: the size of
+ * every per-worker table (proxy_mapfd_t mapfd[], the trace rings, the
+ * notifier's shards). How many actually run is proxy_num_workers(), read
+ * once from LLB_PROXY_WORKERS (default PROXY_DEFAULT_THREADS, the count the
+ * proxy always ran with before the knob existed). The relay is sharded by
+ * fd modulo the worker count with both legs of a connection pinned to one
+ * worker, so the count only sets how many cores the relay may use; nothing
+ * else keys on it.
  * See also: PROXY_NUM_BURST_RX (remains in sockproxy.c – cache/I/O concern).
  */
-#define PROXY_MAX_THREADS           4
+#define PROXY_MAX_THREADS           32
+#define PROXY_DEFAULT_THREADS       4
+#define PROXY_WORKERS_ENV           "LLB_PROXY_WORKERS"
+
+/* The relay worker count in force (1..PROXY_MAX_THREADS). Resolved on first
+ * call from PROXY_WORKERS_ENV; garbage or out of range falls back to the
+ * default with one log line. Safe to call from any thread after that. */
+int proxy_num_workers(void);
 
 /* FD mapping pool constants */
 #define PROXY_START_MAPFD           500
@@ -217,8 +230,15 @@ enum sp_reap_resp {
   SP_REAP_EPP_TIMEOUT,          /* 503 epp_unavailable (no decision); teardown */
   SP_REAP_EPP_EVICT_429,        /* 429 epp_evicted before any response byte; teardown */
   SP_REAP_EPP_EVICT_CUT,        /* evicted mid-response: no text, teardown */
+  SP_REAP_SSE_STALL,            /* SSE error event: client stopped reading; shutdown */
   SP_REAP_KINDS,
 };
+
+/* The stalled-client abort window in seconds (LLB_SSE_STALL_ABORT_SEC, read
+ * once; 0 = off, the default). A streamed response whose client has left
+ * its relay cache at the high-water mark for this long is ended by the
+ * gateway (sockproxy_abandon.h). */
+uint32_t sp_sse_stall_abort_sec(void);
 void sp_reap_finish(proxy_fd_ent_t *pfe);
 /* Hand a response of `kind` to the connection's owner worker and end the
  * connection there (sockproxy_health.c; the reaper's own entry point). The

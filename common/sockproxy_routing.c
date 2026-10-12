@@ -86,9 +86,9 @@ build_ephash_key(char *key_buf, size_t buf_size,
  * @param model_name AI model name or NULL/empty for wildcard
  * @return Endpoint value or NULL if not found
  */
-proxy_epval_t*
-find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_path,
-                  const char *model_name)
+static proxy_epval_t*
+find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
+                       const char *request_path, const char *model_name)
 {
   proxy_epval_t *best_match = NULL;
   proxy_epval_t *tepval = NULL;
@@ -102,10 +102,15 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
 
   /* Default to root path if not provided */
   const char *path = (request_path && request_path[0] != '\0') ? request_path : "/";
+  /* Routing compares the URI path, not its query. Keep the original length
+   * so a bounded copy cannot turn a longer URI into an exact match. */
+  size_t path_len = strcspn(path, "?");
+  size_t copy_len = path_len < sizeof(path_copy) - 1
+                      ? path_len : sizeof(path_copy) - 1;
 
   /* Copy path for progressive shortening */
-  strncpy(path_copy, path, sizeof(path_copy) - 1);
-  path_copy[sizeof(path_copy) - 1] = '\0';
+  memcpy(path_copy, path, copy_len);
+  path_copy[copy_len] = '\0';
 
   /* Progressive prefix matching: "/v1/users/profile" → "/v1/users" → "/v1" → "/"
    * IMPORTANT: We try progressively shorter prefixes to find the LONGEST match */
@@ -116,7 +121,8 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     /* Try to find this prefix */
     HASH_FIND_STR(ent->val.ephash, search_key, tepval);
 
-    if (tepval) {
+    if (tepval && (tepval->path_match_mode != 2 ||
+                   strlen(path_copy) == path_len)) {
       /* Found a match! This is the LONGEST prefix match since we search longest-first */
       best_match = tepval;
       best_match_len = strlen(path_copy);
@@ -139,7 +145,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
        * in loop body); when path_copy is "/v1" etc., "/" hasn't been tried yet. */
       build_ephash_key(search_key, sizeof(search_key), host, "/", model_name);
       HASH_FIND_STR(ent->val.ephash, search_key, tepval);
-      if (tepval) {
+      if (tepval && (tepval->path_match_mode != 2 || path_len == 1)) {
         best_match = tepval;
         best_match_len = 1;
         return best_match;
@@ -172,13 +178,14 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
    * Pure C hash-table lookup — zero CGO calls in this path. */
   if (!best_match && model_name && model_name[0] != '\0') {
     /* Re-initialize path_copy for wildcard retry */
-    strncpy(path_copy, path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = '\0';
+    memcpy(path_copy, path, copy_len);
+    path_copy[copy_len] = '\0';
 
     while (strlen(path_copy) > 0) {
       build_ephash_key(search_key, sizeof(search_key), host, path_copy, "");
       HASH_FIND_STR(ent->val.ephash, search_key, tepval);
-      if (tepval) {
+      if (tepval && (tepval->path_match_mode != 2 ||
+                     strlen(path_copy) == path_len)) {
         return tepval;  /* Wildcard pool found */
       }
       char *last_slash = strrchr(path_copy, '/');
@@ -186,7 +193,8 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
         /* Try root "/" as final prefix (harmless re-check when path_copy is "/") */
         build_ephash_key(search_key, sizeof(search_key), host, "/", "");
         HASH_FIND_STR(ent->val.ephash, search_key, tepval);
-        if (tepval) return tepval;
+        if (tepval && (tepval->path_match_mode != 2 || path_len == 1))
+          return tepval;
         break;
       } else if (last_slash) {
         *last_slash = '\0';
@@ -211,6 +219,25 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     }
   }
 
+  return best_match;
+}
+
+proxy_epval_t*
+find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_path,
+                  const char *model_name)
+{
+  if (!ent || !host) {
+    return NULL;
+  }
+
+  proxy_epval_t *best_match = find_endpoint_for_host(ent, host, request_path,
+                                                   model_name);
+  if (best_match) {
+    return best_match;
+  }
+  proxy_epval_t *tepval = NULL;
+  char search_key[512];
+
   /* Fallback: listener-identity key. Rules created WITHOUT a host get their
    * host_url substituted with the listener's own "ip:port" before the ephash
    * key is built (llb_conv_nat2proxy, loxilb_libdp.c). No Host-header-derived
@@ -221,21 +248,17 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
    * Keying on the listener identity makes empty-host rules Host-agnostic,
    * which is their intended wildcard semantic. */
   if (!best_match) {
-    char self_key[256];   /* "ip:port||model" — model_name alone can be 128 */
     char ab1[INET_ADDRSTRLEN];
     if (inet_ntop(AF_INET, (struct in_addr *)&ent->key.xip, ab1, sizeof(ab1))) {
       char self_host[64];
       snprintf(self_host, sizeof(self_host), "%s:%u", ab1, ntohs(ent->key.xport));
-      if (model_name && model_name[0] != '\0') {
-        /* model-specific pool under the listener identity first */
-        build_ephash_key(self_key, sizeof(self_key), self_host, "", model_name);
-        HASH_FIND_STR(ent->val.ephash, self_key, tepval);
-        if (tepval) return tepval;
-      }
-      build_ephash_key(self_key, sizeof(self_key), self_host, "", "");
-      HASH_FIND_STR(ent->val.ephash, self_key, tepval);
-      if (tepval) {
-        return tepval;
+      /* A no-host rule can carry the same model/path constraints as a
+       * host rule. Reuse the complete lookup instead of checking only
+       * pathless keys, preserving exact and longest-prefix semantics. */
+      best_match = find_endpoint_for_host(ent, self_host, request_path,
+                                         model_name);
+      if (best_match) {
+        return best_match;
       }
     }
   }

@@ -14,7 +14,7 @@
 # primitives and never arm a client fd.
 #
 # Not scanned: the notifier's own module (notify.c/.h, which defines it) and
-# unit tests (test_*.c, which exercise the notifier directly).
+# unit tests and benches (test_*.c, bench_*.c, which drive the notifier directly).
 # The one allowed call: the helper's body in sockproxy_hold.c, exactly once.
 #
 #   sh check_notify_arm.sh    (from anywhere; exit 1 on a violation)
@@ -22,7 +22,7 @@ set -eu
 cd "$(dirname "$0")"
 
 pat='(^|[^A-Za-z0-9_])notify_add_ent\('
-files=$(ls ./*.c ./*.h | grep -vE '^\./(notify\.[ch]|test_[^/]*\.c)$')
+files=$(ls ./*.c ./*.h | grep -vE '^\./(notify\.[ch]|(test_|bench_)[^/]*\.c)$')
 
 bad=$(grep -nE "$pat" $files | grep -v '^\./sockproxy_hold\.c:' || true)
 helper=$(grep -cE "$pat" ./sockproxy_hold.c || true)

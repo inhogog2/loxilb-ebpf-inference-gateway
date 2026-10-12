@@ -8,9 +8,11 @@
 
 #include <string.h>  /* strncpy/memset — needed by the static-inline l7_store_header helpers below */
 #include <stdint.h>
+#include "sockproxy_mcp_rr.h"
 #include <stdatomic.h>  /* D2 root fix: _Atomic gen stamp on proxy_fd_ent */
 
 #include "llhttp.h"
+#include "sockproxy_sse_observe.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -18,6 +20,7 @@
 #include "sockproxy_qos.h"  /* Tier-1 byte-shaper config + bucket (proxy_map_ent members) */
 #include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
+#include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
@@ -228,6 +231,18 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t kv_stage_buckets[4][2][12];
     _Atomic uint64_t kv_stage_sum_us[4][2];
     _Atomic uint64_t kv_stage_count[4][2];
+    // Tier-1.5 match depth, per lookup that reached the scorer: [0] = blocks
+    // the prompt hashed to (the chain the scorer saw, capped by KV_MAX_TOKENS),
+    // [1] = blocks of the chosen endpoint's inventory that overlapped it (0 on a
+    // no_worker miss). Cumulative le buckets over kv_blocks_bucket_bounds
+    // (sockproxy_metrics.c); populated by record_kv_blocks. Same literal-dims
+    // discipline as kv_stage_* above.
+    _Atomic uint64_t kv_blocks_bucket[2][12];
+    _Atomic uint64_t kv_blocks_sum[2];
+    _Atomic uint64_t kv_blocks_count[2];
+    // Streams that ended before their terminator, by reason, with the age
+    // at the end (sockproxy_abandon.h); filled by abandon_record.
+    abandon_stats_t stream_abandon;
 #ifdef HAVE_PII_DETECTION
     // PII Detection metrics (atomic for thread-safety)
     _Atomic uint64_t pii_requests_scanned;
@@ -473,7 +488,7 @@ typedef enum {
 
 // P2 Task 2.3: Circuit breaker per endpoint
 typedef struct circuit_breaker {
-  circuit_breaker_state_t state;   // Current circuit state
+  _Atomic circuit_breaker_state_t state; // Raw P/D state snapshots remain race free
   uint32_t failure_count;          // Consecutive failures in CLOSED state
   uint32_t success_count;          // Successes in HALF_OPEN state
   time_t last_failure_ts;          // Timestamp of last failure
@@ -569,6 +584,8 @@ typedef struct proxy_epval {
   int main_fd;
   int n_eps;
   int ep_sel;
+  sp_mcp_selector_state mcp_selector;
+  _Atomic uint64_t mcp_rr_ticket; /* Modern request-level RR, shared by H1/H2. */
   int select;
   proxy_ent_t eps[MAX_PROXY_EP];
   proxy_epstat_t ep_stats[MAX_PROXY_EP];
@@ -585,7 +602,7 @@ typedef struct proxy_epval {
   
   // P2 Task 2.3: Circuit breaker support
   circuit_breaker_t circuit_breakers[MAX_PROXY_EP]; // Circuit breaker per endpoint
-  uint8_t cb_enabled;                               // 1 = enabled, 0 = disabled
+  _Atomic uint8_t cb_enabled;                       // 1 = enabled, 0 = disabled
   
   // P3: WRR support (Weighted Round-Robin)
   int wrr_current_weights[MAX_PROXY_EP];  // Current weight counters for smooth WRR
@@ -596,10 +613,12 @@ typedef struct proxy_epval {
   
   // P6: Host + Path Prefix Routing - composite key storage
   char ephash_key[512];  // Composite key: "host|path" or "host" (backward compat)
+  uint8_t path_match_mode;  /* 0=disabled, 1=prefix, 2=exact; retained per pool */
   
   // Custom header-based session stickiness configuration
   char session_header_name[128];  // e.g., "mcp-session-id", "x-session-token", "authorization"
   uint8_t session_header_enabled;  // 1=enabled, 0=disabled (use IP-based)
+  uint8_t mcp_stateless; /* Explicit MCP 2026-07-28 validation and per-request selection. */
 
   // SSE (Server-Sent Events) streaming configuration per service rule
   uint8_t  sse_mode;                // 1=SSE mode enabled, 0=disabled
@@ -768,6 +787,9 @@ typedef struct proxy_val {
   int ppv2;             /* PROXY protocol v2 emission on backend conns (L7 fullproxy) */
   int sched_free;
   void *ssl_ctx;
+  /* The frontend context a kept listener had before a rule took it over
+   * again: out of service, freed at the next takeover or with the listener. */
+  void *ssl_ctx_retired;
   /* Replaced in place when the rule's backend TLS policy changes. Read it
    * once per use with proxy_ent_epctx(); a context taken out of service
    * stays allocated on ssl_epctx_retired until the listener goes, so a
@@ -788,6 +810,7 @@ typedef struct proxy_val {
   // 1 = HTTP/2 only
   // 2 = Both HTTP/1.1 and HTTP/2 (backend auto-negotiates)
   uint8_t backend_protocol_cap;
+  uint8_t frontend_protocol_cap; /* MCP bridge decouples frontend ALPN from backend protocol. */
   // sockmap acceleration mode (dp_proxy_tacts.sockmap_en):
   // 0=off, 1=both, 2=request-only, 3=response-only
   uint8_t sockmap_en;
@@ -808,6 +831,23 @@ typedef struct proxy_map_ent {
   // - NULL if stack-allocated (old code paths)
   struct proxy_arg *arg_ptr;
 
+  /* Per-listener client-connection ceiling of the rule (connectionLimit).
+   * A fullproxy rule never enters nat_map, so the datapath's conn_limit gate
+   * (nat_ep_map.conc_conns, kept by NAT conntrack) can never see it. The
+   * sockproxy is the one place that knows how many client connections a
+   * listener holds, so it is the gate: fe_conns is the live gauge (one unit
+   * per accepted client leg, taken in handle_new_connection and released
+   * exactly once in proxy_release_fd_ctx(reset=1); taken with or without a
+   * ceiling because it is also the rule's activeConnections), fe_conn_limit
+   * the ceiling copied from the rule (0 = unlimited: nothing is ever
+   * refused), fe_conn_refused the running count of
+   * connections reset at accept because the ceiling was reached. They live
+   * on the listener node rather than on the pool value, so a rule refresh
+   * neither resets the gauge nor loses the units live connections hold. */
+  _Atomic uint32_t fe_conn_limit;
+  _Atomic uint32_t fe_conns;
+  _Atomic uint64_t fe_conn_refused;
+
   // L7 content-routing policy discriminator (CONTEXT).
   // These live on the per-service proxy_map_ent (the heap struct), NEVER on
   // proxy_arg (the 4096-byte eBPF map value — its _Static_assert stays untouched,
@@ -822,6 +862,8 @@ typedef struct proxy_map_ent {
   // sockproxy.h free of the l7policy IR dependency; sockproxy_l7policy.c casts it
   // to (const l7_route_t *) before calling l7_policy_evaluate.
   uint8_t has_l7_policy;            // 1 => an L7_POLICY is attached ( discriminator)
+  sp_mcp_selector_state mcp_l7_selector[256];
+  _Atomic uint64_t mcp_l7_rr_ticket[256]; /* Bounded persistent route cursors. */
   void   *l7_routes;                // ordered l7_route_t[] (opaque here; cast in the engine)
   int     n_l7_routes;              // number of routes in l7_routes
 
@@ -989,6 +1031,9 @@ struct proxy_fd_ent {
   int odir;
   int ssl_err;
   int ktls_enabled;  // kTLS offload active on this socket
+  /* 1 while this client leg holds one unit of its listener's fe_conns
+   * gauge (connectionLimit); cleared by the release so it runs once. */
+  uint8_t fe_counted;
   int protocol_version;  // 1 = HTTP/1.1, 2 = HTTP/2
   uint32_t _id;
   proxy_socktype_t stype;
@@ -1093,6 +1138,8 @@ struct proxy_fd_ent {
 
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;
+  sp_sse_observer_t cresp_sse;
+  uint8_t cresp_payload_observed;
   /* Set by the response framer under this entry's lock, consumed by the backend
    * leg's EOF without it, so it is atomic and the consumer takes it with an
    * exchange: whoever clears it is the one that counts the completion. A
@@ -1213,8 +1260,13 @@ struct proxy_fd_ent {
   size_t rcv_hwm;     // Furthest byte this user wrote into rcvbuf (sockproxy_rcvbuf.h)
   size_t parsed_off;  // How much of rcvbuf has been parsed
   int http_pok;
-  int http_hok;
+  int http_hok;       /* a Host header NAME was parsed (legacy "host ok"), NOT headers complete */
   int http_hvok;
+  /* The request's header block is complete (llhttp on_headers_complete on the
+   * client leg). Reset at every request boundary, never per read: the
+   * header-completion deadline (timeoutTcpInspect) keys on it, and http_hok
+   * flips on the first "Host:" name, which every slowloris sends first. */
+  int http_hdrs_done;
   int http_body_complete;
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
@@ -1245,6 +1297,15 @@ struct proxy_fd_ent {
   uint8_t http_is_post;    // 1 = the request line's method is POST (capacity
                            // permits apply to inference POSTs only)
   char last_header_name[128];
+  struct sp_mcp_capture *mcp_capture; /* Allocated only on explicit MCP H1 rules. */
+  _Atomic uint8_t mcp_inflight; /* H1 permits one request until its response is framed. */
+  uint8_t mcp_retry_pending; /* Only a failed, not yet connected H1 backend leg. */
+  uint32_t mcp_retry_excluded; /* Bounded to original pool endpoints per request. */
+  uint8_t mcp_route_active;
+  uint32_t mcp_route_mask;
+  uint8_t mcp_route_weights[MAX_PROXY_EP];
+  void *mcp_selector_state; /* Listener-owned slot; no policy allocation pointer. */
+  uint64_t mcp_route_ticket; /* Copied at dispatch; no policy pointer survives. */
 
   // L7 policy generic header/cookie store — bounded fixed
   // capacity; populated by l7_store_header_n() from BOTH the H1 and H2 parse
@@ -1400,6 +1461,13 @@ struct proxy_fd_ent {
   time_t session_created;        // When session was created
   int affinity_type;             // Type of affinity (IP-based, content-based, etc.)
   time_t last_activity;         // Last activity timestamp for session timeout
+  /* The per-rule inactiveTimeout clock of a CLIENT leg: the last moment a
+   * byte moved on this connection in either direction (armed at accept,
+   * stamped on every client read and on every backend read relayed to it).
+   * Its own field because last_activity is the sticky-session / L7
+   * timeoutMemberData clock: a plain connection never arms that one, so the
+   * idle pass keyed on it never reaped an ordinary keep-alive connection. */
+  time_t idle_since;
 #ifdef HAVE_PII_DETECTION
   // PII Masking Deferred State (prevents parser corruption)
   char *pii_masked_text;         // Temporarily stores masked body text
@@ -1456,6 +1524,12 @@ struct proxy_fd_ent {
   uint8_t  sse_active;                // 1=SSE stream detected and active (Content-Type: text/event-stream seen)
   time_t   stream_start_ts;           // Wall-clock time when SSE stream was activated (time(NULL))
   time_t   stream_end_ts;             // Wall-clock time when data:[DONE] was received
+  time_t   bp_since;                  // health tick that first saw this client's relay cache at the
+                                      // high-water mark while a stream was active (0 = draining);
+                                      // the stalled-client policy (sockproxy_abandon.h) keys on it
+  uint8_t  abandon_reason;            // enum abandon_reason + 1 when the end of an open stream is
+                                      // already attributed (backend died, stall abort); 0 = a
+                                      // teardown with the stream open is the client leaving
   uint64_t stream_start_mono_ns;      // CLOCK_MONOTONIC stamp at SSE activation; latency source for
                                       // llb_ai_record_request (wall-clock seconds truncated sub-second
                                       // streams to 0 and NTP steps could skew/negate the delta)
@@ -1963,6 +2037,7 @@ struct proxy_arg {
   // Custom header-based session stickiness configuration
   char session_header_name[128];    // e.g., "mcp-session-id", "x-session-token"
   uint8_t session_header_enabled;   // 1=enabled, 0=use IP-based
+  uint8_t mcp_stateless; /* Empty/default rules keep their existing protocol. */
   
   // Backend protocol capability (for ALPN configuration)
   // 0 = HTTP/1.1 only (default) - advertise only http/1.1 to clients
@@ -2070,6 +2145,12 @@ struct proxy_arg {
   // Admission headers on admitted responses, same hop: 0 = the
   // environment, 1 off, 2 on.
   uint8_t  fc_expose_headers;
+
+  // The rule's connectionLimit (dp_proxy_tacts.conn_limit), copied by
+  // llb_conv_nat2proxy. A fullproxy rule never enters nat_map, so the
+  // datapath's conn_limit gate cannot see it: the listener enforces it at
+  // accept (proxy_map_ent.fe_conn_limit). 0 = unlimited.
+  uint32_t fe_conn_limit;
 
   // KV-Cache Exact Routing configuration 
   uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 
@@ -2205,6 +2286,11 @@ struct proxy_betls_state {
 };
 /* Returns 0 and fills *out, or -ENOENT when no listener has this key. */
 int proxy_get_backend_tls_state(struct proxy_ent *key, struct proxy_betls_state *out);
+/* Live client-connection gauge and refusal count of a listener
+ * (connectionLimit on a fullproxy rule). 0 on success, -1 when no listener
+ * matches the key. */
+int proxy_get_fe_conn_stats(struct proxy_ent *key, uint32_t *conns, uint32_t *limit,
+                            uint64_t *refused);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
 /* Health keys on the endpoint ADDRESS, which names the same backend in every
  * pool, rather than on a pool-local index. ep_port 0 matches any port on the

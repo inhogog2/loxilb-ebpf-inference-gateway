@@ -54,6 +54,7 @@
 #include "sockproxy_ai_admit.h"   /* the refusal record of a request ended while it waited */
 #include "sockproxy_conn.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
+static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
 #include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
 #include "sockproxy_ai_gw.h"
@@ -242,6 +243,8 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n\r\n"
                    "{\"error\":\"epp_evicted\",\"detail\":\"the endpoint picker shed this request\"}\r\n", 1, 0),
   [SP_REAP_EPP_EVICT_CUT] = { NULL, 0, 1, 0 },
+  [SP_REAP_SSE_STALL] =
+      SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
 };
 
 /* End a client this thread decided against, answering it first.
@@ -434,6 +437,37 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
  * i.e. the conc=128 corruption fix — can be exercised DETERMINISTICALLY under load in
  * validation (e.g. =3 so saturated prefills time out and the reaper fires every tick),
  * instead of relying on prefill stochastically exceeding 30s. Cached (getenv once). */
+/* LLB_SSE_STALL_ABORT_SEC: how long a streamed response's client may sit at
+ * the relay cache's high-water mark before the gateway ends the stream
+ * (sockproxy_abandon.h). 0 (the default) never aborts: the behaviour the
+ * proxy always had. Bounded at a day; garbage keeps 0. Cached (getenv once). */
+uint32_t
+sp_sse_stall_abort_sec(void)
+{
+  static uint32_t cached = 0;      /* 0 = not yet resolved */
+  static int resolved = 0;
+  if (__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) {
+    return cached;
+  }
+  uint32_t v = 0;
+  const char *e = getenv("LLB_SSE_STALL_ABORT_SEC");
+  if (e && *e) {
+    char *end = NULL;
+    long n = strtol(e, &end, 10);
+    if (end && *end == '\0' && n > 0 && n <= 86400) {
+      v = (uint32_t)n;
+    } else {
+      log_error("LLB_SSE_STALL_ABORT_SEC=%s is not in 1..86400, stalled-client abort stays off", e);
+    }
+  }
+  cached = v;
+  __atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
+  if (v) {
+    log_info("sockproxy: streams whose client stops reading for %u s are ended (LLB_SSE_STALL_ABORT_SEC)", v);
+  }
+  return cached;
+}
+
 static uint32_t
 pd_prefill_timeout_default(void)
 {
@@ -820,13 +854,16 @@ check_draining_endpoints(void)
          * under PROXY_LOCK). Mirrors the transition at :797-799 exactly. */
         if (tepval->cb_enabled) {
           circuit_breaker_t *cb = &tepval->circuit_breakers[ep_idx];
+          circuit_breaker_lock();
           time_t open_for = now - cb->open_ts;  /* captured before the transition for the log */
-          if (circuit_breaker_proactive_heal(cb, now)) {
+          uint32_t open_timeout = cb->open_timeout_sec;
+          circuit_breaker_unlock();
+          if (circuit_breaker_heal_guarded(cb, now)) {
             atomic_fetch_add(&global_stats.pd_cb_flips, 1);          /* OBS-03: OPEN->HALF_OPEN */
             atomic_fetch_add(&global_stats.pd_cb_proactive_heal, 1); /* : health-pass heal */
             log_info("[CB heal] ep[%d] OPEN->HALF_OPEN driven by 1Hz health pass "
                      "(open %lds >= %us) — EP re-enters rotation, next relay success closes it",
-                     ep_idx, (long)open_for, cb->open_timeout_sec);
+                     ep_idx, (long)open_for, open_timeout);
           }
         }
       }
@@ -911,6 +948,35 @@ check_draining_endpoints(void)
       while (pfe) {
         proxy_fd_ent_t *pfe_next = pfe->next;
 
+        /* Stalled client: the relay cache for this stream has sat at the
+         * high-water mark since bp_since (backpressure paused the backend
+         * reads; the engine keeps generating into its own buffer). With the
+         * knob set, end the stream once the stall has lasted that long —
+         * the same shape as the duration cap below. The decision itself is
+         * the pure function in sockproxy_abandon.h. */
+        if (pfe->sse_active == 1 && pfe->stream_end_ts == 0) {
+          int stall_abort = 0;
+          pfe->bp_since = (time_t)abandon_stall_tick(pfe->cache_backpressure,
+                                                     (long)pfe->bp_since, (long)now,
+                                                     (long)sp_sse_stall_abort_sec(),
+                                                     &stall_abort);
+          if (stall_abort) {
+            log_warn("[SSE_STALL] fd=%d: client has not drained its stream for %lds "
+                     "(cache %zu bytes), ending it", pfe->fd, (long)(now - pfe->bp_since),
+                     pfe->cache_total_size);
+            abandon_record(&global_stats.stream_abandon, ABANDON_STALL_ABORT,
+                           pfe->stream_start_ts > 0 ? (long)(now - pfe->stream_start_ts) : 0);
+            pfe->abandon_reason = ABANDON_STALL_ABORT + 1;
+            llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
+            pfe->stream_end_ts = now;
+            pfe->sse_active = 0;
+            pfe->bp_since = 0;
+            pd_reap_respond(pfe, SP_REAP_SSE_STALL);
+            pfe = pfe_next;
+            continue;
+          }
+        }
+
         if (pfe->sse_active == 1 && pfe->stream_end_ts == 0 &&
             pfe->stream_start_ts > 0) {
           time_t elapsed = now - pfe->stream_start_ts;
@@ -960,7 +1026,7 @@ check_draining_endpoints(void)
         proxy_fd_ent_t *pfe_next = pfe->next;
         if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
             pfe->l7_hdr_accum_start > 0 &&
-            (pfe->h2_session || pfe->http_hok == 0) &&
+            (pfe->h2_session || !pfe->http_hdrs_done) &&
             proxy_hdr_deadline_expired(hd_node, pfe, now)) {
           atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
           log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
@@ -1004,22 +1070,29 @@ check_draining_endpoints(void)
 
         /* L7 member-data deadline overrides the per-rule idle deadline when configured. */
         uint32_t idle_to_s = (l7_data_to_s > 0) ? l7_data_to_s : pfe->inactive_timeout_sec;
+        /* Two clocks: the L7 member-data deadline runs on last_activity (armed when a
+         * request is fully received, cleared when the member answers); the per-rule
+         * inactiveTimeout runs on idle_since (a client leg's last byte either way, armed
+         * at accept). last_activity is otherwise the sticky-session clock, which a plain
+         * connection never arms — keyed on it, the per-rule reap never ran for an
+         * ordinary keep-alive connection. */
+        time_t idle_anchor = (l7_data_to_s > 0) ? pfe->last_activity : pfe->idle_since;
 
         /* for the L7 timeoutMemberData deadline use >= so a deadline rounded UP to N whole
          * seconds fires AT the Nth 1Hz tick (e.g. 1500ms→2s fires at the 2s pass, landing inside the
          * gate's configured-ms window), rather than only after N+1 seconds. The legacy per-rule
          * inactive_timeout_sec path keeps its original strict > semantics (behaviour-preserving). */
-        time_t idle_elapsed = now - pfe->last_activity;
+        time_t idle_elapsed = now - idle_anchor;
         int idle_expired = (l7_data_to_s > 0)
                                ? (idle_elapsed >= (time_t)idle_to_s)
                                : (idle_elapsed > (time_t)idle_to_s);
 
         if (idle_to_s > 0 &&
             pfe->sse_active == 0 &&         /* do not kill active SSE streams */
-            pfe->last_activity > 0 &&
+            idle_anchor > 0 &&
             idle_expired) {
           log_debug("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
-                   pfe->fd, (long)(now - pfe->last_activity), idle_to_s,
+                   pfe->fd, (long)idle_elapsed, idle_to_s,
                    (l7_data_to_s > 0) ? " (L7 timeoutMemberData)" : "");
           if (pfe->fd > 0) {
             shutdown(pfe->fd, SHUT_RDWR);
@@ -1587,24 +1660,85 @@ check_draining_endpoints(void)
 }
 
 
+/* Global -> CB is the only nested order. Transition callbacks run after
+ * releasing this dedicated guard, so parked-client drains may reenter it. */
+static pthread_mutex_t cb_transition_lock = PTHREAD_MUTEX_INITIALIZER;
+void circuit_breaker_lock(void) { pthread_mutex_lock(&cb_transition_lock); }
+void circuit_breaker_unlock(void) { pthread_mutex_unlock(&cb_transition_lock); }
+static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now)
+{
+  circuit_breaker_lock();
+  int changed = circuit_breaker_proactive_heal(cb, now);
+  circuit_breaker_unlock();
+  return changed;
+}
+int circuit_breaker_candidate(proxy_epval_t *pool, int ep)
+{
+  if (!pool || ep < 0 || ep >= pool->n_eps || ep >= MAX_PROXY_EP) return 0;
+  if (!pool->cb_enabled) return 1;
+  circuit_breaker_t *cb = &pool->circuit_breakers[ep];
+  circuit_breaker_lock();
+  int allow = cb->state == CB_STATE_CLOSED ||
+      (cb->state == CB_STATE_OPEN && time(NULL)-cb->open_ts >= cb->open_timeout_sec) ||
+      (cb->state == CB_STATE_HALF_OPEN && cb->half_open_requests < cb->half_open_max_requests);
+  circuit_breaker_unlock();
+  return allow;
+}
+static void circuit_breaker_trip_actions(proxy_epval_t *pool, int ep, const char *reason)
+{
+  if (pool->pd_trie) {
+    pthread_rwlock_wrlock(&pool->pd_trie_lock);
+    pd_trie_remove_ep(pool->pd_trie, ep);
+    pthread_rwlock_unlock(&pool->pd_trie_lock);
+  }
+  pd_parked_drain_ep(pool, ep, reason);
+}
+
 // P2 Task 2.3: Initialize circuit breaker for an endpoint
-void
-circuit_breaker_init(circuit_breaker_t *cb)
+static void
+circuit_breaker_init_locked(circuit_breaker_t *cb)
 {
   if (!cb) return;
   
-  memset(cb, 0, sizeof(*cb));
+  /* Atomic state readers must not race a bytewise reset. */
+  cb->failure_count = cb->success_count = cb->half_open_requests = 0;
+  cb->last_failure_ts = cb->open_ts = 0;
+  cb->origin_err_streak = cb->origin_tripped = 0;
   cb->state = CB_STATE_CLOSED;
   cb->failure_threshold = 5;      // Default: 5 consecutive failures
   cb->success_threshold = 1;       // Default: 1 success in HALF_OPEN to close
   cb->open_timeout_sec = 30;       // Default: 30 seconds
   cb->half_open_max_requests = 3;  // Default: 3 test requests in HALF_OPEN
 }
+void circuit_breaker_init(circuit_breaker_t *cb)
+{
+  circuit_breaker_lock();
+  circuit_breaker_init_locked(cb);
+  circuit_breaker_unlock();
+}
+/* Live configuration is one transaction, including enabled publication.
+ * Never expose zero/default thresholds between reset and customization. */
+void circuit_breaker_configure_pool(proxy_epval_t *pool, uint8_t enabled,
+                                   uint32_t failure_threshold, uint32_t open_timeout_sec)
+{
+  if (!pool) return;
+  circuit_breaker_lock();
+  if (enabled) {
+    for (int i=0; i<pool->n_eps && i<MAX_PROXY_EP; i++) {
+      circuit_breaker_t *cb=&pool->circuit_breakers[i];
+      circuit_breaker_init_locked(cb);
+      if (failure_threshold) cb->failure_threshold=failure_threshold;
+      if (open_timeout_sec) cb->open_timeout_sec=open_timeout_sec;
+    }
+  }
+  pool->cb_enabled=enabled;
+  circuit_breaker_unlock();
+}
 
 // P2 Task 2.3: Check if circuit breaker should skip this endpoint
 // Returns: 1 = skip endpoint, 0 = allow traffic
-int
-circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
+static int
+circuit_breaker_should_skip_locked(proxy_epval_t *tepval, int ep_index)
 {
   circuit_breaker_t *cb;
   time_t now = time(NULL);
@@ -1624,7 +1758,7 @@ circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
     // Check if timeout expired → transition to HALF_OPEN
     if (now - cb->open_ts >= cb->open_timeout_sec) {
       cb->state = CB_STATE_HALF_OPEN;
-      cb->half_open_requests = 0;
+      cb->half_open_requests = 1; /* The timeout winner consumes a probe too. */
       cb->success_count = 0;
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: OPEN→HALF_OPEN */
       return 0;  // Allow testing in HALF_OPEN
@@ -1644,18 +1778,29 @@ circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
   return 0;
 }
 
+int circuit_breaker_should_skip(proxy_epval_t *pool, int ep)
+{
+  if (!pool || ep < 0 || ep >= pool->n_eps || ep >= MAX_PROXY_EP) return 1;
+  circuit_breaker_lock();
+  int skip = circuit_breaker_should_skip_locked(pool, ep);
+  circuit_breaker_unlock();
+  return skip;
+}
+
 // P2 Task 2.3: Record connection failure for circuit breaker
 void
 circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
 {
   circuit_breaker_t *cb;
+  int tripped = 0;
   time_t now = time(NULL);
   
-  if (!tepval || !tepval->cb_enabled || ep_index >= MAX_PROXY_EP) {
+  if (!tepval || !tepval->cb_enabled || ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   cb->last_failure_ts = now;
   
   switch (cb->state) {
@@ -1669,14 +1814,7 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: CLOSED→OPEN */
       log_info("Circuit breaker CLOSED → OPEN - ep[%d], %u failures",
                ep_index, cb->failure_count);
-      /* remove tripped EP from trie */
-      if (tepval->pd_trie) {
-        pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-        pd_trie_remove_ep(tepval->pd_trie, ep_index);
-        pthread_rwlock_unlock(&tepval->pd_trie_lock);
-      }
-      /* release clients parked on the tripped EP for re-selection */
-      pd_parked_drain_ep(tepval, ep_index, "cb-open");
+      tripped = 1;
     }
     break;
     
@@ -1688,20 +1826,15 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
     atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: HALF_OPEN→OPEN */
     log_info("Circuit breaker HALF_OPEN → OPEN - ep[%d], recovery failed",
              ep_index);
-    /* remove tripped EP from trie */
-    if (tepval->pd_trie) {
-      pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-      pd_trie_remove_ep(tepval->pd_trie, ep_index);
-      pthread_rwlock_unlock(&tepval->pd_trie_lock);
-    }
-    /* release clients parked on the tripped EP for re-selection */
-    pd_parked_drain_ep(tepval, ep_index, "cb-open");
+    tripped = 1;
     break;
     
   case CB_STATE_OPEN:
     // Already open - no action needed
     break;
   }
+  circuit_breaker_unlock();
+  if (tripped) circuit_breaker_trip_actions(tepval, ep_index, "cb-open");
 }
 
 // P2 Task 2.3: Record connection success for circuit breaker
@@ -1710,11 +1843,12 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
 {
   circuit_breaker_t *cb;
   
-  if (!tepval || !tepval->cb_enabled || ep_index >= MAX_PROXY_EP) {
+  if (!tepval || !tepval->cb_enabled || ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   
   switch (cb->state) {
   case CB_STATE_CLOSED:
@@ -1754,6 +1888,7 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
     // Success in OPEN state shouldn't happen, but log it
     break;
   }
+  circuit_breaker_unlock();
 }
 
 /* Origin-error demotion threshold: consecutive origin 5xx responses from a
@@ -1763,7 +1898,7 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
 static int
 pd_origin_err_threshold(void)
 {
-  static int thr = -1;
+  static _Atomic int thr = -1;
   if (thr < 0) {
     const char *env = getenv("LLB_PD_ORIGIN_ERR_THRESHOLD");
     thr = env ? atoi(env) : PD_ORIGIN_ERR_THRESHOLD_DEFAULT;
@@ -1788,28 +1923,24 @@ circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index)
   int thr = pd_origin_err_threshold();
 
   if (!tepval || !tepval->cb_enabled || thr <= 0 ||
-      ep_index < 0 || ep_index >= MAX_PROXY_EP) {
+      ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   if (!circuit_breaker_origin_note_error(cb, thr)) {
+    circuit_breaker_unlock();
     return;
   }
   cb->state = CB_STATE_OPEN;
   cb->open_ts = time(NULL);
   cb->last_failure_ts = cb->open_ts;
   cb->failure_count = cb->failure_threshold;
+  circuit_breaker_unlock();
   atomic_fetch_add(&global_stats.pd_cb_flips, 1);
   log_warn("[CB_ORIGIN] ep[%d] -> OPEN after %d consecutive origin 5xx — "
            "demoted from selection and KV affinity", ep_index, thr);
-  /* remove tripped EP from trie */
-  if (tepval->pd_trie) {
-    pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-    pd_trie_remove_ep(tepval->pd_trie, ep_index);
-    pthread_rwlock_unlock(&tepval->pd_trie_lock);
-  }
-  /* release clients parked on the tripped EP for re-selection */
-  pd_parked_drain_ep(tepval, ep_index, "cb-origin-open");
+  circuit_breaker_trip_actions(tepval, ep_index, "cb-origin-open");
 }
 
 /* Record an origin success (status < 400) from a backend leg: the
@@ -1823,10 +1954,11 @@ circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
   circuit_breaker_t *cb;
 
   if (!tepval || !tepval->cb_enabled ||
-      ep_index < 0 || ep_index >= MAX_PROXY_EP) {
+      ep_index < 0 || ep_index >= tepval->n_eps || ep_index >= MAX_PROXY_EP) {
     return;
   }
   cb = &tepval->circuit_breakers[ep_index];
+  circuit_breaker_lock();
   if (circuit_breaker_origin_note_success(cb)) {
     cb->state = CB_STATE_CLOSED;
     cb->failure_count = 0;
@@ -1837,6 +1969,7 @@ circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
     log_info("[CB_ORIGIN] ep[%d] HALF_OPEN->CLOSED on origin success — "
              "fully back in rotation", ep_index);
   }
+  circuit_breaker_unlock();
 }
 
 // ============================================================================

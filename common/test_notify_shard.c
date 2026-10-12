@@ -34,6 +34,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdint.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -43,8 +44,26 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 
 #include "notify.h"
+
+/* The notifier registers a fd with epoll at notify_add_ent, so every fd a
+ * case registers must be a real open descriptor: poll(2) tolerated a made-up
+ * number until its next round (POLLNVAL), epoll_ctl refuses it at once. The
+ * placement cases need specific fd NUMBERS (the shard is fd modulo the relay
+ * count), so each one is a socket dup2'd onto that number. */
+static int
+real_fd(int n)
+{
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+
+  if (s < 0 || dup2(s, n) < 0) {
+    return -1;
+  }
+  close(s);
+  return n;
+}
 
 /* notify.c marks its workers fail-loud through this thread-local, which the
  * proxy core defines; no worker is started here. */
@@ -267,7 +286,13 @@ listener_pause_cases(void)
   rc = notify_rearm_paused(g_vns, gate_open);
   check("valve: the updated listener is re-armed", rc == 1, rc, 1);
   n = dispatches_over(50);
-  check("valve: ... with its updated mask (hang-ups only)", n == 0, n, 0);
+  /* notify.h: "One event polled before the pause may still dispatch after
+   * it" -- a batch a worker collected before the pause's EPOLL_CTL_MOD is
+   * dispatched against the entry as it is then. So exactly one stray
+   * dispatch is within the contract (the sibling checks above tolerate the
+   * same one); the defect this guards, the re-arm handing the listener its
+   * old IN mask, shows as a spinning level-triggered listener (n > 20). */
+  check("valve: ... with its updated mask (hang-ups only)", n <= 1, n, 1);
   check("valve: in-place update back to IN|HUP",
         notify_add_ent_listener(g_vns, g_lfd, NOTI_TYPE_IN | NOTI_TYPE_HUP, &lpriv, 1) == 0, 0, 0);
   n = dispatches_over(50);
@@ -304,7 +329,9 @@ listener_pause_cases(void)
   check("valve: ... and nothing is left paused", notify_paused_count(g_vns) == 0,
         notify_paused_count(g_vns), 0);
   n = dispatches_over(50);
-  check("valve: the new registration keeps its own events", n == 0, n, 0);
+  /* same contract as above: the one event polled before the pause may land
+   * on the new registration; a re-arm defect would spin it (n > 20) */
+  check("valve: the new registration keeps its own events", n <= 1, n, 1);
 
   close(client2);
   close(lfd2);
@@ -314,7 +341,23 @@ listener_pause_cases(void)
 int
 main(void)
 {
-  void *ns = notify_ctx_new(NULL, N_RELAY);
+  void *ns;
+  struct rlimit rl;
+
+  /* fd 65534 below needs the table to reach that far */
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < 65536) {
+    rl.rlim_cur = rl.rlim_max < 65536 ? rl.rlim_max : 65536;
+    setrlimit(RLIMIT_NOFILE, &rl);
+  }
+  for (int n = 20; n <= 23; n++) {
+    check("a real socket on the listener fd", real_fd(n) == n, n, n);
+  }
+  check("a real socket on fd 101", real_fd(101) == 101, 101, 101);
+  check("a real socket on fd 102", real_fd(102) == 102, 102, 102);
+  check("a real socket on fd 103", real_fd(103) == 103, 103, 103);
+  check("a real socket on fd 205", real_fd(205) == 205, 205, 205);
+
+  ns = notify_ctx_new(NULL, N_RELAY);
 
   check("context with 4 relay shards", ns != NULL, ns != NULL, 1);
   check("listener shard follows the relay shards", notify_listener_thr(ns) == N_RELAY,
@@ -349,12 +392,23 @@ main(void)
   {
     int priv;
     check("fd 65535 is refused", notify_add_ent(ns, 65535, NOTI_TYPE_IN, &priv, 1) < 0, 0, 0);
-    check("fd 65534 is accepted", notify_add_ent(ns, 65534, NOTI_TYPE_IN, &priv, 1) == 0, 0, 0);
+    if (real_fd(65534) == 65534) {
+      check("fd 65534 is accepted", notify_add_ent(ns, 65534, NOTI_TYPE_IN, &priv, 1) == 0, 0, 0);
+    } else {
+      printf("skip fd 65534 is accepted (RLIMIT_NOFILE too low)\n");
+    }
+    /* epoll registers at add time: a number that is not an open fd is
+     * refused here instead of surfacing as POLLNVAL on the next round */
+    check("a closed fd is refused", notify_add_ent(ns, 60000, NOTI_TYPE_IN, &priv, 1) == -EBADF,
+          notify_add_ent(ns, 60000, NOTI_TYPE_IN, &priv, 1), -EBADF);
   }
 
-  /* the shard count is bounded by the thread table, listener shard included */
-  check("8 relay shards leave no room for the listener shard", notify_ctx_new(NULL, 8) == NULL, 0, 0);
-  check("7 relay shards fit", notify_ctx_new(NULL, 7) != NULL, 1, 1);
+  /* the shard count is bounded by the thread table, listener shard included:
+   * NOTIFY_MAX_RELAY_SHARDS relay shards fit, one more does not */
+  check("one relay shard past the bound leaves no room for the listener shard",
+        notify_ctx_new(NULL, NOTIFY_MAX_RELAY_SHARDS + 1) == NULL, 0, 0);
+  check("the bound's worth of relay shards fit", notify_ctx_new(NULL, NOTIFY_MAX_RELAY_SHARDS) != NULL, 1, 1);
+  check("the former 8-shard table is no longer the limit", notify_ctx_new(NULL, 8) != NULL, 1, 1);
 
   listener_pause_cases();
 

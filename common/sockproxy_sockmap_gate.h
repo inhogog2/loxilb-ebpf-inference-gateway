@@ -42,6 +42,7 @@
 
 /* The rule facts the gate reads, as the proxy carries them per endpoint. */
 typedef struct sockmap_gate_in {
+  uint8_t mcp_stateless;   /* validation and accounting own both directions */
   uint8_t has_l7_policy;   /* an L7 policy is attached to the rule */
   uint8_t sse_mode;        /* streaming accounting per request/response */
   uint8_t pd_disagg_mode;  /* prefill/decode disaggregation */
@@ -54,7 +55,7 @@ typedef struct sockmap_gate_in {
 static inline void
 sockmap_gate_owned_dirs(const sockmap_gate_in_t *in, int *own_req, int *own_resp)
 {
-  int both = in->has_l7_policy || in->sse_mode || in->pd_disagg_mode;
+  int both = in->mcp_stateless || in->has_l7_policy || in->sse_mode || in->pd_disagg_mode;
 
   *own_req = both || in->ai_gw_mode || in->strips_api_key;
   *own_resp = both;

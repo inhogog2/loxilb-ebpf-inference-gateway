@@ -447,9 +447,30 @@ test_l7hdr: test_l7hdr_guard
 test_sockmap_gate: test_sockmap_gate.c sockproxy_sockmap_gate.h
 	$(CC) -Wall -Wextra -o $@ $< -I.
 
+# Unfinished-stream accounting and the stalled-client policy (pure header).
+# `make test_abandon` builds AND runs it (the gate target must be able to fail).
+test_abandon_bin: test_abandon.c sockproxy_abandon.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_abandon
+test_abandon: test_abandon_bin
+	./test_abandon_bin
+
 .PHONY: test_smgate
 test_smgate: test_sockmap_gate
 	./test_sockmap_gate
+
+# Which backpressure mark a relay cache runs under: the chunked flag is on
+# the backend leg (P7) while the cache is on the client leg, so the mark is
+# resolved over the entry and its legs (sockproxy_cache_mark.h). Pure header
+# over three pfe fields, mirrored by the test. Build-and-run: a compile-only
+# target proves nothing.
+test_cache_mark_bin: test_cache_mark.c sockproxy_cache_mark.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_cache_mark
+test_cache_mark: test_cache_mark_bin
+	./test_cache_mark_bin
 
 # Header-completion deadline resolution: 0 means the product default, never
 # "disabled". Standalone — includes only the pure sockproxy_hdr_deadline.h.
@@ -459,6 +480,24 @@ test_hdr_deadline: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h
 .PHONY: test_hdrdl
 test_hdrdl: test_hdr_deadline
 	./test_hdr_deadline
+
+# connectionLimit on a fullproxy listener: the accept-time ceiling. Standalone
+# — includes only the pure sockproxy_fe_limit.h.
+test_fe_limit: sockproxy_fe_limit_test.c sockproxy_fe_limit.h
+	$(CC) -Wall -Wextra -pthread -o $@ $< -I.
+
+.PHONY: test_felimit
+test_felimit: test_fe_limit
+	./test_fe_limit
+
+# Firewall rule table (pdi) equality: a rule with a port match must be found
+# again by its delete (PDI_RMATCH_ALL). Links the real common_pdi.c.
+test_pdi_rmatch: test_pdi_rmatch.c common_pdi.c common_pdi.h pdi.h
+	$(CC) -Wall -Wextra -pthread -o $@ test_pdi_rmatch.c common_pdi.c -I.
+
+.PHONY: test_pdi
+test_pdi: test_pdi_rmatch
+	./test_pdi_rmatch
 # Clearing a pooled connection shell for reuse. The clear skips the
 # transfer-params buffer, so the unit has to prove both that everything around
 # it is zeroed and that the buffer itself is not -- a clear that quietly went
@@ -499,6 +538,28 @@ test_pd_complete: test_pd_complete.c sockproxy_pd_leak.h
 # (Phase 89) is still required. -fsanitize=address catches any over-read.
 test_resp_framing: test_resp_framing.c llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< llhttp.c httpapi.c http.c -I.
+
+test_sse_observe: test_sse_observe.c sockproxy_sse_observe.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< llhttp.c httpapi.c http.c -I.
+
+test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
+	$(CC) -ffunction-sections -fdata-sections -I. -I../libbpf/src -I../headers -I../kernel $$(pkg-config --cflags openssl) -o $@ test_sni_alpn.c sockproxy_ssl.c log.c -Wl,--gc-sections $$(pkg-config --libs openssl) -lpthread
+
+test_admit_response: test_admit_response.c sockproxy_admit_response.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
+
+.PHONY: test_admit test_uc5
+test_uc5: test_admit test_stream test_uc3 test_l2_reflection
+
+test_admit: test_admit_response
+	./test_admit_response
+
+.PHONY: test_uc3
+test_uc3: test_model_routing test_sni_alpn test_sse_observe test_resp_framing
+	./test_model_routing
+	./test_sni_alpn
+	./test_sse_observe
+	./test_resp_framing
 
 # Phase 93-02 (D1): proactive circuit-breaker recovery unit. Standalone — includes
 # only circuit_breaker_heal.h (the pure production transition under test, no
@@ -752,9 +813,18 @@ test_l7or: test_l7origin
 test_notify_shard: test_notify_shard.c notify.c log.c notify.h
 	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c log.c -I. -lpthread
 
+# The relay shards wait with epoll: dispatch contract + per-event cost vs idle fds.
+test_notify_epoll: test_notify_epoll.c notify.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c log.c -I. -lpthread
+
+# Notifier throughput vs relay worker count (sizing LLB_PROXY_WORKERS); not a test.
+bench_notify_scale: bench_notify_scale.c notify.c log.c notify.h
+	$(CC) -O2 -Wall -Wextra -Werror -o $@ bench_notify_scale.c notify.c log.c -I. -lpthread
+
 .PHONY: test_shard
-test_shard: test_notify_shard
+test_shard: test_notify_shard test_notify_epoll
 	./test_notify_shard
+	./test_notify_epoll
 
 # Global proxy lock accounting: wait and hold time land on the acquiring site,
 # nested and cross-function holds included; the off path records nothing.
@@ -797,10 +867,54 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
 # a wildcard is silent on the very first build when no .d exists yet. Keep this as
 # the LAST directive in the Makefile.
 -include $(wildcard *.d)
+
+.PHONY: test_l2_reflection
+test_l2_reflection: test_l2_reflection.c llb_l2_reflection.h
+	$(CC) -g -Wall -Wextra -Werror -fsanitize=address,undefined -o test_l2_reflection test_l2_reflection.c
+	./test_l2_reflection
+
+.PHONY: test_security_aggregate
+test_security_aggregate: test_security_aggregate.c security_aggregate.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_security_aggregate.c -I. -lpthread
+	./test_security_aggregate
+
+.PHONY: test_security_ipv6
+test_security_ipv6: test_security_ipv6.c security_ipv6.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_security_ipv6.c
+	./$@
+
+# Modern MCP protocol/framing regressions. These portable tests do not
+# substitute for Gateway HTTP/1.1 and HTTP/2 traffic verification.
+.PHONY: test_mcp
+test_mcp: test_sockproxy_mcp test_sockproxy_mcp_capture test_sockproxy_mcp_rr
+	./test_sockproxy_mcp
+	./test_sockproxy_mcp_capture
+	./test_sockproxy_mcp_rr
+	CC="$(CC)" python3 test_sockproxy_mcp_bridge.py
+	CC="$(CC)" python3 test_sockproxy_mcp_retry.py
+	CC="$(CC)" python3 test_sockproxy_mcp_async_retry.py
+	CC="$(CC)" python3 test_sockproxy_cb_concurrent.py
+
+test_sockproxy_mcp: test_sockproxy_mcp.c sockproxy_mcp.h
+	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -o $@ $<
+
+test_sockproxy_mcp_capture: test_sockproxy_mcp_capture.c sockproxy_mcp_capture.h sockproxy_mcp.h llhttp.c httpapi.c http.c
+	$(CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ test_sockproxy_mcp_capture.c llhttp.c httpapi.c http.c
+
+test_sockproxy_mcp_rr: test_sockproxy_mcp_rr.c sockproxy_mcp_rr.h
+	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -pthread -o $@ $<
+
+# Optional race detection requires a compiler/runtime with working ThreadSanitizer.
+.PHONY: test_cb_tsan test_cb_mutation
+test_cb_tsan:
+	CC="$(CC)" SANITIZERS=thread python3 test_sockproxy_cb_concurrent.py
+
+test_cb_mutation:
+	CC="$(CC)" python3 test_sockproxy_cb_concurrent.py --mutation-check

@@ -18,7 +18,7 @@
 #include <time.h>
 #include <pthread.h>
 
-#define MAX_WORKERS 4  // Must match PROXY_MAX_THREADS from sockproxy.c
+#define MAX_WORKERS 32  // >= PROXY_MAX_THREADS (sockproxy_internal.h); rings are allocated per RUNNING worker only
 
 // Global per-thread ring array
 static lxb_ring_t *g_rings[MAX_WORKERS] = {NULL};
