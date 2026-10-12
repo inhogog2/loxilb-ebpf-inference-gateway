@@ -497,6 +497,18 @@ fc_state_destroy(fc_state_t *fc)
   fc->queue.used = fc->queue.count = 0;
   fc->queue.dead = 1;
   atomic_store_explicit(&fc->queued, 0, memory_order_relaxed);
+  /* The tenant table goes with the rule, so creating and deleting rules
+   * does not grow the process. A request that still holds the pool settles
+   * its service unit as before and finds no tenant slot to settle. */
+  free(fc->tenants);
+  free(fc->tenant_index);
+  fc->tenants = NULL;
+  fc->tenant_index = NULL;
+  fc->tenants_used = 0;
+  fc->tenant_free = 0;
+  fc->tenant_tombs = 0;
+  fc->tenants_runnable_waiting = 0;
+  fc->tenant_bound = 0;
   pthread_mutex_unlock(&fc->queue.lock);
 }
 
@@ -634,7 +646,9 @@ fc_tidx_home(const fc_state_t *fc, uint64_t key)
 }
 
 /* Lock held. The table and its index, made on the pool's first share.
- * tenant_slots is not zero from here on. */
+ * tenant_slots is not zero from here on. A destroyed pool gets none: a
+ * request that resolved the pool before its rule went runs on the service
+ * ceiling alone. */
 static int
 fc_tenant_table_ensure(fc_state_t *fc)
 {
@@ -642,6 +656,8 @@ fc_tenant_table_ensure(fc_state_t *fc)
 
   if (fc->tenants)
     return 0;
+  if (fc->queue.dead)
+    return -1;
   if (fc->tenant_slots == 0)
     fc->tenant_slots = FC_TENANT_SLOTS;
   n = fc->tenant_slots;

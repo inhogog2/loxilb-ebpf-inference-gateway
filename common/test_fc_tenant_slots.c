@@ -22,8 +22,9 @@
  * slots that stay put and are found again through any amount of coming and
  * going, the count of waiters that could run following a bound that moved,
  * the overflow counted once for a request that is refused and then waits,
- * a release that arrives after the pool was destroyed, and a pool that could
- * not get its table running without a share instead of refusing traffic.
+ * the table freed with the pool and a release that arrives after it, and a
+ * pool that could not get its table running without a share instead of
+ * refusing traffic.
  *
  * Build: make test_fc_tenant_slots (also run by `make test_fc`). The link
  * wraps calloc so one test can make the table's allocation fail.
@@ -450,18 +451,27 @@ static void
 test_release_after_destroy(void)
 {
   fc_state_t fc;
-  fc_permit_t a, b;
+  fc_permit_t a, b, c;
 
   pool_slots(&fc, 256, 4, 0, 50);
   assert(gate(&fc, &a, tkey(1), 1, 0) == FC_ADMIT);
   assert(gate(&fc, &b, tkey(2), 2, 0) == FC_ADMIT);
+  assert(a.tslot >= 0 && b.tslot >= 0);
   fc_state_destroy(&fc);
-  /* The table stays with the pool: late releases settle their tenants. */
+  /* The table goes with the pool, so deleting a rule gives its memory back. */
+  assert(fc.tenants == NULL && fc.tenant_index == NULL);
+  assert(fc_tenants_active(&fc) == 0);
+  /* A request that resolved the pool before the delete still runs, on the
+   * service ceiling alone, and brings no table back. */
+  assert(gate(&fc, &c, tkey(3), 3, 0) == FC_ADMIT);
+  assert(c.tslot < 0 && fc.tenants == NULL);
+  /* Late releases settle the service unit and find no slot to settle. */
   fc_permit_release(&a);
   fc_permit_release(&b);
+  fc_permit_release(&c);
   assert(fc_tenants_active(&fc) == 0 && fc_inflight(&fc) == 0);
   assert(anomaly(FC_A_UNDERFLOW) == 0);
-  printf("  destroy: a release after the pool was destroyed settled its tenant\n");
+  printf("  destroy: the table went with the pool and late releases settled\n");
 }
 
 /* ---- no memory for the table --------------------------------------------- */

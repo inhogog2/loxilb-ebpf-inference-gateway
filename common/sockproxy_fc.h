@@ -340,8 +340,8 @@ typedef struct fc_state {
    * shared by tenants past the table. Under queue.lock, which every path
    * that moves a queue entry already holds; taken on the admission path only
    * while a share is set. The table is allocated when the pool first runs
-   * with a share and stays with the pool from then on: a release may still
-   * arrive after fc_state_destroy. Slots never move while they are held;
+   * with a share and freed by fc_state_destroy; a release that arrives
+   * after that finds no table. Slots never move while they are held;
    * `tenant_index` finds a slot by key (open addressing, 2 * tenant_slots
    * buckets) and is the only part that is ever re-laid. */
   fc_tenant_t *tenants;
@@ -410,10 +410,11 @@ uint32_t fc_tenant_slots_from_env(void);
 /* Apply a configuration to a live pool. The queue ring grows to the new
  * depth when needed; entries already waiting are kept in order. */
 void fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg);
-/* Free the queue ring and mark the pool dead, so a request still holding
- * the pool can never park on it again. The queue must have been drained
- * first. The lock is kept: the pool's memory outlives its rule, and a
- * worker that resolved the pool before the delete may still take it. */
+/* Free the queue ring and the tenant table and mark the pool dead, so a
+ * request still holding the pool can never park on it again. The queue
+ * must have been drained first. The lock is kept: the pool's memory
+ * outlives its rule, and a worker that resolved the pool before the delete
+ * may still take it. */
 void fc_state_destroy(fc_state_t *fc);
 
 static inline int
