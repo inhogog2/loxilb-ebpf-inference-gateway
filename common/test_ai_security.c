@@ -116,7 +116,7 @@ test_upstream_hygiene(void)
   /* JWT-capable + strip_authz + forward_identity: client X-Auth-* gone,
    * Authorization gone, VERIFIED identity injected. */
   n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
-                                      3 /* jwt */, 1, 1, 1,
+                                      3 /* jwt */, 1, 0, 1, 1,
                                       "tenant-1", "alice");
   assert(n == 4); /* :method + content-type + 2 injected */
   assert(!has_header(output, n, "authorization", NULL));
@@ -128,7 +128,7 @@ test_upstream_hygiene(void)
   /* Passthrough profile (strip_authz=0): Authorization rides through, the
    * spoofed X-Auth-* still never does. */
   n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
-                                      3, 1, 0, 0, "", "");
+                                      3, 1, 0, 0, 0, "", "");
   assert(n == 3);
   assert(has_header(output, n, "authorization", "Bearer tok"));
   assert(!has_header(output, n, "x-auth-tenant", NULL));
@@ -137,14 +137,14 @@ test_upstream_hygiene(void)
   /* Not JWT-capable (plain API-key service): none of the JWT hygiene runs —
    * exact legacy behaviour, headers untouched apart from the key strip. */
   n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
-                                      1, 0, 0, 0, NULL, NULL);
+                                      1, 0, 0, 0, 0, NULL, NULL);
   assert(n == 5);
   assert(has_header(output, n, "authorization", "Bearer tok"));
   assert(has_header(output, n, "x-auth-tenant", "spoofed-t"));
 
   /* forward_identity with no user: only the tenant is injected. */
   n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
-                                      3, 1, 1, 1, "tenant-1", "");
+                                      3, 1, 0, 1, 1, "tenant-1", "");
   assert(n == 3);
   assert(has_header(output, n, "x-auth-tenant", "tenant-1"));
   assert(!has_header(output, n, "x-auth-user", NULL));
@@ -152,8 +152,74 @@ test_upstream_hygiene(void)
   /* Injection respects the output cap: no room, no write past the end. */
   nghttp2_nv tight[2];
   n = ai_security_h2_upstream_hygiene(input, 5, tight, 2,
-                                      3, 1, 1, 1, "tenant-1", "alice");
+                                      3, 1, 0, 1, 1, "tenant-1", "alice");
   assert(n == 2);
+}
+
+/* A service with a network-identity binding that forwards identity: the
+ * whole X-Auth-* family a client sent is gone whatever the rule's auth
+ * type, and the gate's tenant goes upstream only when the matched binding
+ * asked for it. */
+static void
+test_netid_forward_hygiene(void)
+{
+  nghttp2_nv input[] = {
+    nv(":method", "POST"),
+    nv("authorization", "Bearer tok"),
+    nv("x-auth-tenant", "spoofed-t"),
+    nv("X-Auth-Roles", "admin"),
+    nv("x-auth-", "edge"),
+    nv("x-authority", "kept"),
+    nv("x-api-key", "backend-owned"),
+  };
+  nghttp2_nv output[9];
+  size_t n;
+
+  /* No auth declared on the rule (policy 0), the matched binding forwards:
+   * the family is stripped, the tenant injected, nothing else touched. */
+  n = ai_security_h2_upstream_hygiene(input, 7, output, 9,
+                                      0, 0, 1, 0, 1, "line-1", "");
+  assert(n == 5);
+  assert(has_header(output, n, "x-auth-tenant", "line-1"));
+  assert(!has_header(output, n, "x-auth-tenant", "spoofed-t"));
+  assert(!has_header(output, n, "X-Auth-Roles", "admin"));
+  assert(!has_header(output, n, "x-auth-", "edge"));
+  assert(has_header(output, n, "x-authority", "kept"));
+  assert(has_header(output, n, "authorization", "Bearer tok"));
+  assert(has_header(output, n, "x-api-key", "backend-owned"));
+
+  /* The same service, a request no forwarding binding matched: stripped,
+   * and nothing is injected in the client's place, also when the request
+   * has a tenant of its own. */
+  n = ai_security_h2_upstream_hygiene(input, 7, output, 9,
+                                      0, 0, 1, 0, 0, "", "");
+  assert(n == 4);
+  n = ai_security_h2_upstream_hygiene(input, 7, output, 9,
+                                      0, 0, 1, 0, 0, "key-tenant", "alice");
+  assert(n == 4);
+  assert(!has_header(output, n, "x-auth-tenant", "key-tenant"));
+  assert(!has_header(output, n, "x-auth-user", "alice"));
+  assert(!has_header(output, n, "x-auth-tenant", "spoofed-t"));
+  assert(!has_header(output, n, "X-Auth-Roles", "admin"));
+
+  /* A forwarding binding with no tenant to name injects nothing. */
+  n = ai_security_h2_upstream_hygiene(input, 7, output, 9,
+                                      0, 0, 1, 0, 1, "", "alice");
+  assert(n == 4);
+
+  /* Beside a credential that named a user: both go upstream, once. */
+  n = ai_security_h2_upstream_hygiene(input, 7, output, 9,
+                                      3, 1, 1, 0, 1, "tenant-1", "alice");
+  assert(n == 5); /* x-api-key and the family gone, two injected */
+  assert(has_header(output, n, "x-auth-tenant", "tenant-1"));
+  assert(has_header(output, n, "x-auth-user", "alice"));
+
+  /* A service with no such binding is as it was: nothing of the family
+   * is stripped on a rule that is not JWT-capable. */
+  n = ai_security_h2_upstream_hygiene(input, 7, output, 9,
+                                      0, 0, 0, 0, 1, "line-1", "");
+  assert(n == 7);
+  assert(has_header(output, n, "x-auth-tenant", "spoofed-t"));
 }
 
 int
@@ -162,6 +228,7 @@ main(void)
   test_bounded_copy();
   test_header_filter();
   test_upstream_hygiene();
+  test_netid_forward_hygiene();
   puts("PASS: AI credential handling and upstream header hygiene");
   return 0;
 }

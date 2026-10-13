@@ -259,24 +259,37 @@ void ai_gw_svc_ident(uint32_t xip_be, uint16_t xport_be, char *buf, size_t len);
  * ai_gw_netid_bound_set replaces the whole set. svc_idents holds n service
  * identities ("VIP:port") and flags, when not NULL, one byte for each:
  * AI_GW_NETID_FAIL_CLOSED marks a service that refuses a request the
- * resolver could not answer for. all carries the same bits for every
+ * resolver could not answer for, AI_GW_NETID_FWD one that has a binding
+ * which forwards identity upstream. all carries the same bits for every
  * service: AI_GW_NETID_BOUND marks every service bound (a binding that
- * names no service), with AI_GW_NETID_FAIL_CLOSED every one fails closed.
- * More than AI_GW_NETID_SVC_MAX services also reads as all: the set may
- * answer bound, or fail-closed, for a service that did not ask (the
- * resolver then finds no binding), never the reverse. Safe against
- * concurrent readers; writers are serialized.
+ * names no service), with AI_GW_NETID_FAIL_CLOSED every one fails closed
+ * and with AI_GW_NETID_FWD every one forwards. More than
+ * AI_GW_NETID_SVC_MAX services also reads as all: the set may answer bound,
+ * fail-closed or forwarding for a service that did not ask (the resolver
+ * then finds no binding), never the reverse. Safe against concurrent
+ * readers; writers are serialized.
  *
  * ai_gw_netid_bound is the request-path read: lock-free, wait-free against
  * a writer, one hash and a probe of a table kept at most a quarter full,
  * and one atomic load while no binding exists anywhere. It returns 0 or
- * AI_GW_NETID_BOUND, with AI_GW_NETID_FAIL_CLOSED when the service asked
- * for it. */
+ * AI_GW_NETID_BOUND, with AI_GW_NETID_FAIL_CLOSED and AI_GW_NETID_FWD when
+ * the service has them.
+ *
+ * ai_gw_netid_fwd_any says whether any service forwards identity at all:
+ * the one load the upstream-header path pays before it builds a service
+ * identity to ask about.
+ *
+ * ai_gw_netid_ifmatch is set while at least one binding matches on an
+ * ingress interface. Only then is a connection's ingress interface read. */
 #define AI_GW_NETID_SVC_MAX      1024
 #define AI_GW_NETID_BOUND        0x1
 #define AI_GW_NETID_FAIL_CLOSED  0x2
+#define AI_GW_NETID_FWD          0x4
 void ai_gw_netid_bound_set(const char *const *svc_idents, const uint8_t *flags,
                            int n, int all);
 int  ai_gw_netid_bound(const char *svc_ident);
+int  ai_gw_netid_fwd_any(void);
+void ai_gw_netid_ifmatch_set(int on);
+int  ai_gw_netid_ifmatch(void);
 
 #endif /* __SOCKPROXY_AI_ADMIT_H__ */

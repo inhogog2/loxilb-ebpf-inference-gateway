@@ -190,10 +190,12 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
  * request probes the table its state word names, at a load of a quarter or
  * less, and reads the word again: a different word means a replacement ran
  * underneath, and it reads once more from the new one. It never waits for a
- * writer. A slot holds a hash with its two low bits replaced: bit 0 marks
- * the slot taken, bit 1 is the service's fail-closed flag. Two services whose
- * hashes agree above those bits share a slot and its flag; that costs one of
- * them a resolver call it did not need, and decides nothing. */
+ * writer. A slot holds a hash with its three low bits replaced: bit 0 marks
+ * the slot taken, bit 1 is the service's fail-closed flag, bit 2 its
+ * forward-identity flag. Two services whose hashes agree above those bits
+ * share a slot and its flags; that costs one of them a resolver call it did
+ * not need, or a client-sent X-Auth-* header it would have passed on, and
+ * admits nothing. */
 
 enum { NETID_NONE = 0, NETID_LISTED = 1, NETID_ALL = 2 };
 
@@ -204,15 +206,23 @@ _Static_assert((NETID_TBL_SLOTS & NETID_TBL_MASK) == 0, "table size");
 #define NETID_ST_MODE        0x3u    /* NETID_* */
 #define NETID_ST_ALL_CLOSED  0x4u    /* every service fails closed */
 #define NETID_ST_ANY_CLOSED  0x8u    /* some slot carries the flag */
-#define NETID_ST_TBL         0x10u   /* which table is published */
-#define NETID_ST_GEN         0x20u   /* generation, one step */
+#define NETID_ST_ALL_FWD     0x10u   /* every service forwards identity */
+#define NETID_ST_ANY_FWD     0x20u   /* some slot carries the flag */
+#define NETID_ST_TBL         0x40u   /* which table is published */
+#define NETID_ST_GEN         0x80u   /* generation, one step */
 
 #define NETID_SLOT_USED      0x1ull
 #define NETID_SLOT_CLOSED    0x2ull
+#define NETID_SLOT_FWD       0x4ull
+#define NETID_SLOT_FLAGS     (NETID_SLOT_CLOSED | NETID_SLOT_FWD)
+#define NETID_SLOT_LOW       (NETID_SLOT_USED | NETID_SLOT_FLAGS)
+_Static_assert(NETID_SLOT_CLOSED == AI_GW_NETID_FAIL_CLOSED &&
+               NETID_SLOT_FWD == AI_GW_NETID_FWD, "slot flags are the API's");
 
 static _Atomic uint32_t netid_state;     /* NETID_NONE is the one load a
                                           * request pays with no binding */
 static _Atomic uint64_t netid_tbl[2][NETID_TBL_SLOTS];
+static _Atomic int netid_ifmatch;        /* a binding matches on an interface */
 static pthread_mutex_t netid_wlock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t
@@ -229,7 +239,7 @@ netid_hash(const char *s)
 static inline uint32_t
 netid_slot0(uint64_t h)
 {
-  return (uint32_t)((h >> 2) ^ (h >> 33)) & NETID_TBL_MASK;
+  return (uint32_t)((h >> 3) ^ (h >> 33)) & NETID_TBL_MASK;
 }
 
 void
@@ -251,30 +261,31 @@ ai_gw_netid_bound_set(const char *const *svc_idents, const uint8_t *flags,
   for (int i = 0; svc_idents && i < n; i++) {
     if (!svc_idents[i] || !svc_idents[i][0])
       continue;
-    int closed = flags && (flags[i] & AI_GW_NETID_FAIL_CLOSED);
-    uint64_t want = (netid_hash(svc_idents[i]) & ~3ull) | NETID_SLOT_USED;
+    uint64_t fl = flags ? (flags[i] & NETID_SLOT_FLAGS) : 0;
+    uint64_t want = (netid_hash(svc_idents[i]) & ~NETID_SLOT_LOW) |
+                    NETID_SLOT_USED;
     uint32_t at = netid_slot0(want);
     uint64_t v;
 
     while ((v = atomic_load_explicit(&tbl[at], memory_order_relaxed)) != 0 &&
-           (v & ~NETID_SLOT_CLOSED) != want)
+           (v & ~NETID_SLOT_FLAGS) != want)
       at = (at + 1) & NETID_TBL_MASK;
     if (v == 0) {
       if (cnt == AI_GW_NETID_SVC_MAX) {
-        /* More than the set holds: never miss one, and never run one that
-         * asked to fail closed as if it had not. */
-        all |= AI_GW_NETID_BOUND;
-        if (closed)
-          all |= AI_GW_NETID_FAIL_CLOSED;
+        /* More than the set holds: never miss one, never run one that
+         * asked to fail closed as if it had not, and never pass a
+         * client-sent identity header on to one that forwards its own. */
+        all |= AI_GW_NETID_BOUND | (int)fl;
         continue;
       }
       cnt++;
       v = want;
     }
-    if (closed) {
-      v |= NETID_SLOT_CLOSED;
+    v |= fl;
+    if (fl & NETID_SLOT_CLOSED)
       next |= NETID_ST_ANY_CLOSED;
-    }
+    if (fl & NETID_SLOT_FWD)
+      next |= NETID_ST_ANY_FWD;
     atomic_store_explicit(&tbl[at], v, memory_order_relaxed);
   }
 
@@ -282,6 +293,8 @@ ai_gw_netid_bound_set(const char *const *svc_idents, const uint8_t *flags,
     next |= NETID_ALL;
     if (all & AI_GW_NETID_FAIL_CLOSED)
       next |= NETID_ST_ALL_CLOSED;
+    if (all & AI_GW_NETID_FWD)
+      next |= NETID_ST_ALL_FWD;
   } else if (cnt) {
     next |= NETID_LISTED;
   }
@@ -298,7 +311,7 @@ ai_gw_netid_bound(const char *svc_ident)
   if ((st & NETID_ST_MODE) == NETID_NONE || !svc_ident || !svc_ident[0])
     return 0;
 
-  uint64_t want = (netid_hash(svc_ident) & ~3ull) | NETID_SLOT_USED;
+  uint64_t want = (netid_hash(svc_ident) & ~NETID_SLOT_LOW) | NETID_SLOT_USED;
   for (;;) {
     uint32_t mode = st & NETID_ST_MODE;
     int ret = 0;
@@ -308,8 +321,12 @@ ai_gw_netid_bound(const char *svc_ident)
     if (mode == NETID_ALL) {
       ret = AI_GW_NETID_BOUND;
       if (st & NETID_ST_ALL_CLOSED)
-        return ret | AI_GW_NETID_FAIL_CLOSED;
-      if (!(st & NETID_ST_ANY_CLOSED))
+        ret |= AI_GW_NETID_FAIL_CLOSED;
+      if (st & NETID_ST_ALL_FWD)
+        ret |= AI_GW_NETID_FWD;
+      /* A slot can only add a flag the whole set does not carry. */
+      if ((!(st & NETID_ST_ANY_CLOSED) || (ret & AI_GW_NETID_FAIL_CLOSED)) &&
+          (!(st & NETID_ST_ANY_FWD) || (ret & AI_GW_NETID_FWD)))
         return ret;
     }
 
@@ -322,10 +339,8 @@ ai_gw_netid_bound(const char *svc_ident)
       uint64_t v = atomic_load_explicit(&tbl[at], memory_order_relaxed);
       if (v == 0)
         break;
-      if ((v & ~NETID_SLOT_CLOSED) == want) {
-        ret |= AI_GW_NETID_BOUND;
-        if (v & NETID_SLOT_CLOSED)
-          ret |= AI_GW_NETID_FAIL_CLOSED;
+      if ((v & ~NETID_SLOT_FLAGS) == want) {
+        ret |= AI_GW_NETID_BOUND | (int)(v & NETID_SLOT_FLAGS);
         break;
       }
       at = (at + 1) & NETID_TBL_MASK;
@@ -336,6 +351,25 @@ ai_gw_netid_bound(const char *svc_ident)
       return ret;
     st = now;             /* replaced underneath: read the new one */
   }
+}
+
+int
+ai_gw_netid_fwd_any(void)
+{
+  return (atomic_load_explicit(&netid_state, memory_order_relaxed) &
+          (NETID_ST_ALL_FWD | NETID_ST_ANY_FWD)) != 0;
+}
+
+void
+ai_gw_netid_ifmatch_set(int on)
+{
+  atomic_store(&netid_ifmatch, on ? 1 : 0);
+}
+
+int
+ai_gw_netid_ifmatch(void)
+{
+  return atomic_load_explicit(&netid_ifmatch, memory_order_relaxed);
 }
 
 /* The keyless decision of a non-enforcing service: the opt-in per-VIP shared

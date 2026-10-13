@@ -1769,6 +1769,120 @@ test_netid_bound_set_carries_fail_closed(void)
   assert(ai_gw_netid_bound(names[5]) == 0);
 }
 
+/* A service can have a binding that forwards identity: the flag travels
+ * with its entry as the fail-closed one does, the two are independent, and
+ * one load answers "does any service forward at all". */
+static void
+test_netid_bound_set_carries_forward(void)
+{
+  static char names[AI_GW_NETID_SVC_MAX + 2][24];
+  static const char *ptrs[AI_GW_NETID_SVC_MAX + 2];
+  static uint8_t fl[AI_GW_NETID_SVC_MAX + 2];
+  const char *three[] = { "10.0.0.1:2040", "10.0.0.2:8080", "10.0.0.3:9000" };
+  const uint8_t mixed[] = { AI_GW_NETID_FWD, AI_GW_NETID_FAIL_CLOSED,
+                            AI_GW_NETID_FWD | AI_GW_NETID_FAIL_CLOSED };
+  const int b = AI_GW_NETID_BOUND;
+
+  assert(ai_gw_netid_fwd_any() == 0);
+  ai_gw_netid_bound_set(three, mixed, 3, 0);
+  assert(ai_gw_netid_fwd_any() == 1);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == (b | AI_GW_NETID_FWD));
+  assert(ai_gw_netid_bound("10.0.0.2:8080") == (b | AI_GW_NETID_FAIL_CLOSED));
+  assert(ai_gw_netid_bound("10.0.0.3:9000") ==
+         (b | AI_GW_NETID_FWD | AI_GW_NETID_FAIL_CLOSED));
+  assert(ai_gw_netid_bound("10.0.0.4:1") == 0);
+
+  /* The next set carries no flag: none is left behind. */
+  ai_gw_netid_bound_set(three, NULL, 3, 0);
+  assert(ai_gw_netid_fwd_any() == 0);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == b);
+
+  /* Every service bound, one of them forwarding: that one only. */
+  ai_gw_netid_bound_set(three, mixed, 1, AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_fwd_any() == 1);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == (b | AI_GW_NETID_FWD));
+  assert(ai_gw_netid_bound("192.0.2.9:1") == b);
+
+  /* Every service forwards; one also fails closed. */
+  ai_gw_netid_bound_set(three + 1, mixed + 1, 1,
+                        AI_GW_NETID_BOUND | AI_GW_NETID_FWD);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == (b | AI_GW_NETID_FWD));
+  assert(ai_gw_netid_bound("10.0.0.2:8080") ==
+         (b | AI_GW_NETID_FWD | AI_GW_NETID_FAIL_CLOSED));
+
+  /* The forward flag alone binds nothing. */
+  ai_gw_netid_bound_set(NULL, NULL, 0, AI_GW_NETID_FWD);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == 0);
+  assert(ai_gw_netid_fwd_any() == 0);
+
+  /* Past capacity, a forwarding service that did not fit makes every
+   * service forward: a client-sent identity header must not reach it. */
+  for (int i = 0; i < AI_GW_NETID_SVC_MAX + 2; i++) {
+    snprintf(names[i], sizeof(names[i]), "10.%d.%d.1:%d", i / 256, i % 256,
+             1000 + i);
+    ptrs[i] = names[i];
+    fl[i] = 0;
+  }
+  ai_gw_netid_bound_set(ptrs, fl, AI_GW_NETID_SVC_MAX + 1, 0);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == b);
+  fl[AI_GW_NETID_SVC_MAX + 1] = AI_GW_NETID_FWD;
+  ai_gw_netid_bound_set(ptrs, fl, AI_GW_NETID_SVC_MAX + 2, 0);
+  assert(ai_gw_netid_bound(names[6]) == (b | AI_GW_NETID_FWD));
+  assert(ai_gw_netid_bound("192.0.2.9:1") == (b | AI_GW_NETID_FWD));
+
+  ai_gw_netid_bound_set(NULL, NULL, 0, 0);
+  assert(ai_gw_netid_bound(names[6]) == 0 && ai_gw_netid_fwd_any() == 0);
+}
+
+/* The interface-match switch: off until the control plane says a binding
+ * matches on an interface, and any non-zero value is "on". */
+static void
+test_netid_ifmatch_switch(void)
+{
+  assert(ai_gw_netid_ifmatch() == 0);
+  ai_gw_netid_ifmatch_set(1);
+  assert(ai_gw_netid_ifmatch() == 1);
+  ai_gw_netid_ifmatch_set(7);
+  assert(ai_gw_netid_ifmatch() == 1);
+  ai_gw_netid_ifmatch_set(0);
+  assert(ai_gw_netid_ifmatch() == 0);
+}
+
+/* A service that also carries the forward flag is bound like any other:
+ * the gate reads the bound bit, not the word. */
+static void
+test_net_forward_flag_does_not_change_the_decision(void)
+{
+  ai_gw_req_ctx_t req = {
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 0,
+    .svc_ident = "10.0.0.1:2040",
+    .netid_bound = AI_GW_NETID_BOUND | AI_GW_NETID_FWD,
+    .client_ip = NET_SRC,
+    .in_ifindex = 12,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  nid_bind("line-1-tenant", 0, 0);
+  nid_stub.out.forward_identity = 1;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(nid_stub.calls == 1 && nid_stub.in_ifindex == 12);
+  assert(res.auth_src == AI_GW_AUTH_SRC_NETWORK);
+  assert(res.net_forward_identity == 1);
+  assert(strcmp(res.tenant_id, "line-1-tenant") == 0);
+
+  /* The forward flag without the bound bit asks nothing. */
+  req.netid_bound = AI_GW_NETID_FWD;
+  reset_stubs();
+  nid_bind("line-1-tenant", 0, 0);
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_UNMETERED);
+  assert(nid_stub.calls == 0 && res.net_forward_identity == 0);
+}
+
 /* The set is replaced whole while requests read it. A service in every
  * published set must read as bound through every replacement, and one in
  * none of them never: a reader may not see half of a replacement. */
@@ -1880,6 +1994,9 @@ main(void)
   test_net_streamed_body_is_gated_on_the_prefix();
   test_netid_bound_set();
   test_netid_bound_set_carries_fail_closed();
+  test_netid_bound_set_carries_forward();
+  test_netid_ifmatch_switch();
+  test_net_forward_flag_does_not_change_the_decision();
   test_netid_bound_set_is_replaced_under_readers();
   puts("PASS: network identity: one case per decision-table row, the conflict "
        "rule on the network path, a presented credential never falls back, "

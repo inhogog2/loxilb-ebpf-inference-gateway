@@ -64,6 +64,10 @@ _Static_assert(offsetof(proxy_fd_ent_t, resp_origin_ip) < PFE_SKIP_OFF ||
 _Static_assert(offsetof(proxy_fd_ent_t, l7_peer_ip) < PFE_SKIP_OFF ||
                offsetof(proxy_fd_ent_t, l7_peer_ip) >= PFE_SKIP_END,
                "l7_peer_ip must lie outside the skipped span");
+/* And the interface it arrived on: a reused shell must read its own. */
+_Static_assert(offsetof(proxy_fd_ent_t, l7_in_ifindex) < PFE_SKIP_OFF ||
+               offsetof(proxy_fd_ent_t, l7_in_ifindex) >= PFE_SKIP_END,
+               "l7_in_ifindex must lie outside the skipped span");
 
 static inline void
 pfe_clear(proxy_fd_ent_t *pfe)

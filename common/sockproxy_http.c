@@ -52,6 +52,7 @@
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_ai_security.h"
 #include "sockproxy_sockmap_gate.h"
+#include "sockproxy_in_ifindex.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
@@ -735,6 +736,43 @@ l7h1_strip_header(uint8_t *msg, size_t *len, const char *name)
   return headers_end;
 }
 
+/* Strip every header whose name starts with prefix (case-insensitive) from
+ * the header block in [msg, *len): a whole family a client must not be able
+ * to send upstream, whatever its members are called. Same contract as
+ * l7h1_strip_header: the header terminator, or NULL if it was lost. */
+static uint8_t *
+l7h1_strip_header_prefix(uint8_t *msg, size_t *len, const char *prefix)
+{
+  uint8_t *headers_end = memmem(msg, *len, "\r\n\r\n", 4);
+  size_t plen = strlen(prefix);
+  if (!headers_end || plen == 0)
+    return headers_end;
+
+  uint8_t *line = memmem(msg, (size_t)(headers_end - msg), "\r\n", 2);
+  while (line && line < headers_end) {
+    uint8_t *hdr = line + 2;
+    if (hdr >= headers_end)
+      break;
+    if ((size_t)(headers_end - hdr) > plen &&
+        strncasecmp((const char *)hdr, prefix, plen) == 0) {
+      uint8_t *line_end = memmem(hdr, (size_t)(*len - (size_t)(hdr - msg)),
+                                 "\r\n", 2);
+      if (!line_end)
+        break;
+      line_end += 2;
+      size_t remove_len = (size_t)(line_end - hdr);
+      memmove(hdr, line_end, *len - (size_t)(line_end - msg));
+      *len -= remove_len;
+      headers_end = memmem(msg, *len, "\r\n\r\n", 4);
+      if (!headers_end)
+        return NULL;
+      continue;
+    }
+    line = memmem(hdr, (size_t)(headers_end - hdr), "\r\n", 2);
+  }
+  return headers_end;
+}
+
 /* Splice one "<name>: <value>\r\n" line before the final \r\n\r\n. */
 static int
 l7h1_splice_header(uint8_t *msg, size_t *len, size_t bufsize,
@@ -890,20 +928,37 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
 {
   proxy_map_ent_t *node;
   size_t cur = buflen;
+  int strip_key, netid_fwd_svc = 0;
 
   if (!pfe || !buf)
     return buflen;
   node = (proxy_map_ent_t *)pfe->head;
+  if (!node || !node->val.ephash)
+    return buflen;
   /* Header ownership follows api_key_auth only. ai_gw_mode is accounting and
    * streaming state, not an authorization declaration. */
-  if (!node || !node->val.ephash ||
-      !ai_security_should_strip_api_key(node->val.ephash->apikey_auth))
+  strip_key = ai_security_should_strip_api_key(node->val.ephash->apikey_auth);
+  /* A service with a network-identity binding that forwards identity owns
+   * the whole X-Auth-* family, whatever its auth type and whether or not
+   * this request's source matched a binding: its backend reads those names
+   * as the gateway's word. The binding's service list is the declaration;
+   * nothing else about the rule is asked. One atomic load while no such
+   * binding exists. */
+  if (ai_gw_netid_fwd_any()) {
+    char fwd_svc_ident[64];
+    ai_gw_svc_ident(node->key.xip, node->key.xport,
+                    fwd_svc_ident, sizeof(fwd_svc_ident));
+    netid_fwd_svc = (ai_gw_netid_bound(fwd_svc_ident) & AI_GW_NETID_FWD) != 0;
+  }
+  if (!strip_key && !netid_fwd_svc)
     return buflen;
   if (buflen < 4 || !memmem(buf, buflen, "\r\n\r\n", 4))
     return buflen;
 
-  if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
+  if (strip_key && !l7h1_strip_header(buf, &cur, "X-Api-Key"))
     return buflen;   /* terminator lost — leave the buffer as it was */
+  if (netid_fwd_svc && !l7h1_strip_header_prefix(buf, &cur, "X-Auth-"))
+    return buflen;
 
   /* Upstream hygiene for JWT-capable services (apikey_auth 3/4).
    *
@@ -931,16 +986,20 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
       if (!l7h1_strip_header(buf, &cur, "Authorization"))
         return buflen;
     }
-    if (pfe->auth_fwd_identity && pfe->tenant_id[0]) {
-      size_t scan = (cur < 2048) ? cur : 2048;
-      if (!memmem(buf, scan, "Transfer-Encoding: chunked", 26) &&
-          !memmem(buf, scan, "transfer-encoding: chunked", 26)) {
-        (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-Tenant",
-                                 pfe->tenant_id);
-        if (pfe->auth_user_id[0])
-          (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-User",
-                                   pfe->auth_user_id);
-      }
+  }
+  /* One injection, whichever arm asked for it: the JWT profile of the
+   * deciding token, or the binding that matched this request's source on a
+   * service that forwards identity. The values are the gate's. */
+  if (((pfe->auth_jwt_capable && pfe->auth_fwd_identity) ||
+       (netid_fwd_svc && pfe->auth_netid_fwd)) && pfe->tenant_id[0]) {
+    size_t scan = (cur < 2048) ? cur : 2048;
+    if (!memmem(buf, scan, "Transfer-Encoding: chunked", 26) &&
+        !memmem(buf, scan, "transfer-encoding: chunked", 26)) {
+      (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-Tenant",
+                               pfe->tenant_id);
+      if (pfe->auth_user_id[0])
+        (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-User",
+                                 pfe->auth_user_id);
     }
   }
   return cur;
@@ -8607,6 +8666,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->auth_strip_authz = 0;
     pfe->auth_fwd_identity = 0;
     pfe->auth_jwt_capable = 0;
+    pfe->auth_netid_fwd = 0;
     pfe->x_model_header[0] = '\0';
     pfe->effective_model[0] = '\0';
     pfe->json_stream_route_pending = 0;
@@ -9173,6 +9233,12 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   /* Whether a network-identity binding can name this request's tenant is a
    * property of the service; with none the gate does not look for one. */
   req->netid_bound = ai_gw_netid_bound(adm_svc_ident);
+  /* The interface the connection arrived on, for a binding that matches on
+   * one. Read at accept while such a binding exists; a connection accepted
+   * before the first one was configured is read here, once. */
+  if (req->netid_bound)
+    req->in_ifindex = sp_in_ifindex_cached(&pfe->l7_in_ifindex, pfe->fd,
+                                           ai_gw_netid_ifmatch());
   /* The request ID exists before the gate decides, so a refusal carries the
    * same key its completion and settle would have. A client-supplied
    * X-Request-Id was adopted at header capture; anything else is minted
@@ -9250,6 +9316,7 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   pfe->auth_jwt_capable =
     (hent->val.ephash->apikey_auth == 3 ||
      hent->val.ephash->apikey_auth == 4) ? 1 : 0;
+  pfe->auth_netid_fwd = adm.net_forward_identity ? 1 : 0;
   strncpy(pfe->effective_model, adm.effective_model,
           sizeof(pfe->effective_model) - 1);
   pfe->effective_model[sizeof(pfe->effective_model) - 1] = '\0';
@@ -11191,6 +11258,12 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
                 sizeof(npfe1->l7_peer_ip));
     }
   }
+
+  /* The interface it arrived on, the other half of what a network-identity
+   * binding matches. Read only while a binding that matches on an interface
+   * exists: with none, a connection costs no system call for it. */
+  if (ai_gw_netid_ifmatch())
+    npfe1->l7_in_ifindex = sp_in_ifindex_read(new_sd);
 
   // Check if kTLS was enabled during SSL_accept
   if (ssl && ktls_is_active(new_sd)) {

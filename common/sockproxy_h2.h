@@ -144,6 +144,7 @@ typedef struct proxy_h2_stream {
   uint8_t  auth_strip_authz;         // upstream hygiene switches, parity with the H1 splice
   uint8_t  auth_fwd_identity;
   uint8_t  auth_jwt_capable;
+  uint8_t  auth_netid_fwd;           // the matched binding forwards identity upstream
   uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
   int64_t  usage_res_epoch;          // reservation window tag
   uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)

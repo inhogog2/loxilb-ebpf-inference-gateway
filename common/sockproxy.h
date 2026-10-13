@@ -1345,6 +1345,14 @@ struct proxy_fd_ent {
   // or the peer is not IPv4.
   char     l7_peer_ip[L7_HOP_TEXT_MAX];
 
+  // Index of the interface this connection arrived on, for network-identity
+  // bindings that match on an interface: 0 = not read, -1 = the read failed
+  // (kept, so it is not tried again on every request), else the index. Read
+  // at most once per connection (sockproxy_in_ifindex.h), and only while
+  // such a binding exists, so a gateway with none never makes the calls.
+  // With l7_peer_ip it is the pair a binding is resolved against.
+  int32_t  l7_in_ifindex;
+
   // Header-completion deadline anchor (slowloris guard), every listener.
   // HTTP/1.1: set on the first byte of a request's headers, cleared once
   // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2: set
@@ -1495,6 +1503,9 @@ struct proxy_fd_ent {
   uint8_t  auth_strip_authz;          // 1 = strip Authorization before dispatch (JWT arm decided, no passthrough)
   uint8_t  auth_fwd_identity;         // 1 = inject X-Auth-Tenant/X-Auth-User upstream (verified values)
   uint8_t  auth_jwt_capable;          // 1 = rule mode consults the JWT arm (3/4): always strip client X-Auth-*
+  uint8_t  auth_netid_fwd;            // 1 = the binding that matched this request's source forwards identity:
+                                      // inject X-Auth-Tenant/X-Auth-User upstream. Per request. The strip of
+                                      // client-sent X-Auth-* is the service's, not the request's (ai_gw_netid_bound)
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer

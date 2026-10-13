@@ -28,6 +28,7 @@
 #include "sockproxy_internal.h"
 #include "sockproxy.h"
 #include "sockproxy_ai_security.h"
+#include "sockproxy_in_ifindex.h"
 #include "sockproxy_ai_admit.h"   /* the shared H1/H2 admission gate */
 #include "sockproxy_ai_gw.h"      /* settle-path ladder calls */
 #include "sockproxy_pd.h"         /* dialect ops for usage extraction */
@@ -4249,6 +4250,11 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .origin_ip = stream->l7_origin_ip,
       .trusted_hops = (int)stream->l7_trusted_hops,
     };
+    /* The interface the connection arrived on: the connection's, so every
+     * stream reads the same one, and read once. */
+    if (adm_req.netid_bound && pfe)
+      adm_req.in_ifindex = sp_in_ifindex_cached(&pfe->l7_in_ifindex, pfe->fd,
+                                                ai_gw_netid_ifmatch());
     ai_gw_admit_result_t adm;
     ai_gw_admit(&adm_req, &adm);
 
@@ -4315,6 +4321,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       stream->auth_jwt_capable =
         (ent->val.ephash->apikey_auth == 3 ||
          ent->val.ephash->apikey_auth == 4) ? 1 : 0;
+      stream->auth_netid_fwd = adm.net_forward_identity ? 1 : 0;
       if (adm.res_epoch != 0) {
         stream->usage_reserved_toks = adm.reserved_toks;
         stream->usage_res_epoch = adm.res_epoch;
@@ -5061,7 +5068,18 @@ h2_have_tepval:
   int security_headers_built = 0;
   uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
   int hygiene_jwt = stream->ai_admitted && stream->auth_jwt_capable;
-  if (ai_security_should_strip_api_key(security_policy) || hygiene_jwt) {
+  /* A service with a binding that forwards identity owns the X-Auth-*
+   * family for every stream, admitted by a binding or not (parity with the
+   * H1 splice). One atomic load while no such binding exists. */
+  int hygiene_netid = 0;
+  if (ai_gw_netid_fwd_any()) {
+    char fwd_svc_ident[64];
+    ai_gw_svc_ident(ent->key.xip, ent->key.xport,
+                    fwd_svc_ident, sizeof(fwd_svc_ident));
+    hygiene_netid = (ai_gw_netid_bound(fwd_svc_ident) & AI_GW_NETID_FWD) != 0;
+  }
+  if (ai_security_should_strip_api_key(security_policy) || hygiene_jwt ||
+      hygiene_netid) {
     size_t hygiene_cap = nheaders + 2;   /* + injected X-Auth-Tenant/User */
     security_headers_nv = calloc(hygiene_cap, sizeof(*security_headers_nv));
     if (!security_headers_nv) {
@@ -5072,8 +5090,10 @@ h2_have_tepval:
     }
     nheaders = ai_security_h2_upstream_hygiene(
         headers, nheaders, security_headers_nv, hygiene_cap,
-        security_policy, hygiene_jwt,
-        stream->auth_strip_authz, stream->auth_fwd_identity,
+        security_policy, hygiene_jwt, hygiene_netid,
+        stream->auth_strip_authz,
+        (hygiene_jwt && stream->auth_fwd_identity) ||
+        (hygiene_netid && stream->ai_admitted && stream->auth_netid_fwd),
         stream->tenant_id, stream->auth_user_id);
     headers = security_headers_nv;
     security_headers_built = 1;
