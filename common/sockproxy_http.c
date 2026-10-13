@@ -5327,6 +5327,40 @@ proxy_get_entry_stats(uint32_t id, int epid, uint64_t *p, uint64_t *b)
   PROXY_UNLOCK();
 }
 
+/* The bounded-load units CHWBL/WRR_HASH record on endpoint `epid` of the
+ * rule `id`: what the selector charged and teardown has not yet given back.
+ * -1 when the rule is unknown or keeps no such units. A diagnostic read for
+ * tests and status readers, never replayed into a rule. */
+int
+proxy_get_chwbl_ep_load(uint32_t id, int epid)
+{
+  proxy_map_ent_t *node;
+  proxy_epval_t *epv;
+  int rc = -1;
+
+  if (epid < 0 || epid >= MAX_PROXY_EP)
+    return -1;
+
+  PROXY_LOCK();
+  for (node = proxy_struct->head; node; node = node->next) {
+    for (epv = node->val.ephash; epv; epv = epv->hh.next) {
+      if (epv->_id != id)
+        continue;
+#ifdef HAVE_DP_GPU_ROUTING
+      pthread_rwlock_rdlock(&epv->chwbl_state_lock);
+      if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) &&
+          epv->chwbl_config)
+        rc = (int)atomic_load(&epv->chwbl_config->ep_loads[epid].active_conns);
+      pthread_rwlock_unlock(&epv->chwbl_state_lock);
+#endif /* HAVE_DP_GPU_ROUTING */
+      PROXY_UNLOCK();
+      return rc;
+    }
+  }
+  PROXY_UNLOCK();
+  return rc;
+}
+
 int
 proxy_selftests()
 {

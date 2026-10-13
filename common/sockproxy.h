@@ -2389,6 +2389,7 @@ void proxy_dump_entry(proxy_info_cb_t);
  * svc_id (0 = none); *mode / *timeout_ms are those of the first match. */
 int proxy_epp_cfg_get(uint32_t svc_id, uint8_t *mode, uint32_t *timeout_ms);
 void proxy_get_entry_stats(uint32_t id, int epid, uint64_t *p, uint64_t *b);
+int proxy_get_chwbl_ep_load(uint32_t id, int epid);
 void pfe_ent_accouting(proxy_fd_ent_t *pfe, uint64_t bc, int txdir);
 int proxy_main(sockmap_cb_t cb, peer_map_cb_t peer_map_cb,
                verdict_map_cb_t verdict_map_cb, int ktls_enabled);

@@ -840,6 +840,15 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
     pfe->kv_sr_load_held = 1;
     pfe->kv_sr_ep_idx = idx;
     if (!pfe->epv) pfe->epv = tepval;
+#ifdef HAVE_DP_GPU_ROUTING
+    /* CHWBL/WRR_HASH charge their bounded-load unit inside selection and
+     * teardown gives it back by ep_num (proxy_release_fd_ctx). A candidate
+     * pinned here never went through selection, so take the unit now —
+     * the same pairing the mid-cycle failover re-apply keeps — or the
+     * release steals a unit another connection holds (underflow at 0)
+     * and a FailOpen fallback selects on a load lower than the truth. */
+    chwbl_inc_runtime(tepval, idx);
+#endif /* HAVE_DP_GPU_ROUTING */
     ep_sel->ep_cfds[0].ep_cfd = fd;
     ep_sel->ep_cfds[0].connect_pending = 0;
     *sel = idx;
