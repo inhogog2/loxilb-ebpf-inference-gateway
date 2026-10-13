@@ -711,6 +711,8 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
       /* The credential validated and named its tenant; only the model was
        * refused. Carry the identity so the refusal is attributable, as the
        * CONFLICT arm below already does. */
+      if (jwt_arm)
+        res->auth_src = AI_GW_AUTH_SRC_BEARER;
       snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
       snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
       snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
@@ -721,6 +723,10 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
     }
     return -1;
   }
+  /* A token validated: every record of this request, a later refusal's
+   * included, says a bearer token decided its tenant. */
+  if (jwt_arm)
+    res->auth_src = AI_GW_AUTH_SRC_BEARER;
 
   /* Rows 4 and 5: the credential validated, and the source has a binding.
    * An advisory binding is noted and changes nothing. A strict one holds

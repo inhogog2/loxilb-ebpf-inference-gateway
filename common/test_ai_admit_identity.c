@@ -69,6 +69,8 @@ static int validate_bearer_calls;
 /* Forced outcome of the API-key arm: 0 = validate, otherwise the decision
  * the arm refuses with (2 = model refused for a known tenant). */
 static int validate_key_decision;
+/* The same for the JWT arm. */
+static int validate_bearer_decision;
 static struct {
   int  calls;
   char request_id[64];
@@ -180,6 +182,12 @@ llb_ai_validate_bearer(char *bearer, char *model_name, char *profile_name,
   assert(strcmp(bearer, "tok") == 0); /* gate strips the Bearer tag itself */
   strcpy(result->tenant_id, "tenant-1");
   strcpy(result->user_id, "alice");
+  if (validate_bearer_decision != 0) {
+    /* The token validated and named its tenant; the refusal is the arm's
+     * decision (a model its roles do not cover). */
+    result->decision = validate_bearer_decision;
+    return -1;
+  }
   /* The JWT arm mints no key_id. */
   return 0;
 }
@@ -280,6 +288,7 @@ reset_stubs(void)
   validate_key_calls = 0;
   validate_bearer_calls = 0;
   validate_key_decision = 0;
+  validate_bearer_decision = 0;
   extract_model_calls = 0;
   memset(&deny_stub, 0, sizeof(deny_stub));
   memset(&rl_stub, 0, sizeof(rl_stub));
@@ -323,6 +332,62 @@ test_jwt_arm_forwards_user_and_service(void)
   assert(rs_stub.prompt_est == 7 && rs_stub.max_tokens == 32);
   assert(res.res_epoch == 77 && res.reserved_toks == 39);
   assert(strcmp(res.user_id, "alice") == 0);
+  /* A validated token is what decided the tenant, and the result says so. */
+  assert(res.auth_src == AI_GW_AUTH_SRC_BEARER);
+}
+
+/* What a bearer token leaves on the records: a validated one is named as
+ * the source on the admission and on any refusal after it; one that did not
+ * validate decided nothing; an API key never reads as a bearer token. */
+static void
+test_bearer_is_named_as_the_source(void)
+{
+  ai_gw_req_ctx_t req = {
+    .bearer = "Bearer tok",
+    .jwt_profile = "kc",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 3,
+    .svc_ident = "10.0.0.1:2040",
+  };
+  ai_gw_admit_result_t res;
+
+  /* Refused by a later stage: the refusal's record names the token. */
+  reset_stubs();
+  rl_stub.rc = -1;
+  rl_stub.decision = 3;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.stage == AI_GW_STAGE_RATELIMIT);
+  assert(deny_stub.calls == 1 && deny_stub.auth_src == AI_GW_AUTH_SRC_BEARER);
+  assert(strcmp(deny_stub.tenant, "tenant-1") == 0);
+  assert(deny_stub.net_identity[0] == '\0');
+
+  /* Refused by the token's own model allowlist: the token validated and
+   * named its tenant, and the refusal's record names it. */
+  reset_stubs();
+  validate_bearer_decision = 2;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.http_status == 403);
+  assert(strcmp(res.error_code, "model_not_allowed") == 0);
+  assert(deny_stub.calls == 1 && deny_stub.auth_src == AI_GW_AUTH_SRC_BEARER);
+  assert(strcmp(deny_stub.tenant, "tenant-1") == 0);
+
+  /* No token: nothing validated, nothing is claimed. */
+  reset_stubs();
+  req.bearer = "";
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.http_status == 401);
+  assert(deny_stub.calls == 1 && deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
+  assert(res.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
+
+  /* An API key is not a bearer token. */
+  reset_stubs();
+  req.bearer = "";
+  req.api_key = "k";
+  req.auth_mode = 1;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(res.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
 }
 
 static void
@@ -1197,6 +1262,9 @@ test_net_row5_strict_binding_holds_the_credential(void)
   assert(ai_gw_admit(&req, &res) == -1);
   assert(strcmp(res.error_code, "network_tenant_mismatch") == 0);
   assert(strcmp(res.user_id, "alice") == 0);
+  /* The token validated before the binding refused it. */
+  assert(deny_stub.auth_src == AI_GW_AUTH_SRC_BEARER);
+  assert(strcmp(deny_stub.net_identity, "line-1") == 0);
 }
 
 /* Row 6: an enforcing service, no credential, and a binding that stands in
@@ -1778,6 +1846,7 @@ int
 main(void)
 {
   test_jwt_arm_forwards_user_and_service();
+  test_bearer_is_named_as_the_source();
   test_apikey_arm_forwards_key_and_service();
   test_keyless_probes_shared_bucket_only_with_ident();
   test_prefix_only_sizes_reservation_from_declared_length();

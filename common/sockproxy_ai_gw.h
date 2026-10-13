@@ -199,12 +199,12 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *                   tells an origin that resolved back to the peer apart from
  *                   a client that connected directly, since both report
  *                   origin_ip == client_ip. 0 when nothing was derived
- *   auth_src:       what decided tenant_id: 0 a credential (or nothing), 1 a
- *                   network-identity binding (AI_GW_AUTH_SRC_* in
- *                   sockproxy_ai_admit.h)
+ *   auth_src:       what decided tenant_id: 0 an API key (or nothing), 1 a
+ *                   network-identity binding, 2 a validated bearer token
+ *                   (AI_GW_AUTH_SRC_* in sockproxy_ai_admit.h)
  *   net_identity:   name of the network-identity binding that matched the
  *                   request's source, "" when none did. Set with auth_src 0
- *                   when a credential decided and the binding was only
+ *                   or 2 when a credential decided and the binding was only
  *                   matched beside it
  *
  * Returns void.

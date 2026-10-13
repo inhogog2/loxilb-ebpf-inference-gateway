@@ -94,9 +94,12 @@ typedef enum {
   AI_GW_STAGE_CAPACITY,        /* service/endpoint capacity, after policy (429/503) */
 } ai_gw_admit_stage_t;
 
-/* How the admitted tenant was decided. */
-#define AI_GW_AUTH_SRC_CREDENTIAL 0   /* an API key or a bearer token */
+/* How the tenant was decided. BEARER is set once a bearer token has
+ * validated, so a refusal made after that names it too; a token that did
+ * not validate decided nothing and leaves CREDENTIAL. */
+#define AI_GW_AUTH_SRC_CREDENTIAL 0   /* an API key, or nothing */
 #define AI_GW_AUTH_SRC_NETWORK    1   /* a network-identity binding of the source */
+#define AI_GW_AUTH_SRC_BEARER     2   /* a validated bearer token */
 
 /* Request view handed to the gate. All pointers are borrowed; strings are
  * NUL-terminated. body may be NULL when the request carried none. */
