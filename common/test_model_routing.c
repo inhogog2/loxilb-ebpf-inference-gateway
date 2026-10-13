@@ -183,6 +183,41 @@ test_listener_without_path_remains_supported(void)
   HASH_DEL(service.val.ephash, &model);
 }
 
+/* The admission gate asks for the default reservation of the rule a request
+ * routes to: the pool this lookup selects, whichever was installed first. */
+static void
+test_default_reservation_is_the_routed_pools(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t first_off, model_on, model_third, wildcard;
+
+  add_pool(&service, &first_off, "inference.example||model-off", 901);
+  add_pool(&service, &model_on, "inference.example||model-on", 902);
+  add_pool(&service, &model_third, "inference.example||model-third", 903);
+  model_on.ai_default_tokens = 800;
+  model_third.ai_default_tokens = 300;
+
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-off") == 0);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-on") == 800);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-third") == 300);
+  /* no pool for the model and no wildcard: no rule, nothing reserved by default */
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-none") == 0);
+  assert(sp_resv_default_tokens_route(&service, "other.example", "/", "model-on") == 0);
+  /* a wildcard pool takes the models that have none of their own */
+  add_pool(&service, &wildcard, "inference.example|/", 904);
+  wildcard.ai_default_tokens = 64;
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-none") == 64);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "") == 64);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-on") == 800);
+  /* no usable Host: dispatch takes the listener's first pool, and so does this */
+  assert(sp_resv_default_tokens_route(&service, NULL, "/", "model-on") == 0);
+  first_off.ai_default_tokens = 5;
+  assert(sp_resv_default_tokens_route(&service, NULL, NULL, NULL) == 5);
+  assert(sp_resv_default_tokens_route(NULL, "inference.example", "/", "model-on") == 0);
+
+  HASH_CLEAR(hh, service.val.ephash);
+}
+
 int
 main(void)
 {
@@ -195,6 +230,7 @@ main(void)
   test_listener_exact_query_and_wrong_path();
   test_listener_wildcard_path_and_host_precedence();
   test_listener_without_path_remains_supported();
+  test_default_reservation_is_the_routed_pools();
   puts("test_model_routing: ALL PASS");
   return 0;
 }

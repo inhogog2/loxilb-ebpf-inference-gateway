@@ -546,8 +546,13 @@ admit_metered(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
      * the quota may shrink but never refuses on. The prompt estimate (and a
      * declared ceiling) stay the firm part, refused when they do not fit. */
     int resv_default = 0;
-    if (resv_max <= 0 && req->default_tokens > 0)
-      resv_default = req->default_tokens;
+    if (resv_max <= 0) {
+      int dflt = req->default_tokens_of
+                   ? req->default_tokens_of(req->default_tokens_arg, model)
+                   : req->default_tokens;
+      if (dflt > 0)
+        resv_default = dflt;
+    }
     if (resv_prompt > 0 || resv_max > 0 || resv_default > 0) {
       ai_gw_decision_t rs_dec = {0};
       int64_t rs_epoch = 0;

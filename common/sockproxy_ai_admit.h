@@ -138,8 +138,17 @@ typedef struct ai_gw_req_ctx {
   /* Default reservation: completion tokens to claim for a request whose
    * body declares no max_tokens, as the rule resolved it (0 = off, the
    * prompt estimate alone is claimed). A declared ceiling is never
-   * replaced, and nothing is written into the forwarded body. */
+   * replaced, and nothing is written into the forwarded body.
+   *
+   * Several rules can share a listener and the request's rule is the one
+   * its model routes to, which the gate itself decides. So the caller hands
+   * a lookup: default_tokens_of(default_tokens_arg, model) is asked once,
+   * at the reservation, with the model the request will be routed by, and
+   * answers that rule's value (0 = off, or no rule). It reads rule
+   * configuration only. With no lookup, default_tokens is the value. */
   int         default_tokens;
+  int       (*default_tokens_of)(void *arg, const char *model);
+  void       *default_tokens_arg;
 
   /* Network identity. netid_bound is the service's switch, from
    * ai_gw_netid_bound(svc_ident): 0 means no binding can match this service

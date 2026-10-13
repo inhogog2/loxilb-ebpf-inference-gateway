@@ -4225,6 +4225,14 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     if (stream->request_id[0] == '\0')
       ai_gw_mint_request_id(stream->request_id, sizeof(stream->request_id));
 
+    /* The default reservation is the routed rule's: the gate asks for it
+     * with the model it resolved, by the host and path the pool lookup
+     * below uses. */
+    sp_resv_route_t adm_route = {
+      .ent = ent,
+      .host = stream->authority,
+      .path = stream->path[0] ? stream->path : "/",
+    };
     ai_gw_req_ctx_t adm_req = {
       .api_key = stream->x_api_key_raw,
       .bearer = stream->bearer_raw,
@@ -4235,7 +4243,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .prefix_model = body_model,
       .hdr_model = stream->x_model_header,
       .auth_mode = ent->val.ephash->apikey_auth,
-      .default_tokens = (int)ent->val.ephash->ai_default_tokens,
+      .default_tokens_of = sp_resv_default_tokens_of,
+      .default_tokens_arg = &adm_route,
       .svc_ident = adm_svc_ident,
       /* A service property; a rule that is not an AI-gateway one has no
        * identity here and so is never bound. */

@@ -347,8 +347,6 @@ typedef struct proxy_fc_svc_stat {
     uint8_t  expose_headers;               /* 1 when admitted responses carry the admission headers */
     uint8_t  src_expose;                   /* source of expose_headers */
     uint32_t tenant_slots;                 /* tenants the pool tracks by name: the table size in force */
-    uint32_t listener_default_tokens;      /* default reservation the admission gate runs this VIP:port on:
-                                            * the first pool's, whatever this pool's own rule declares (0 = off) */
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
@@ -370,8 +368,6 @@ _Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 338, "warming_eps o
 _Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 344, "adapt_down offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, tenants_active) == 360, "tenants_active offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, tenant_slots) == 368, "tenant_slots offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, listener_default_tokens) == 372,
-               "listener_default_tokens offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every

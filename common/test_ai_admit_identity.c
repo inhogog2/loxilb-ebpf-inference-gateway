@@ -578,6 +578,77 @@ test_default_reservation_leaves_a_declared_ceiling_alone(void)
   assert(res.reservation_clamped == 0);
 }
 
+/* The rule a request routes to is the one whose default counts, and the
+ * gate is what decides the model it routes by: the caller's lookup is asked
+ * once, at the reservation, with that model. */
+static struct {
+  int   calls;
+  char  model[128];
+  void *arg;
+  int   answer;
+} dt_stub;
+
+static int
+dt_lookup(void *arg, const char *model)
+{
+  dt_stub.calls++;
+  dt_stub.arg = arg;
+  snprintf(dt_stub.model, sizeof(dt_stub.model), "%s", model);
+  return dt_stub.answer;
+}
+
+static void
+test_default_reservation_is_the_routed_rules(void)
+{
+  ai_gw_req_ctx_t req = default_resv_req(64);   /* the plain value: not used */
+  ai_gw_admit_result_t res;
+  int cookie;
+
+  req.default_tokens_of = dt_lookup;
+  req.default_tokens_arg = &cookie;
+
+  /* asked with the model the gate resolved (the body's), and its answer is
+   * what the quota is asked for */
+  reset_stubs();
+  memset(&dt_stub, 0, sizeof(dt_stub));
+  dt_stub.answer = 300;
+  max_tokens_stub = 0;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(dt_stub.calls == 1 && dt_stub.arg == &cookie);
+  assert(strcmp(dt_stub.model, "m1") == 0);
+  assert(strcmp(dt_stub.model, res.effective_model) == 0);
+  assert(rs_stub.default_tokens == 300);
+  assert(res.reserved_toks == 307);
+
+  /* the routed rule has it off: nothing stands in, whatever the plain
+   * value says */
+  reset_stubs();
+  memset(&dt_stub, 0, sizeof(dt_stub));
+  max_tokens_stub = 0;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(dt_stub.calls == 1);
+  assert(rs_stub.default_tokens == 0 && res.reserved_toks == 7);
+
+  /* a declared ceiling: the rule is not asked at all */
+  reset_stubs();
+  memset(&dt_stub, 0, sizeof(dt_stub));
+  dt_stub.answer = 300;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(dt_stub.calls == 0);
+  assert(rs_stub.max_tokens == 32 && rs_stub.default_tokens == 0);
+
+  /* a request refused before the reservation never asks */
+  reset_stubs();
+  memset(&dt_stub, 0, sizeof(dt_stub));
+  dt_stub.answer = 300;
+  max_tokens_stub = 0;
+  rl_stub.rc = 1;
+  assert(ai_gw_admit(&req, &res) != 0);
+  assert(res.verdict == AI_GW_ADMIT_DENY && res.stage == AI_GW_STAGE_RATELIMIT);
+  assert(dt_stub.calls == 0);
+}
+
 /* The quota shrank the default: the request is admitted all the same, the
  * granted total rides to settlement (not the asked one), and the result
  * says the claim was clamped. Shrunk to nothing is still an admission, on
@@ -1967,6 +2038,7 @@ main(void)
   test_default_reservation_off_claims_the_prompt_alone();
   test_default_reservation_stands_in_for_an_absent_ceiling();
   test_default_reservation_leaves_a_declared_ceiling_alone();
+  test_default_reservation_is_the_routed_rules();
   test_clamped_default_is_admitted_with_what_was_granted();
   test_reserve_refusal_reports_the_firm_claim();
   test_default_reservation_covers_a_streamed_body();

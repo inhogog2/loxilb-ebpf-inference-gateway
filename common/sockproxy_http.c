@@ -4855,7 +4855,6 @@ proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
       strncpy(st->pool, tepval->ephash_key, sizeof(st->pool) - 1);
       st->pool[sizeof(st->pool) - 1] = '\0';
       sp_fc_fill_queue_stat(fc, st);
-      st->listener_default_tokens = ent->val.ephash->ai_default_tokens;
       n++;
     }
   }
@@ -4913,9 +4912,6 @@ proxy_get_fc_state(struct proxy_ent *key, const char *host_url,
       strncpy(out->pool, tepval->ephash_key, sizeof(out->pool) - 1);
       out->pool[sizeof(out->pool) - 1] = '\0';
       sp_fc_fill_queue_stat(fc, out);
-      /* The gate reads the default reservation from the listener's first
-       * pool, before a pool is routed to: report that one, not this pool's. */
-      out->listener_default_tokens = ent->val.ephash->ai_default_tokens;
       rc = 0;
     }
     break;
@@ -9333,12 +9329,33 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
  *
  * All three H1 gate sites build their view here, so the refusal record
  * carries the same attribution from each of them. */
+int
+sp_resv_default_tokens_of(void *arg, const char *model)
+{
+  sp_resv_route_t *r = arg;
+  char host_only[256];
+
+  if (!r || !r->ent)
+    return 0;
+  if (!r->host)
+    return sp_resv_default_tokens_route(r->ent, NULL, r->path, model);
+  strip_port_from_hostname(r->host, host_only, sizeof(host_only));
+  return sp_resv_default_tokens_route(r->ent, host_only, r->path, model);
+}
+
 static void
 sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
                              const proxy_map_ent_t *hent,
-                             ai_gw_req_ctx_t *req)
+                             ai_gw_req_ctx_t *req, sp_resv_route_t *route)
 {
   memset(req, 0, sizeof(*req));
+  /* The default reservation is the routed rule's: the same host and path
+   * dispatch will look the pool up by, and the model the gate resolves. */
+  route->ent = (proxy_map_ent_t *)hent;
+  route->host = pfe->http_hvok ? pfe->host_url : NULL;
+  route->path = pfe->http_path_ok ? pfe->request_path : "/";
+  req->default_tokens_of = sp_resv_default_tokens_of;
+  req->default_tokens_arg = route;
   req->api_key = pfe->x_api_key_raw;
   req->bearer = pfe->bearer_raw;
   req->bearer_oversize = pfe->bearer_oversize;
@@ -9346,7 +9363,6 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->prefix_model = pfe->prefix_key.model;
   req->hdr_model = pfe->x_model_header;
   req->auth_mode = hent->val.ephash->apikey_auth;
-  req->default_tokens = (int)hent->val.ephash->ai_default_tokens;
   /* The gate runs before the header splice, so a refused request normally
    * has no derived origin and proxy_origin_ip returns "" — which says "not
    * derived" and must not be read as the peer. The peer is known from
@@ -9389,12 +9405,13 @@ sp_h1_pre_dispatch_admit(int fd, proxy_fd_ent_t *pfe)
 {
   proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
   ai_gw_req_ctx_t req;
+  sp_resv_route_t route;
 
   if (pfe->odir != 0 || !hent || !hent->val.ephash ||
       !hent->val.ephash->ai_gw_mode)
     return 0;
 
-  sp_h1_admit_req_from_headers(pfe, hent, &req);
+  sp_h1_admit_req_from_headers(pfe, hent, &req, &route);
   req.prefix_only = 1;
   if (pfe->json_stream_route_pending) {
     const uint8_t *route_body = NULL;
@@ -9434,9 +9451,10 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
   if (pfe->odir == 0 && hent && hent->val.ephash &&
       hent->val.ephash->ai_gw_mode && sp_h1_rule_enforces(hent)) {
     ai_gw_req_ctx_t req;
+    sp_resv_route_t route;
     char msg[128];
 
-    sp_h1_admit_req_from_headers(pfe, hent, &req);
+    sp_h1_admit_req_from_headers(pfe, hent, &req, &route);
     req.prefix_only = 1;          /* no body, no length: nothing is reserved */
     req.prefix_model = "";
     if (sp_h1_admit_apply(pfe, hent, &req, "streamed") != 0)
@@ -9668,7 +9686,8 @@ handle_on_message_complete(llhttp_t* parser)
        * dispatch site so a body this parser never completes is gated by
        * the same code. */
       ai_gw_req_ctx_t adm_req;
-      sp_h1_admit_req_from_headers(pfe, hent, &adm_req);
+      sp_resv_route_t adm_route;
+      sp_h1_admit_req_from_headers(pfe, hent, &adm_req, &adm_route);
       adm_req.body = gate_body;
       adm_req.body_len = gate_body_len;
       if (sp_h1_admit_apply(pfe, hent, &adm_req, "complete") != 0) {
