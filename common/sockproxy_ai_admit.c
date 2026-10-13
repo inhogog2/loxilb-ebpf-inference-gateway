@@ -181,19 +181,35 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
 
 /* ---- services with a network-identity binding ---------------------------
  *
- * A sorted array of service-identity hashes behind a sequence counter: the
- * control plane replaces it whole, the request path searches it without a
- * lock and retries when a replacement ran underneath. A hash collision can
- * only report a service bound that is not, which costs that service one
- * resolver call per request and decides nothing. */
+ * Two open-addressing tables of service-identity hashes and one state word.
+ * The control plane fills the table requests are not reading and then swaps
+ * the state word, which names the table, the mode and a generation. A
+ * request probes the table its state word names, at a load of a quarter or
+ * less, and reads the word again: a different word means a replacement ran
+ * underneath, and it reads once more from the new one. It never waits for a
+ * writer. A slot holds a hash with its two low bits replaced: bit 0 marks
+ * the slot taken, bit 1 is the service's fail-closed flag. Two services whose
+ * hashes agree above those bits share a slot and its flag; that costs one of
+ * them a resolver call it did not need, and decides nothing. */
 
 enum { NETID_NONE = 0, NETID_LISTED = 1, NETID_ALL = 2 };
 
-static _Atomic uint32_t netid_mode;      /* NETID_*; NONE is the one load a
+#define NETID_TBL_SLOTS  (AI_GW_NETID_SVC_MAX * 4)   /* a power of two */
+#define NETID_TBL_MASK   (NETID_TBL_SLOTS - 1)
+_Static_assert((NETID_TBL_SLOTS & NETID_TBL_MASK) == 0, "table size");
+
+#define NETID_ST_MODE        0x3u    /* NETID_* */
+#define NETID_ST_ALL_CLOSED  0x4u    /* every service fails closed */
+#define NETID_ST_ANY_CLOSED  0x8u    /* some slot carries the flag */
+#define NETID_ST_TBL         0x10u   /* which table is published */
+#define NETID_ST_GEN         0x20u   /* generation, one step */
+
+#define NETID_SLOT_USED      0x1ull
+#define NETID_SLOT_CLOSED    0x2ull
+
+static _Atomic uint32_t netid_state;     /* NETID_NONE is the one load a
                                           * request pays with no binding */
-static _Atomic uint32_t netid_seq;       /* odd while a writer is inside */
-static _Atomic uint32_t netid_n;
-static _Atomic uint64_t netid_svc[AI_GW_NETID_SVC_MAX];
+static _Atomic uint64_t netid_tbl[2][NETID_TBL_SLOTS];
 static pthread_mutex_t netid_wlock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t
@@ -207,80 +223,115 @@ netid_hash(const char *s)
   return h;
 }
 
-static int
-netid_hash_cmp(const void *a, const void *b)
+static inline uint32_t
+netid_slot0(uint64_t h)
 {
-  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
-  return x < y ? -1 : x > y;
+  return (uint32_t)((h >> 2) ^ (h >> 33)) & NETID_TBL_MASK;
 }
 
 void
-ai_gw_netid_bound_set(const char *const *svc_idents, int n, int all)
+ai_gw_netid_bound_set(const char *const *svc_idents, const uint8_t *flags,
+                      int n, int all)
 {
-  static uint64_t sorted[AI_GW_NETID_SVC_MAX];   /* under netid_wlock */
   uint32_t cnt = 0;
-  uint32_t mode;
+  uint32_t st, next;
+  _Atomic uint64_t *tbl;
 
   pthread_mutex_lock(&netid_wlock);
+  st = atomic_load(&netid_state);
+  next = (st & NETID_ST_TBL) ^ NETID_ST_TBL;
+  tbl = netid_tbl[next ? 1 : 0];
+
+  for (uint32_t i = 0; i < NETID_TBL_SLOTS; i++)
+    atomic_store_explicit(&tbl[i], 0, memory_order_relaxed);
+
   for (int i = 0; svc_idents && i < n; i++) {
     if (!svc_idents[i] || !svc_idents[i][0])
       continue;
-    if (cnt == AI_GW_NETID_SVC_MAX) {
-      all = 1;            /* more than the set holds: never miss one */
-      break;
-    }
-    sorted[cnt++] = netid_hash(svc_idents[i]);
-  }
-  qsort(sorted, cnt, sizeof(sorted[0]), netid_hash_cmp);
-  mode = all ? NETID_ALL : (cnt ? NETID_LISTED : NETID_NONE);
+    int closed = flags && (flags[i] & AI_GW_NETID_FAIL_CLOSED);
+    uint64_t want = (netid_hash(svc_idents[i]) & ~3ull) | NETID_SLOT_USED;
+    uint32_t at = netid_slot0(want);
+    uint64_t v;
 
-  atomic_fetch_add(&netid_seq, 1);
-  for (uint32_t i = 0; i < cnt; i++)
-    atomic_store_explicit(&netid_svc[i], sorted[i], memory_order_relaxed);
-  atomic_store(&netid_n, cnt);
-  atomic_store(&netid_mode, mode);
-  atomic_fetch_add(&netid_seq, 1);
+    while ((v = atomic_load_explicit(&tbl[at], memory_order_relaxed)) != 0 &&
+           (v & ~NETID_SLOT_CLOSED) != want)
+      at = (at + 1) & NETID_TBL_MASK;
+    if (v == 0) {
+      if (cnt == AI_GW_NETID_SVC_MAX) {
+        /* More than the set holds: never miss one, and never run one that
+         * asked to fail closed as if it had not. */
+        all |= AI_GW_NETID_BOUND;
+        if (closed)
+          all |= AI_GW_NETID_FAIL_CLOSED;
+        continue;
+      }
+      cnt++;
+      v = want;
+    }
+    if (closed) {
+      v |= NETID_SLOT_CLOSED;
+      next |= NETID_ST_ANY_CLOSED;
+    }
+    atomic_store_explicit(&tbl[at], v, memory_order_relaxed);
+  }
+
+  if (all & AI_GW_NETID_BOUND) {
+    next |= NETID_ALL;
+    if (all & AI_GW_NETID_FAIL_CLOSED)
+      next |= NETID_ST_ALL_CLOSED;
+  } else if (cnt) {
+    next |= NETID_LISTED;
+  }
+  next |= (st & ~(NETID_ST_GEN - 1)) + NETID_ST_GEN;
+  atomic_store(&netid_state, next);
   pthread_mutex_unlock(&netid_wlock);
 }
 
 int
 ai_gw_netid_bound(const char *svc_ident)
 {
-  uint32_t mode = atomic_load_explicit(&netid_mode, memory_order_relaxed);
+  uint32_t st = atomic_load_explicit(&netid_state, memory_order_relaxed);
 
-  if (mode == NETID_NONE || !svc_ident || !svc_ident[0])
+  if ((st & NETID_ST_MODE) == NETID_NONE || !svc_ident || !svc_ident[0])
     return 0;
-  if (mode == NETID_ALL)
-    return 1;
 
-  uint64_t want = netid_hash(svc_ident);
+  uint64_t want = (netid_hash(svc_ident) & ~3ull) | NETID_SLOT_USED;
   for (;;) {
-    uint32_t s1 = atomic_load(&netid_seq);
-    int found = 0;
+    uint32_t mode = st & NETID_ST_MODE;
+    int ret = 0;
 
-    if (s1 & 1)
-      continue;           /* a replacement is being written */
-    mode = atomic_load(&netid_mode);
-    uint32_t lo = 0, hi = atomic_load(&netid_n);
-    if (hi > AI_GW_NETID_SVC_MAX)
-      hi = AI_GW_NETID_SVC_MAX;
-    while (lo < hi) {
-      uint32_t mid = lo + (hi - lo) / 2;
-      uint64_t v = atomic_load_explicit(&netid_svc[mid], memory_order_relaxed);
-      if (v == want) {
-        found = 1;
+    if (mode == NETID_NONE)
+      return 0;
+    if (mode == NETID_ALL) {
+      ret = AI_GW_NETID_BOUND;
+      if (st & NETID_ST_ALL_CLOSED)
+        return ret | AI_GW_NETID_FAIL_CLOSED;
+      if (!(st & NETID_ST_ANY_CLOSED))
+        return ret;
+    }
+
+    const _Atomic uint64_t *tbl = netid_tbl[(st & NETID_ST_TBL) ? 1 : 0];
+    uint32_t at = netid_slot0(want);
+    /* The table is never more than a quarter full, so a probe ends on an
+     * empty slot; the bound only holds a read of a table that is being
+     * refilled underneath, which the check below discards. */
+    for (uint32_t i = 0; i < NETID_TBL_SLOTS; i++) {
+      uint64_t v = atomic_load_explicit(&tbl[at], memory_order_relaxed);
+      if (v == 0)
+        break;
+      if ((v & ~NETID_SLOT_CLOSED) == want) {
+        ret |= AI_GW_NETID_BOUND;
+        if (v & NETID_SLOT_CLOSED)
+          ret |= AI_GW_NETID_FAIL_CLOSED;
         break;
       }
-      if (v < want)
-        lo = mid + 1;
-      else
-        hi = mid;
+      at = (at + 1) & NETID_TBL_MASK;
     }
-    if (atomic_load(&netid_seq) != s1)
-      continue;           /* replaced underneath: read again */
-    if (mode == NETID_ALL)
-      return 1;
-    return mode == NETID_LISTED && found;
+
+    uint32_t now = atomic_load(&netid_state);
+    if (now == st)
+      return ret;
+    st = now;             /* replaced underneath: read the new one */
   }
 }
 
@@ -310,9 +361,9 @@ admit_keyless(ai_gw_admit_result_t *res, const char *svc_ident)
 }
 
 /* Ask the resolver for the binding of this request's source. Returns 1 with
- * *nid filled when one matches, 0 otherwise. Everything that is not a clean
- * match is "no binding": a resolver that could not answer, and a match that
- * names no tenant, must never admit anything. */
+ * *nid filled when one matches, 0 when none does, and -1 when the resolver
+ * could not answer, which includes a match that names no tenant. Nothing but
+ * a clean match ever admits anything. */
 static int
 netid_lookup(const ai_gw_req_ctx_t *req, const char *svc_ident,
              const char *model, ai_gw_netid_t *nid)
@@ -320,7 +371,11 @@ netid_lookup(const ai_gw_req_ctx_t *req, const char *svc_ident,
   memset(nid, 0, sizeof(*nid));
   if (llb_ai_netid_resolve((char *)(req->client_ip ? req->client_ip : ""),
                            req->in_ifindex, (char *)svc_ident,
-                           (char *)model, nid) != 0 || !nid->matched) {
+                           (char *)model, nid) != 0) {
+    memset(nid, 0, sizeof(*nid));
+    return -1;
+  }
+  if (!nid->matched) {
     memset(nid, 0, sizeof(*nid));
     return 0;
   }
@@ -328,9 +383,29 @@ netid_lookup(const ai_gw_req_ctx_t *req, const char *svc_ident,
   nid->binding[sizeof(nid->binding) - 1] = '\0';
   if (nid->tenant_id[0] == '\0') {
     memset(nid, 0, sizeof(*nid));
-    return 0;
+    return -1;
   }
   return 1;
+}
+
+/* The gate's question: 1 a binding matches, 0 none does, -1 the request is
+ * refused (res is set). A resolver that cannot answer is "no binding" - it
+ * never admits by network and never refuses a valid credential - unless the
+ * service asked to fail closed, where every request the resolver would have
+ * decided is refused until it answers again. */
+static int
+netid_ask(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
+          const char *svc_ident, const char *model, ai_gw_netid_t *nid)
+{
+  int rc = netid_lookup(req, svc_ident, model, nid);
+
+  if (rc >= 0)
+    return rc;
+  if (!(req->netid_bound & AI_GW_NETID_FAIL_CLOSED))
+    return 0;
+  set_deny(res, AI_GW_STAGE_AUTH, 503, 5, 0, "netid_unavailable",
+           "Network identity cannot be resolved; request refused");
+  return -1;
 }
 
 /* The identity a request is metered as, however it was decided. */
@@ -511,7 +586,7 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 
   /* A binding is looked for only on a service that has one, and a service
    * is known by its identity. */
-  int netid = req->netid_bound && svc_ident[0];
+  int netid = (req->netid_bound & AI_GW_NETID_BOUND) && svc_ident[0];
 
   if (!enforcing && !netid)
     return admit_keyless(res, svc_ident);
@@ -537,7 +612,10 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
     /* Rows 1 and 2. A source with a binding is that binding's tenant; any
      * other source is the keyless traffic it was before the service had
      * bindings, decided by the same code with the same result. */
-    if (netid_lookup(req, svc_ident, model, &nid)) {
+    nid_match = netid_ask(req, res, svc_ident, model, &nid);
+    if (nid_match < 0)
+      return -1;
+    if (nid_match) {
       snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
       return admit_network(req, res, svc_ident, model, body_bound, hdr_model,
                            &nid);
@@ -592,7 +670,9 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   if (netid && api_key[0] == '\0' && bearer[0] == '\0' &&
       !req->bearer_oversize) {
     nid_asked = 1;
-    nid_match = netid_lookup(req, svc_ident, model, &nid);
+    nid_match = netid_ask(req, res, svc_ident, model, &nid);
+    if (nid_match < 0)
+      return -1;
     if (nid_match && nid.credential_network)
       return admit_network(req, res, svc_ident, model, body_bound, hdr_model,
                            &nid);
@@ -646,7 +726,15 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * the credential's own, which its validator has just checked. */
   if (netid) {
     if (!nid_asked)
-      nid_match = netid_lookup(req, svc_ident, model, &nid);
+      nid_match = netid_ask(req, res, svc_ident, model, &nid);
+    if (nid_match < 0) {
+      /* The credential validated and named its tenant: the refusal is
+       * attributable to it, as the mismatch below is. */
+      snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
+      snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
+      snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
+      return -1;
+    }
     if (nid_match) {
       snprintf(res->net_identity, sizeof(res->net_identity), "%s", nid.binding);
       res->net_forward_identity = nid.forward_identity ? 1 : 0;

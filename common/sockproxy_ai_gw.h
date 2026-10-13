@@ -428,7 +428,8 @@ typedef struct ai_gw_netid {
  * Returns:
  *    0  answered; out->matched says whether a binding matches
  *   -1  the resolver could not answer (no snapshot, internal error). The
- *       gate reads this as "no binding": it never admits on a failure.
+ *       gate reads this as "no binding": it never admits on a failure. A
+ *       service that asked to fail closed refuses the request instead (503).
  */
 extern int llb_ai_netid_resolve(char *client_ip, int in_ifindex,
                                 char *svc_ident, char *model,

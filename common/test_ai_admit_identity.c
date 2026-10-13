@@ -1410,6 +1410,97 @@ test_net_resolver_failure_is_no_binding(void)
   assert(strlen(res.net_identity) == sizeof(res.net_identity) - 1);
 }
 
+/* A service that asked to fail closed refuses, with 503, every request the
+ * resolver would have decided while it cannot answer. Nothing else moves:
+ * an answer, match or not, is decided as on any other service, and a
+ * credential's own refusal still comes first. */
+static void
+test_net_resolver_failure_fails_closed_where_asked(void)
+{
+  ai_gw_req_ctx_t req = {
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .svc_ident = NET_SVC,
+    .client_ip = NET_SRC,
+    .netid_bound = AI_GW_NETID_BOUND | AI_GW_NETID_FAIL_CLOSED,
+  };
+  ai_gw_admit_result_t res;
+
+  for (int shape = 0; shape < 2; shape++) {
+    /* 0: the call fails; 1: a match that names no tenant. */
+    for (int mode = 0; mode <= 1; mode++) {
+      /* No credential: a non-enforcing service, then an enforcing one. */
+      req.auth_mode = mode;
+      req.api_key = "";
+      reset_stubs();
+      nid_bind("line-1-tenant", 1, 1);
+      if (shape == 0)
+        nid_stub.rc = -1;
+      else
+        nid_stub.out.tenant_id[0] = '\0';
+      assert(ai_gw_admit(&req, &res) == -1);
+      assert(res.verdict == AI_GW_ADMIT_DENY && res.stage == AI_GW_STAGE_AUTH);
+      assert(res.http_status == 503 && res.retry_after == 5);
+      assert(strcmp(res.error_code, "netid_unavailable") == 0);
+      assert(res.tenant_id[0] == '\0' && res.net_identity[0] == '\0');
+      assert(res.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
+      assert(nid_stub.calls == 1 && validate_key_calls == 0);
+      assert(rl_stub.calls == 0 && rs_stub.calls == 0);
+      assert(deny_stub.calls == 1 && deny_stub.http_status == 503);
+      assert(strcmp(deny_stub.error_code, "netid_unavailable") == 0);
+    }
+
+    /* A valid key: refused as well, and the refusal names the key's
+     * tenant. The resolver is asked once. */
+    req.auth_mode = 1;
+    req.api_key = "sk-abc";
+    reset_stubs();
+    nid_bind("tenant-1", 1, 0);
+    if (shape == 0)
+      nid_stub.rc = -1;
+    else
+      nid_stub.out.tenant_id[0] = '\0';
+    assert(ai_gw_admit(&req, &res) == -1);
+    assert(res.http_status == 503);
+    assert(strcmp(res.error_code, "netid_unavailable") == 0);
+    assert(strcmp(res.tenant_id, "tenant-1") == 0);
+    assert(nid_stub.calls == 1);
+    assert(rl_stub.calls == 0 && rs_stub.calls == 0);
+
+    /* An invalid key is refused by its validator first, as on any service:
+     * the resolver is not reached. */
+    reset_stubs();
+    validate_key_decision = 1;
+    nid_stub.rc = -1;
+    assert(ai_gw_admit(&req, &res) == -1);
+    assert(res.http_status == 401);
+    assert(nid_stub.calls == 0);
+  }
+
+  /* The resolver answers: no binding is no binding, and a binding is a
+   * binding. The flag changes neither. */
+  req.auth_mode = 0;
+  req.api_key = "";
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_UNMETERED);
+  req.auth_mode = 1;
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.http_status == 401);
+  req.api_key = "sk-abc";
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW && res.net_identity[0] == '\0');
+  req.auth_mode = 0;
+  req.api_key = "";
+  reset_stubs();
+  nid_bind("line-1-tenant", 0, 0);
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(strcmp(res.tenant_id, "line-1-tenant") == 0);
+}
+
 /* A streamed body: the gate has only the prefix, and the network path
  * sizes its claim from the declared length as the credential path does. */
 static void
@@ -1449,7 +1540,7 @@ test_netid_bound_set(void)
   assert(ai_gw_netid_bound("10.0.0.1:2040") == 0);
   assert(ai_gw_netid_bound("") == 0 && ai_gw_netid_bound(NULL) == 0);
 
-  ai_gw_netid_bound_set(two, 2, 0);
+  ai_gw_netid_bound_set(two, NULL, 2, 0);
   assert(ai_gw_netid_bound("10.0.0.1:2040") == 1);
   assert(ai_gw_netid_bound("10.0.0.2:8080") == 1);
   assert(ai_gw_netid_bound("10.0.0.1:2041") == 0);
@@ -1457,18 +1548,18 @@ test_netid_bound_set(void)
   assert(ai_gw_netid_bound("") == 0);
 
   /* A replacement is the whole set, not an addition. */
-  ai_gw_netid_bound_set(two + 1, 1, 0);
+  ai_gw_netid_bound_set(two + 1, NULL, 1, 0);
   assert(ai_gw_netid_bound("10.0.0.1:2040") == 0);
   assert(ai_gw_netid_bound("10.0.0.2:8080") == 1);
 
   /* Empty names are skipped. */
-  ai_gw_netid_bound_set(junk, 3, 0);
+  ai_gw_netid_bound_set(junk, NULL, 3, 0);
   assert(ai_gw_netid_bound("10.0.0.3:1") == 1);
   assert(ai_gw_netid_bound("10.0.0.2:8080") == 0);
 
   /* A binding that names no service binds every service that has an
    * identity. */
-  ai_gw_netid_bound_set(NULL, 0, 1);
+  ai_gw_netid_bound_set(NULL, NULL, 0, 1);
   assert(ai_gw_netid_bound("192.0.2.9:1") == 1);
   assert(ai_gw_netid_bound("") == 0);
 
@@ -1478,20 +1569,89 @@ test_netid_bound_set(void)
              1000 + i);
     ptrs[i] = names[i];
   }
-  ai_gw_netid_bound_set(ptrs, AI_GW_NETID_SVC_MAX, 0);
+  ai_gw_netid_bound_set(ptrs, NULL, AI_GW_NETID_SVC_MAX, 0);
   for (int i = 0; i < AI_GW_NETID_SVC_MAX; i++)
     assert(ai_gw_netid_bound(names[i]) == 1);
   assert(ai_gw_netid_bound(names[AI_GW_NETID_SVC_MAX]) == 0);
 
   /* One more than it holds: no service may be missed, so all are bound. */
-  ai_gw_netid_bound_set(ptrs, AI_GW_NETID_SVC_MAX + 1, 0);
+  ai_gw_netid_bound_set(ptrs, NULL, AI_GW_NETID_SVC_MAX + 1, 0);
   assert(ai_gw_netid_bound(names[AI_GW_NETID_SVC_MAX]) == 1);
   assert(ai_gw_netid_bound("192.0.2.9:1") == 1);
 
   /* And back to nothing. */
-  ai_gw_netid_bound_set(NULL, 0, 0);
+  ai_gw_netid_bound_set(NULL, NULL, 0, 0);
   assert(ai_gw_netid_bound("10.0.0.1:2040") == 0);
   assert(ai_gw_netid_bound(names[0]) == 0);
+}
+
+/* A service can ask to fail closed: the flag travels with its entry. */
+static void
+test_netid_bound_set_carries_fail_closed(void)
+{
+  static char names[AI_GW_NETID_SVC_MAX + 2][24];
+  static const char *ptrs[AI_GW_NETID_SVC_MAX + 2];
+  static uint8_t fl[AI_GW_NETID_SVC_MAX + 2];
+  const char *three[] = { "10.0.0.1:2040", "10.0.0.2:8080", "10.0.0.2:8080" };
+  const uint8_t one_closed[] = { AI_GW_NETID_FAIL_CLOSED, 0, 0 };
+  const uint8_t dup_closed[] = { 0, 0, AI_GW_NETID_FAIL_CLOSED };
+  const int both = AI_GW_NETID_BOUND | AI_GW_NETID_FAIL_CLOSED;
+
+  ai_gw_netid_bound_set(three, one_closed, 2, 0);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == both);
+  assert(ai_gw_netid_bound("10.0.0.2:8080") == AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound("10.0.0.3:1") == 0);
+
+  /* A service named twice fails closed when either entry asks. */
+  ai_gw_netid_bound_set(three, dup_closed, 3, 0);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound("10.0.0.2:8080") == both);
+
+  /* The next set carries no flag: none is left behind, in either table. */
+  ai_gw_netid_bound_set(three, NULL, 2, 0);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound("10.0.0.2:8080") == AI_GW_NETID_BOUND);
+  ai_gw_netid_bound_set(three, NULL, 2, 0);
+  assert(ai_gw_netid_bound("10.0.0.2:8080") == AI_GW_NETID_BOUND);
+
+  /* Every service bound, one of them closed: that one only. */
+  ai_gw_netid_bound_set(three, one_closed, 2, AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound("10.0.0.1:2040") == both);
+  assert(ai_gw_netid_bound("10.0.0.2:8080") == AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == AI_GW_NETID_BOUND);
+
+  /* Every service bound and closed. */
+  ai_gw_netid_bound_set(NULL, NULL, 0, both);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == both);
+  assert(ai_gw_netid_bound("") == 0);
+
+  /* The closed flag alone binds nothing. */
+  ai_gw_netid_bound_set(NULL, NULL, 0, AI_GW_NETID_FAIL_CLOSED);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == 0);
+
+  /* Past capacity. The services that fit keep their own flag; one that did
+   * not fit and is open leaves the others open ... */
+  for (int i = 0; i < AI_GW_NETID_SVC_MAX + 2; i++) {
+    snprintf(names[i], sizeof(names[i]), "10.%d.%d.1:%d", i / 256, i % 256,
+             1000 + i);
+    ptrs[i] = names[i];
+    fl[i] = 0;
+  }
+  fl[5] = AI_GW_NETID_FAIL_CLOSED;
+  ai_gw_netid_bound_set(ptrs, fl, AI_GW_NETID_SVC_MAX + 1, 0);
+  assert(ai_gw_netid_bound(names[5]) == both);
+  assert(ai_gw_netid_bound(names[6]) == AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound(names[AI_GW_NETID_SVC_MAX]) == AI_GW_NETID_BOUND);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == AI_GW_NETID_BOUND);
+  /* ... and one that did not fit and is closed closes every service: it
+   * cannot be told from the others any more. */
+  fl[AI_GW_NETID_SVC_MAX + 1] = AI_GW_NETID_FAIL_CLOSED;
+  ai_gw_netid_bound_set(ptrs, fl, AI_GW_NETID_SVC_MAX + 2, 0);
+  assert(ai_gw_netid_bound(names[6]) == both);
+  assert(ai_gw_netid_bound("192.0.2.9:1") == both);
+
+  ai_gw_netid_bound_set(NULL, NULL, 0, 0);
+  assert(ai_gw_netid_bound(names[5]) == 0);
 }
 
 /* The set is replaced whole while requests read it. A service in every
@@ -1515,11 +1675,16 @@ netid_race_writer(void *arg)
     snprintf(b[i], sizeof(b[i]), "10.2.%d.1:%d", i, 3000 + i);
     pb[i] = b[i];
   }
+  static uint8_t fa[AI_GW_NETID_SVC_MAX / 2], fb[8];
   pa[17] = "192.0.2.1:443";
   pb[3] = "192.0.2.1:443";
+  pa[400] = "192.0.2.2:443";
+  pb[6] = "192.0.2.2:443";
+  fa[400] = AI_GW_NETID_FAIL_CLOSED;
+  fb[6] = AI_GW_NETID_FAIL_CLOSED;
   for (int n = 0; n < 20000; n++) {
-    ai_gw_netid_bound_set(pa, AI_GW_NETID_SVC_MAX / 2, 0);
-    ai_gw_netid_bound_set(pb, 8, 0);
+    ai_gw_netid_bound_set(pa, fa, AI_GW_NETID_SVC_MAX / 2, 0);
+    ai_gw_netid_bound_set(pb, fb, 8, 0);
   }
   atomic_store(&netid_race_stop, 1);
   return NULL;
@@ -1531,7 +1696,9 @@ netid_race_reader(void *arg)
   long reads = 0;
   (void)arg;
   while (!atomic_load(&netid_race_stop)) {
-    assert(ai_gw_netid_bound("192.0.2.1:443") == 1);
+    assert(ai_gw_netid_bound("192.0.2.1:443") == AI_GW_NETID_BOUND);
+    assert(ai_gw_netid_bound("192.0.2.2:443") ==
+           (AI_GW_NETID_BOUND | AI_GW_NETID_FAIL_CLOSED));
     assert(ai_gw_netid_bound("198.51.100.1:1") == 0);
     reads++;
   }
@@ -1541,11 +1708,12 @@ netid_race_reader(void *arg)
 static void
 test_netid_bound_set_is_replaced_under_readers(void)
 {
-  const char *first[] = { "192.0.2.1:443" };
+  const char *first[] = { "192.0.2.1:443", "192.0.2.2:443" };
+  const uint8_t first_fl[] = { 0, AI_GW_NETID_FAIL_CLOSED };
   pthread_t w, r[3];
   void *reads;
 
-  ai_gw_netid_bound_set(first, 1, 0);
+  ai_gw_netid_bound_set(first, first_fl, 2, 0);
   atomic_store(&netid_race_stop, 0);
   for (int i = 0; i < 3; i++)
     assert(pthread_create(&r[i], NULL, netid_race_reader, NULL) == 0);
@@ -1555,7 +1723,7 @@ test_netid_bound_set_is_replaced_under_readers(void)
     pthread_join(r[i], &reads);
     assert((long)reads > 0);
   }
-  ai_gw_netid_bound_set(NULL, 0, 0);
+  ai_gw_netid_bound_set(NULL, NULL, 0, 0);
   assert(ai_gw_netid_bound("192.0.2.1:443") == 0);
 }
 
@@ -1591,8 +1759,10 @@ main(void)
   test_net_row7_no_credential_otherwise_is_401();
   test_net_presented_credential_never_falls_back();
   test_net_resolver_failure_is_no_binding();
+  test_net_resolver_failure_fails_closed_where_asked();
   test_net_streamed_body_is_gated_on_the_prefix();
   test_netid_bound_set();
+  test_netid_bound_set_carries_fail_closed();
   test_netid_bound_set_is_replaced_under_readers();
   puts("PASS: network identity: one case per decision-table row, the conflict "
        "rule on the network path, a presented credential never falls back, "

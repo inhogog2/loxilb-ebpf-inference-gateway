@@ -69,7 +69,11 @@
  * order: model conflict (400), the binding's model allowlist (403), rate
  * and quota (429), reservation (429). A request that presents a credential
  * is always decided by that credential: a refused credential never falls
- * back to the binding. A resolver that cannot answer is "no binding".
+ * back to the binding. A resolver that cannot answer is "no binding" - it
+ * never admits by network and never refuses a valid credential - except on a
+ * service that asked to fail closed (AI_GW_NETID_FAIL_CLOSED), where every
+ * request the resolver would have decided is refused with 503
+ * netid_unavailable until it answers again.
  */
 
 /* What the caller should do with the request. */
@@ -136,8 +140,10 @@ typedef struct ai_gw_req_ctx {
 
   /* Network identity. netid_bound is the service's switch, from
    * ai_gw_netid_bound(svc_ident): 0 means no binding can match this service
-   * and the gate neither resolves one nor reads the body for it. It needs
-   * svc_ident; with none the gate treats it as 0. in_ifindex is the
+   * and the gate neither resolves one nor reads the body for it;
+   * AI_GW_NETID_FAIL_CLOSED beside AI_GW_NETID_BOUND refuses the request
+   * with 503 when the resolver cannot answer. It needs svc_ident; with none
+   * the gate treats it as 0. in_ifindex is the
    * interface the connection arrived on, cached by the caller (0 = not
    * read); with client_ip below it is what a binding matches on. */
   int         netid_bound;
@@ -246,16 +252,26 @@ void ai_gw_svc_ident(uint32_t xip_be, uint16_t xport_be, char *buf, size_t len);
  * last published them: what callers put in ai_gw_req_ctx_t.netid_bound.
  *
  * ai_gw_netid_bound_set replaces the whole set. svc_idents holds n service
- * identities ("VIP:port"); all != 0 marks every service bound (a binding
- * that names no service). More than AI_GW_NETID_SVC_MAX services also reads
- * as all: the set may answer 1 for a service with no binding (the resolver
- * then finds none), never 0 for one that has one. Safe against concurrent
- * readers; writers are serialized.
+ * identities ("VIP:port") and flags, when not NULL, one byte for each:
+ * AI_GW_NETID_FAIL_CLOSED marks a service that refuses a request the
+ * resolver could not answer for. all carries the same bits for every
+ * service: AI_GW_NETID_BOUND marks every service bound (a binding that
+ * names no service), with AI_GW_NETID_FAIL_CLOSED every one fails closed.
+ * More than AI_GW_NETID_SVC_MAX services also reads as all: the set may
+ * answer bound, or fail-closed, for a service that did not ask (the
+ * resolver then finds no binding), never the reverse. Safe against
+ * concurrent readers; writers are serialized.
  *
- * ai_gw_netid_bound is the request-path read: lock-free, and one atomic
- * load while no binding exists anywhere. */
-#define AI_GW_NETID_SVC_MAX 1024
-void ai_gw_netid_bound_set(const char *const *svc_idents, int n, int all);
+ * ai_gw_netid_bound is the request-path read: lock-free, wait-free against
+ * a writer, one hash and a probe of a table kept at most a quarter full,
+ * and one atomic load while no binding exists anywhere. It returns 0 or
+ * AI_GW_NETID_BOUND, with AI_GW_NETID_FAIL_CLOSED when the service asked
+ * for it. */
+#define AI_GW_NETID_SVC_MAX      1024
+#define AI_GW_NETID_BOUND        0x1
+#define AI_GW_NETID_FAIL_CLOSED  0x2
+void ai_gw_netid_bound_set(const char *const *svc_idents, const uint8_t *flags,
+                           int n, int all);
 int  ai_gw_netid_bound(const char *svc_ident);
 
 #endif /* __SOCKPROXY_AI_ADMIT_H__ */
