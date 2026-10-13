@@ -9139,6 +9139,9 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   ai_gw_svc_ident(hent->key.xip, hent->key.xport,
                   adm_svc_ident, sizeof(adm_svc_ident));
   req->svc_ident = adm_svc_ident;
+  /* Whether a network-identity binding can name this request's tenant is a
+   * property of the service; with none the gate does not look for one. */
+  req->netid_bound = ai_gw_netid_bound(adm_svc_ident);
   /* The request ID exists before the gate decides, so a refusal carries the
    * same key its completion and settle would have. A client-supplied
    * X-Request-Id was adopted at header capture; anything else is minted
@@ -9156,7 +9159,10 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
      * Report it so the operator can see the consequence of the default
      * rather than infer it from a bill. The legacy model derivation
      * also stays in force: pfe->effective_model is deliberately not
-     * written on non-enforcing services. */
+     * written for keyless traffic. A request the gate admitted as a
+     * network tenant is not this case, on any service: it comes back
+     * ALLOW and takes the admitted path below, model resolution
+     * included. */
     char um_vip[INET6_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &hent->key.xip, um_vip, sizeof(um_vip));
     llb_ai_record_unmetered(um_vip);
@@ -9182,8 +9188,13 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
                adm.error_code, adm.retry_after);
       break;
     default:
-      log_info("[AIGateway] fd=%d %s rejected: status=%d key=%.8s...",
-               pfe->fd, site, adm.http_status, pfe->x_api_key_raw);
+      if (adm.net_identity[0])
+        log_info("[AIGateway] fd=%d %s rejected: status=%d error=%s tenant=%s net_identity=%s",
+                 pfe->fd, site, adm.http_status, adm.error_code,
+                 adm.tenant_id, adm.net_identity);
+      else
+        log_info("[AIGateway] fd=%d %s rejected: status=%d key=%.8s...",
+                 pfe->fd, site, adm.http_status, pfe->x_api_key_raw);
       break;
     }
     return -1;

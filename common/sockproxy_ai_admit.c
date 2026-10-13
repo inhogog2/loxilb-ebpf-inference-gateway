@@ -179,133 +179,182 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                      trusted_hops);
 }
 
-static int
-ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
+/* ---- services with a network-identity binding ---------------------------
+ *
+ * A sorted array of service-identity hashes behind a sequence counter: the
+ * control plane replaces it whole, the request path searches it without a
+ * lock and retries when a replacement ran underneath. A hash collision can
+ * only report a service bound that is not, which costs that service one
+ * resolver call per request and decides nothing. */
+
+enum { NETID_NONE = 0, NETID_LISTED = 1, NETID_ALL = 2 };
+
+static _Atomic uint32_t netid_mode;      /* NETID_*; NONE is the one load a
+                                          * request pays with no binding */
+static _Atomic uint32_t netid_seq;       /* odd while a writer is inside */
+static _Atomic uint32_t netid_n;
+static _Atomic uint64_t netid_svc[AI_GW_NETID_SVC_MAX];
+static pthread_mutex_t netid_wlock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t
+netid_hash(const char *s)
 {
-  memset(res, 0, sizeof(*res));
+  uint64_t h = 0xcbf29ce484222325ULL;   /* FNV-1a */
+  for (; *s; s++) {
+    h ^= (uint8_t)*s;
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
 
-  const char *api_key = req->api_key ? req->api_key : "";
-  const char *prefix_model = req->prefix_model ? req->prefix_model : "";
-  const char *hdr_model = req->hdr_model ? req->hdr_model : "";
+static int
+netid_hash_cmp(const void *a, const void *b)
+{
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return x < y ? -1 : x > y;
+}
 
-  const char *svc_ident = req->svc_ident ? req->svc_ident : "";
+void
+ai_gw_netid_bound_set(const char *const *svc_idents, int n, int all)
+{
+  static uint64_t sorted[AI_GW_NETID_SVC_MAX];   /* under netid_wlock */
+  uint32_t cnt = 0;
+  uint32_t mode;
 
-  /* Skip enforcement only for the two DECLARED non-enforcing values.
-   * 1 enforces, and so does anything out of range: a wire value this code
-   * does not recognise is a corrupted policy, and a corrupted policy that
-   * admits keyless traffic fails open on exactly the services an operator
-   * tried to protect. */
-  if (req->auth_mode == 0 || req->auth_mode == 2) {
-    /* The one ladder arm keyless traffic has: the opt-in per-VIP shared
-     * bucket. A fully-empty identity makes this the keyless probe on the
-     * Go side — no bucket configured (or defaults unknowable) admits, so
-     * services that never opted in keep their exact legacy behaviour. */
-    if (svc_ident[0]) {
-      ai_gw_decision_t vs_dec = {0};
-      if (llb_ai_ratelimit_check("", "", "", (char *)svc_ident, "",
-                                 &vs_dec) != 0) {
-        set_deny(res, AI_GW_STAGE_RATELIMIT,
-                 vs_dec.decision == 4 ? 503 : 429,
-                 vs_dec.retry_after, 1,
-                 vs_dec.error_code[0] ? vs_dec.error_code
-                                      : "rate_limit_exceeded", "");
-        return -1;
-      }
+  pthread_mutex_lock(&netid_wlock);
+  for (int i = 0; svc_idents && i < n; i++) {
+    if (!svc_idents[i] || !svc_idents[i][0])
+      continue;
+    if (cnt == AI_GW_NETID_SVC_MAX) {
+      all = 1;            /* more than the set holds: never miss one */
+      break;
     }
-    res->verdict = AI_GW_ADMIT_UNMETERED;
+    sorted[cnt++] = netid_hash(svc_idents[i]);
+  }
+  qsort(sorted, cnt, sizeof(sorted[0]), netid_hash_cmp);
+  mode = all ? NETID_ALL : (cnt ? NETID_LISTED : NETID_NONE);
+
+  atomic_fetch_add(&netid_seq, 1);
+  for (uint32_t i = 0; i < cnt; i++)
+    atomic_store_explicit(&netid_svc[i], sorted[i], memory_order_relaxed);
+  atomic_store(&netid_n, cnt);
+  atomic_store(&netid_mode, mode);
+  atomic_fetch_add(&netid_seq, 1);
+  pthread_mutex_unlock(&netid_wlock);
+}
+
+int
+ai_gw_netid_bound(const char *svc_ident)
+{
+  uint32_t mode = atomic_load_explicit(&netid_mode, memory_order_relaxed);
+
+  if (mode == NETID_NONE || !svc_ident || !svc_ident[0])
+    return 0;
+  if (mode == NETID_ALL)
+    return 1;
+
+  uint64_t want = netid_hash(svc_ident);
+  for (;;) {
+    uint32_t s1 = atomic_load(&netid_seq);
+    int found = 0;
+
+    if (s1 & 1)
+      continue;           /* a replacement is being written */
+    mode = atomic_load(&netid_mode);
+    uint32_t lo = 0, hi = atomic_load(&netid_n);
+    if (hi > AI_GW_NETID_SVC_MAX)
+      hi = AI_GW_NETID_SVC_MAX;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      uint64_t v = atomic_load_explicit(&netid_svc[mid], memory_order_relaxed);
+      if (v == want) {
+        found = 1;
+        break;
+      }
+      if (v < want)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    if (atomic_load(&netid_seq) != s1)
+      continue;           /* replaced underneath: read again */
+    if (mode == NETID_ALL)
+      return 1;
+    return mode == NETID_LISTED && found;
+  }
+}
+
+/* The keyless decision of a non-enforcing service: the opt-in per-VIP shared
+ * bucket, then UNMETERED. */
+static int
+admit_keyless(ai_gw_admit_result_t *res, const char *svc_ident)
+{
+  /* The one ladder arm keyless traffic has: the opt-in per-VIP shared
+   * bucket. A fully-empty identity makes this the keyless probe on the
+   * Go side — no bucket configured (or defaults unknowable) admits, so
+   * services that never opted in keep their exact legacy behaviour. */
+  if (svc_ident[0]) {
+    ai_gw_decision_t vs_dec = {0};
+    if (llb_ai_ratelimit_check("", "", "", (char *)svc_ident, "",
+                               &vs_dec) != 0) {
+      set_deny(res, AI_GW_STAGE_RATELIMIT,
+               vs_dec.decision == 4 ? 503 : 429,
+               vs_dec.retry_after, 1,
+               vs_dec.error_code[0] ? vs_dec.error_code
+                                    : "rate_limit_exceeded", "");
+      return -1;
+    }
+  }
+  res->verdict = AI_GW_ADMIT_UNMETERED;
+  return 0;
+}
+
+/* Ask the resolver for the binding of this request's source. Returns 1 with
+ * *nid filled when one matches, 0 otherwise. Everything that is not a clean
+ * match is "no binding": a resolver that could not answer, and a match that
+ * names no tenant, must never admit anything. */
+static int
+netid_lookup(const ai_gw_req_ctx_t *req, const char *svc_ident,
+             const char *model, ai_gw_netid_t *nid)
+{
+  memset(nid, 0, sizeof(*nid));
+  if (llb_ai_netid_resolve((char *)(req->client_ip ? req->client_ip : ""),
+                           req->in_ifindex, (char *)svc_ident,
+                           (char *)model, nid) != 0 || !nid->matched) {
+    memset(nid, 0, sizeof(*nid));
     return 0;
   }
-
-  /* allowed_models must bind to the model the backend will actually serve,
-   * which is the one in the JSON body — an X-Model header that differs
-   * from the body is at best a stale hint and at worst a spoof. The body
-   * is complete by the time the gate runs, so parse it here and fall back
-   * to the earlier prefix extraction, then the header, only when the body
-   * carries no model field. */
-  char body_model[AI_GW_MODEL_LEN] = {0};
-  if (req->body && req->body_len > 0 && !req->prefix_only) {
-    extract_model_field(req->body, req->body_len, body_model, sizeof(body_model));
+  nid->tenant_id[sizeof(nid->tenant_id) - 1] = '\0';
+  nid->binding[sizeof(nid->binding) - 1] = '\0';
+  if (nid->tenant_id[0] == '\0') {
+    memset(nid, 0, sizeof(*nid));
+    return 0;
   }
-  const char *body_bound = body_model[0] ? body_model : prefix_model;
-  const char *model = body_bound[0] ? body_bound : hdr_model;
-  /* Resolved before any arm can refuse, so a refusal names the model the
-   * request asked for; the ALLOW path writes the same value again below. */
-  snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
+  return 1;
+}
 
-  /* Stage 1: validate the credential → 401 (missing/invalid), 403 (model
-   * denied), 503 (store cannot answer). The store outage is deliberately
-   * NOT a 401: a client that retries a 503 is behaving correctly; a client
-   * that retries a 401 is replaying a credential that will never work.
-   *
-   * Arm dispatch: mode 1 is the API-key arm and mode 3 the JWT arm.
-   * Mode 4 (apikey-or-jwt) picks by which credential is PRESENT, API key
-   * winning: a present X-Api-Key decides alone and its refusal is final —
-   * falling back to the JWT arm after a failed key would let a caller
-   * probe one credential per request behind a single 401. With no key the
-   * Bearer arm decides (its missing-token 401 covers the neither-present
-   * case). Unknown wire values keep the old fail-closed posture and
-   * enforce the API-key arm — a JWT-only client is denied there, never
-   * admitted unchecked. Identities are never merged across arms. */
-  const char *bearer = req->bearer ? req->bearer : "";
-  const char *jwt_profile = req->jwt_profile ? req->jwt_profile : "";
+/* The identity a request is metered as, however it was decided. */
+typedef struct {
+  const char *tenant_id;
+  const char *key_id;
+  const char *user_id;
+  int         auth_flags;
+  /* Network path only: the binding refuses this model. Checked after the
+   * conflict rule, where a credential's own allowlist was checked by its
+   * validator before it. */
+  int         net_model_refused;
+} admit_ident_t;
 
-  /* The capture hands over the RAW Authorization value, reassembled from
-   * however many fragments the parser delivered it in. Only the Bearer
-   * scheme feeds the JWT arm — Basic belongs to the session-affinity
-   * extractor — and the tag is stripped HERE, after reassembly, so a
-   * fragment boundary inside the header can never split the prefix this
-   * dispatch keys on. RFC 7235 allows more than one SP before the token.
-   * A non-Bearer value reads as "no bearer credential": on the JWT arm
-   * that is the missing-token 401. */
-  if (!strncasecmp(bearer, "Bearer ", 7)) {
-    bearer += 7;
-    while (*bearer == ' ')
-      bearer++;
-  } else {
-    bearer = "";
-  }
-
-  int jwt_arm = (req->auth_mode == 3) ||
-                (req->auth_mode == 4 && api_key[0] == '\0');
-
-  ai_gw_decision_t key_dec = {0};
-  int ai_rc;
-  if (jwt_arm) {
-    int bearer_flags = req->bearer_oversize ? AI_GW_BEARERF_OVERSIZE : 0;
-    ai_rc = llb_ai_validate_bearer((char *)bearer, (char *)model,
-                                   (char *)jwt_profile, bearer_flags,
-                                   &key_dec);
-  } else {
-    ai_rc = llb_ai_validate_key((char *)api_key, (char *)model, &key_dec);
-  }
-  if (ai_rc != 0) {
-    /* The Go arm names its refusal (invalid_token/token_expired/…); fall
-     * back to the arm-appropriate legacy code when it did not. */
-    const char *deny_code = key_dec.error_code[0] ? key_dec.error_code
-                          : (jwt_arm ? "invalid_token" : "invalid_api_key");
-    if (key_dec.decision == 4) {
-      set_deny(res, AI_GW_STAGE_AUTH, 503, 5, 0,
-               key_dec.error_code[0] ? key_dec.error_code
-                                     : "policy_store_unavailable",
-               "Credential policy store is unavailable; request refused");
-    } else if (key_dec.decision == 2) {
-      set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0, "model_not_allowed",
-               jwt_arm ? "Model not permitted for this token"
-                       : "Model not permitted for this API key");
-      /* The credential validated and named its tenant; only the model was
-       * refused. Carry the identity so the refusal is attributable, as the
-       * CONFLICT arm below already does. */
-      snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
-      snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
-      snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
-    } else {
-      set_deny(res, AI_GW_STAGE_AUTH, 401, 0, 0, deny_code,
-               jwt_arm ? "Missing or invalid bearer token"
-                       : "Missing or invalid X-Api-Key header");
-    }
-    return -1;
-  }
-
+/* Stages 2 to 4 for an identity that is already decided: the conflict
+ * rule, rate and quota, the reservation. One body for every way a tenant
+ * is decided, so a network tenant is held to exactly what a credential's
+ * tenant is. */
+static int
+admit_metered(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
+              const char *svc_ident, const char *model,
+              const char *body_bound, const char *hdr_model,
+              const admit_ident_t *id)
+{
   /* Stage 2: on enforcing services a body/header model disagreement is a
    * hard 400, never a silent steer. Before this check existed the auth
    * stage bound allowed_models to the body model while endpoint selection
@@ -317,15 +366,22 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
              "JSON body model and X-Model header disagree");
     /* The identity is real (the credential validated) — carry it so the
      * caller can log and count the denial against the right tenant. */
-    snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
-    snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
+    snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", id->tenant_id);
+    snprintf(res->key_id, sizeof(res->key_id), "%s", id->key_id);
     return -1;
   }
 
-  snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
-  snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
-  snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
-  res->auth_flags = key_dec.auth_flags;
+  if (id->net_model_refused) {
+    set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0, "model_not_allowed",
+             "Model not permitted for this network identity");
+    snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", id->tenant_id);
+    return -1;
+  }
+
+  snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", id->tenant_id);
+  snprintf(res->key_id, sizeof(res->key_id), "%s", id->key_id);
+  snprintf(res->user_id, sizeof(res->user_id), "%s", id->user_id);
+  res->auth_flags = id->auth_flags;
   snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
 
   /* Stage 3: per-key then per-tenant RPS check → 429. The body-bound model
@@ -336,8 +392,8 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * guard — the last is the gateway's outage and carries 503, never a 429
    * that reads as "slow down". */
   ai_gw_decision_t rl_dec = {0};
-  int rl_rc = llb_ai_ratelimit_check(key_dec.key_id, key_dec.tenant_id,
-                                     key_dec.user_id, (char *)svc_ident,
+  int rl_rc = llb_ai_ratelimit_check((char *)id->key_id, (char *)id->tenant_id,
+                                     (char *)id->user_id, (char *)svc_ident,
                                      (char *)model, &rl_dec);
   if (rl_rc != 0) {
     const char *rl_err =
@@ -384,8 +440,8 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
       ai_gw_decision_t rs_dec = {0};
       int64_t rs_epoch = 0;
       int rs_granted = 0;
-      if (llb_ai_token_quota_reserve(key_dec.tenant_id, (char *)model,
-                                     key_dec.user_id, key_dec.key_id,
+      if (llb_ai_token_quota_reserve((char *)id->tenant_id, (char *)model,
+                                     (char *)id->user_id, (char *)id->key_id,
                                      (char *)svc_ident,
                                      resv_prompt, resv_max, resv_default,
                                      &rs_epoch, &rs_granted, &rs_dec) != 0) {
@@ -412,4 +468,213 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 
   res->verdict = AI_GW_ADMIT_ALLOW;
   return 0;
+}
+
+/* The network path: the binding's tenant, with no key and no user, through
+ * the same stages a credential's tenant goes through. */
+static int
+admit_network(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
+              const char *svc_ident, const char *model,
+              const char *body_bound, const char *hdr_model,
+              const ai_gw_netid_t *nid)
+{
+  admit_ident_t id = {
+    .tenant_id = nid->tenant_id,
+    .key_id = "",
+    .user_id = "",
+    .net_model_refused = !nid->model_ok,
+  };
+
+  res->auth_src = AI_GW_AUTH_SRC_NETWORK;
+  res->net_forward_identity = nid->forward_identity ? 1 : 0;
+  snprintf(res->net_identity, sizeof(res->net_identity), "%s", nid->binding);
+  return admit_metered(req, res, svc_ident, model, body_bound, hdr_model, &id);
+}
+
+static int
+ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
+{
+  memset(res, 0, sizeof(*res));
+
+  const char *api_key = req->api_key ? req->api_key : "";
+  const char *prefix_model = req->prefix_model ? req->prefix_model : "";
+  const char *hdr_model = req->hdr_model ? req->hdr_model : "";
+
+  const char *svc_ident = req->svc_ident ? req->svc_ident : "";
+
+  /* Skip enforcement only for the two DECLARED non-enforcing values.
+   * 1 enforces, and so does anything out of range: a wire value this code
+   * does not recognise is a corrupted policy, and a corrupted policy that
+   * admits keyless traffic fails open on exactly the services an operator
+   * tried to protect. */
+  int enforcing = !(req->auth_mode == 0 || req->auth_mode == 2);
+
+  /* A binding is looked for only on a service that has one, and a service
+   * is known by its identity. */
+  int netid = req->netid_bound && svc_ident[0];
+
+  if (!enforcing && !netid)
+    return admit_keyless(res, svc_ident);
+
+  /* allowed_models must bind to the model the backend will actually serve,
+   * which is the one in the JSON body — an X-Model header that differs
+   * from the body is at best a stale hint and at worst a spoof. The body
+   * is complete by the time the gate runs, so parse it here and fall back
+   * to the earlier prefix extraction, then the header, only when the body
+   * carries no model field. */
+  char body_model[AI_GW_MODEL_LEN] = {0};
+  if (req->body && req->body_len > 0 && !req->prefix_only) {
+    extract_model_field(req->body, req->body_len, body_model, sizeof(body_model));
+  }
+  const char *body_bound = body_model[0] ? body_model : prefix_model;
+  const char *model = body_bound[0] ? body_bound : hdr_model;
+
+  ai_gw_netid_t nid;
+  int nid_asked = 0;
+  int nid_match = 0;
+
+  if (!enforcing) {
+    /* Rows 1 and 2. A source with a binding is that binding's tenant; any
+     * other source is the keyless traffic it was before the service had
+     * bindings, decided by the same code with the same result. */
+    if (netid_lookup(req, svc_ident, model, &nid)) {
+      snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
+      return admit_network(req, res, svc_ident, model, body_bound, hdr_model,
+                           &nid);
+    }
+    return admit_keyless(res, svc_ident);
+  }
+
+  /* Resolved before any arm can refuse, so a refusal names the model the
+   * request asked for; the ALLOW path writes the same value again below. */
+  snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
+
+  /* Stage 1: validate the credential → 401 (missing/invalid), 403 (model
+   * denied), 503 (store cannot answer). The store outage is deliberately
+   * NOT a 401: a client that retries a 503 is behaving correctly; a client
+   * that retries a 401 is replaying a credential that will never work.
+   *
+   * Arm dispatch: mode 1 is the API-key arm and mode 3 the JWT arm.
+   * Mode 4 (apikey-or-jwt) picks by which credential is PRESENT, API key
+   * winning: a present X-Api-Key decides alone and its refusal is final —
+   * falling back to the JWT arm after a failed key would let a caller
+   * probe one credential per request behind a single 401. With no key the
+   * Bearer arm decides (its missing-token 401 covers the neither-present
+   * case). Unknown wire values keep the old fail-closed posture and
+   * enforce the API-key arm — a JWT-only client is denied there, never
+   * admitted unchecked. Identities are never merged across arms. */
+  const char *bearer = req->bearer ? req->bearer : "";
+  const char *jwt_profile = req->jwt_profile ? req->jwt_profile : "";
+
+  /* The capture hands over the RAW Authorization value, reassembled from
+   * however many fragments the parser delivered it in. Only the Bearer
+   * scheme feeds the JWT arm — Basic belongs to the session-affinity
+   * extractor — and the tag is stripped HERE, after reassembly, so a
+   * fragment boundary inside the header can never split the prefix this
+   * dispatch keys on. RFC 7235 allows more than one SP before the token.
+   * A non-Bearer value reads as "no bearer credential": on the JWT arm
+   * that is the missing-token 401. */
+  if (!strncasecmp(bearer, "Bearer ", 7)) {
+    bearer += 7;
+    while (*bearer == ' ')
+      bearer++;
+  } else {
+    bearer = "";
+  }
+
+  /* Row 6: no credential at all, from a source whose binding stands in for
+   * one. "No credential" is neither a key nor a bearer token, whichever arm
+   * the service declares, and a token dropped for its size was presented:
+   * a request that presents a credential is decided by that credential,
+   * and a refused one never falls back to where it came from. Anything
+   * short of a credential-bearing binding goes to the credential arm,
+   * which answers the missing credential as it always has (row 7). */
+  if (netid && api_key[0] == '\0' && bearer[0] == '\0' &&
+      !req->bearer_oversize) {
+    nid_asked = 1;
+    nid_match = netid_lookup(req, svc_ident, model, &nid);
+    if (nid_match && nid.credential_network)
+      return admit_network(req, res, svc_ident, model, body_bound, hdr_model,
+                           &nid);
+  }
+
+  int jwt_arm = (req->auth_mode == 3) ||
+                (req->auth_mode == 4 && api_key[0] == '\0');
+
+  ai_gw_decision_t key_dec = {0};
+  int ai_rc;
+  if (jwt_arm) {
+    int bearer_flags = req->bearer_oversize ? AI_GW_BEARERF_OVERSIZE : 0;
+    ai_rc = llb_ai_validate_bearer((char *)bearer, (char *)model,
+                                   (char *)jwt_profile, bearer_flags,
+                                   &key_dec);
+  } else {
+    ai_rc = llb_ai_validate_key((char *)api_key, (char *)model, &key_dec);
+  }
+  if (ai_rc != 0) {
+    /* The Go arm names its refusal (invalid_token/token_expired/…); fall
+     * back to the arm-appropriate legacy code when it did not. */
+    const char *deny_code = key_dec.error_code[0] ? key_dec.error_code
+                          : (jwt_arm ? "invalid_token" : "invalid_api_key");
+    if (key_dec.decision == 4) {
+      set_deny(res, AI_GW_STAGE_AUTH, 503, 5, 0,
+               key_dec.error_code[0] ? key_dec.error_code
+                                     : "policy_store_unavailable",
+               "Credential policy store is unavailable; request refused");
+    } else if (key_dec.decision == 2) {
+      set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0, "model_not_allowed",
+               jwt_arm ? "Model not permitted for this token"
+                       : "Model not permitted for this API key");
+      /* The credential validated and named its tenant; only the model was
+       * refused. Carry the identity so the refusal is attributable, as the
+       * CONFLICT arm below already does. */
+      snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
+      snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
+      snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
+    } else {
+      set_deny(res, AI_GW_STAGE_AUTH, 401, 0, 0, deny_code,
+               jwt_arm ? "Missing or invalid bearer token"
+                       : "Missing or invalid X-Api-Key header");
+    }
+    return -1;
+  }
+
+  /* Rows 4 and 5: the credential validated, and the source has a binding.
+   * An advisory binding is noted and changes nothing. A strict one holds
+   * the credential to the network it came from: its tenant must be the
+   * binding's, and the model must pass the binding's allowlist as well as
+   * the credential's own, which its validator has just checked. */
+  if (netid) {
+    if (!nid_asked)
+      nid_match = netid_lookup(req, svc_ident, model, &nid);
+    if (nid_match) {
+      snprintf(res->net_identity, sizeof(res->net_identity), "%s", nid.binding);
+      res->net_forward_identity = nid.forward_identity ? 1 : 0;
+      if (nid.enforce) {
+        int mismatch = strcmp(nid.tenant_id, key_dec.tenant_id) != 0;
+        if (mismatch || !nid.model_ok) {
+          if (mismatch)
+            set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0,
+                     "network_tenant_mismatch",
+                     "Credential is not valid from this network");
+          else
+            set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0, "model_not_allowed",
+                     "Model not permitted for this network identity");
+          snprintf(res->tenant_id, sizeof(res->tenant_id), "%s",
+                   key_dec.tenant_id);
+          snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
+          snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
+          return -1;
+        }
+      }
+    }
+  }
+
+  admit_ident_t id = {
+    .tenant_id = key_dec.tenant_id,
+    .key_id = key_dec.key_id,
+    .user_id = key_dec.user_id,
+    .auth_flags = key_dec.auth_flags,
+  };
+  return admit_metered(req, res, svc_ident, model, body_bound, hdr_model, &id);
 }

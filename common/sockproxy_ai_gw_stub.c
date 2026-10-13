@@ -252,6 +252,20 @@ llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }
 
+__attribute__((weak)) int
+llb_ai_netid_resolve(char *client_ip, int in_ifindex,
+                     char *svc_ident, char *model, ai_gw_netid_t *out)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)client_ip;
+    (void)in_ifindex;
+    (void)svc_ident;
+    (void)model;
+    if (out)
+        out->matched = 0;
+    return 0;  /* no binding: the request is decided as if none existed */
+}
+
 __attribute__((weak)) void
 llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
                   int64_t decode_latency_ms, int kv_params_found,

@@ -394,6 +394,47 @@ extern int llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                                       ai_gw_decision_t *result);
 
 /*
+ * ai_gw_netid_t - what llb_ai_netid_resolve found for a request's source.
+ * Zeroed memory is "no binding", which is also what a failed call leaves.
+ */
+typedef struct ai_gw_netid {
+    int  matched;            /* 0 = no binding matches this source on this service */
+    int  enforce;            /* 0 advisory, 1 strict */
+    int  credential_network; /* 1 = the binding admits a request with no credential */
+    int  model_ok;           /* the model is in the binding's allowlist (or it has none) */
+    int  forward_identity;   /* the binding asks for the tenant to be forwarded upstream */
+    char tenant_id[128];     /* the binding's tenant */
+    char binding[64];        /* the binding's name, for records */
+} ai_gw_netid_t;
+
+/*
+ * llb_ai_netid_resolve - find the network-identity binding of a request's
+ * source: the one that names the tenant of traffic from a CIDR or an
+ * ingress interface on this service.
+ *
+ * Called from the admission gate, at most once per request, and only for a
+ * service the control plane marked as bound (ai_gw_netid_bound): a service
+ * with no binding never makes this call. It must not block: it reads an
+ * immutable snapshot.
+ *
+ * Parameters:
+ *   client_ip   the socket peer, dotted IPv4 (NUL-terminated; "" when unknown)
+ *   in_ifindex  the interface the connection arrived on; 0 when not read
+ *   svc_ident   service identity "VIP:port" (NUL-terminated)
+ *   model       effective model name, for model_ok ("" when the request
+ *               names none)
+ *   out         output structure, zeroed by the caller
+ *
+ * Returns:
+ *    0  answered; out->matched says whether a binding matches
+ *   -1  the resolver could not answer (no snapshot, internal error). The
+ *       gate reads this as "no binding": it never admits on a failure.
+ */
+extern int llb_ai_netid_resolve(char *client_ip, int in_ifindex,
+                                char *svc_ident, char *model,
+                                ai_gw_netid_t *out);
+
+/*
  * llb_ai_pd_record – record a P/D disaggregation lifecycle event.
  *
  * C sockproxy calls this at P/D completion (success or error) to record

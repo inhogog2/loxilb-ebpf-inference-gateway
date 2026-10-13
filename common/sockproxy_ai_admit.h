@@ -44,6 +44,32 @@
  * and silently picking one hides it. Non-enforcing services keep their
  * legacy behavior: the gate is skipped and routing derives the model as it
  * always has.
+ *
+ * Network identity. On a service with a network-identity binding
+ * (netid_bound) the source of the request can decide its tenant. The table,
+ * one row per case:
+ *
+ *   # | service        | credential | binding of the source | result
+ *   1 | non-enforcing  | any        | none                  | UNMETERED, as before
+ *   2 | non-enforcing  | any        | any                   | ALLOW as the binding's
+ *     |                |            |                       | tenant (network path)
+ *   3 | enforcing      | present    | none                  | the credential decides
+ *   4 | enforcing      | present    | advisory              | the credential decides;
+ *     |                |            |                       | net_identity is set
+ *   5 | enforcing      | present    | strict                | tenant differs: 403
+ *     |                |            |                       | network_tenant_mismatch;
+ *     |                |            |                       | equal: the model must
+ *     |                |            |                       | also be in the binding's
+ *     |                |            |                       | allowlist
+ *   6 | enforcing      | absent     | credential: network   | ALLOW as the binding's
+ *     |                |            |                       | tenant (network path)
+ *   7 | enforcing      | absent     | anything else         | 401, as before
+ *
+ * The network path runs the same stages as a credential does, in this
+ * order: model conflict (400), the binding's model allowlist (403), rate
+ * and quota (429), reservation (429). A request that presents a credential
+ * is always decided by that credential: a refused credential never falls
+ * back to the binding. A resolver that cannot answer is "no binding".
  */
 
 /* What the caller should do with the request. */
@@ -63,6 +89,10 @@ typedef enum {
   AI_GW_STAGE_RESERVE,         /* pre-admission token reservation (429) */
   AI_GW_STAGE_CAPACITY,        /* service/endpoint capacity, after policy (429/503) */
 } ai_gw_admit_stage_t;
+
+/* How the admitted tenant was decided. */
+#define AI_GW_AUTH_SRC_CREDENTIAL 0   /* an API key or a bearer token */
+#define AI_GW_AUTH_SRC_NETWORK    1   /* a network-identity binding of the source */
 
 /* Request view handed to the gate. All pointers are borrowed; strings are
  * NUL-terminated. body may be NULL when the request carried none. */
@@ -103,6 +133,15 @@ typedef struct ai_gw_req_ctx {
    * prompt estimate alone is claimed). A declared ceiling is never
    * replaced, and nothing is written into the forwarded body. */
   int         default_tokens;
+
+  /* Network identity. netid_bound is the service's switch, from
+   * ai_gw_netid_bound(svc_ident): 0 means no binding can match this service
+   * and the gate neither resolves one nor reads the body for it. It needs
+   * svc_ident; with none the gate treats it as 0. in_ifindex is the
+   * interface the connection arrived on, cached by the caller (0 = not
+   * read); with client_ip below it is what a binding matches on. */
+  int         netid_bound;
+  int         in_ifindex;
 
   /* Correlation, filled by the caller before the gate: the request ID that
    * the refusal, the completion and the settle records of this request all
@@ -158,6 +197,18 @@ typedef struct ai_gw_admit_result {
   uint32_t reserved_toks;
   int64_t  res_epoch;
   uint8_t  reservation_clamped;
+
+  /* Network identity, valid on ALLOW and on a refusal made after the
+   * binding was resolved. auth_src says what decided the tenant
+   * (AI_GW_AUTH_SRC_*). net_identity names the binding that matched the
+   * source ("" = none): on the network path it is the one that admitted
+   * the request, beside a credential it is the one checked against it or
+   * merely noted (advisory). net_forward_identity is that binding's
+   * forward_identity switch, carried for the caller; the gate decides
+   * nothing on it. */
+  uint8_t  auth_src;
+  uint8_t  net_forward_identity;
+  char     net_identity[64];
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
@@ -190,5 +241,21 @@ void ai_gw_mint_request_id(char *buf, size_t len);
  * vip label, plus the listener port. buf is always NUL-terminated; a
  * zero-length buf is left untouched. */
 void ai_gw_svc_ident(uint32_t xip_be, uint16_t xport_be, char *buf, size_t len);
+
+/* The services that have a network-identity binding, as the control plane
+ * last published them: what callers put in ai_gw_req_ctx_t.netid_bound.
+ *
+ * ai_gw_netid_bound_set replaces the whole set. svc_idents holds n service
+ * identities ("VIP:port"); all != 0 marks every service bound (a binding
+ * that names no service). More than AI_GW_NETID_SVC_MAX services also reads
+ * as all: the set may answer 1 for a service with no binding (the resolver
+ * then finds none), never 0 for one that has one. Safe against concurrent
+ * readers; writers are serialized.
+ *
+ * ai_gw_netid_bound is the request-path read: lock-free, and one atomic
+ * load while no binding exists anywhere. */
+#define AI_GW_NETID_SVC_MAX 1024
+void ai_gw_netid_bound_set(const char *const *svc_idents, int n, int all);
+int  ai_gw_netid_bound(const char *svc_ident);
 
 #endif /* __SOCKPROXY_AI_ADMIT_H__ */

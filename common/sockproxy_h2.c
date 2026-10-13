@@ -4229,6 +4229,9 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .auth_mode = ent->val.ephash->apikey_auth,
       .default_tokens = (int)ent->val.ephash->ai_default_tokens,
       .svc_ident = adm_svc_ident,
+      /* A service property; a rule that is not an AI-gateway one has no
+       * identity here and so is never bound. */
+      .netid_bound = ai_gw_netid_bound(adm_svc_ident),
       .request_id = stream->request_id,
       .producer_id = notify_worker_id(),
       /* The gate runs BEFORE the header splice, so no origin has been
@@ -4268,10 +4271,16 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       proxy_h2_send_ai_deny(pfe, stream,
                             adm.http_status, adm.retry_after,
                             adm.retry_body, adm.error_code, adm.error_msg);
-      log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
-               "status=%d stage=%d error=%s key=%s tenant=%s",
-               stream->stream_id, adm.http_status, adm.stage,
-               adm.error_code, adm.key_id, adm.tenant_id);
+      if (adm.net_identity[0])
+        log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+                 "status=%d stage=%d error=%s key=%s tenant=%s net_identity=%s",
+                 stream->stream_id, adm.http_status, adm.stage,
+                 adm.error_code, adm.key_id, adm.tenant_id, adm.net_identity);
+      else
+        log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+                 "status=%d stage=%d error=%s key=%s tenant=%s",
+                 stream->stream_id, adm.http_status, adm.stage,
+                 adm.error_code, adm.key_id, adm.tenant_id);
       return 0;
     } else {
       /* Admitted. Persist the identity, the gate's model resolution, the
