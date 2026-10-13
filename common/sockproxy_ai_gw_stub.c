@@ -115,9 +115,12 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       int stream_start, int stream_end, char *error_code,
                       char *request_id, char *user_id, char *key_id,
                       char *svc_ident, int is_stream, int producer_id,
-                      char *client_ip, char *origin_ip, int trusted_hops)
+                      char *client_ip, char *origin_ip, int trusted_hops,
+                      int auth_src, char *net_identity)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)auth_src;
+    (void)net_identity;
     (void)tenant_id;
     (void)model_name;
     (void)status_code;
@@ -166,9 +169,12 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    char *svc_ident, char *model_name,
                    char *tenant_id, char *key_id, char *user_id,
                    int stage, int http_status, char *error_code,
-                   char *client_ip, char *origin_ip, int trusted_hops)
+                   char *client_ip, char *origin_ip, int trusted_hops,
+                   int auth_src, char *net_identity)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)auth_src;
+    (void)net_identity;
     (void)request_id;
     (void)producer_id;
     (void)svc_ident;
@@ -208,9 +214,12 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                            int prompt_tokens, int complet_tokens,
                            int estimated, int reserved_toks,
                            int64_t res_epoch, char *request_id,
-                           int producer_id, ai_gw_decision_t *result)
+                           int producer_id, int auth_src, char *net_identity,
+                           ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)auth_src;
+    (void)net_identity;
     (void)tenant_id;
     (void)model_name;
     (void)user_id;

@@ -149,7 +149,8 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
                        res->error_code,
                        (char *)(req->client_ip ? req->client_ip : ""),
                        (char *)(req->origin_ip ? req->origin_ip : ""),
-                       req->trusted_hops);
+                       req->trusted_hops, (int)res->auth_src,
+                       res->net_identity);
   }
   return rc;
 }
@@ -161,7 +162,8 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            const char *user_id, int http_status,
                            const char *error_code,
                            const char *client_ip, const char *origin_ip,
-                           int trusted_hops)
+                           int trusted_hops, int auth_src,
+                           const char *net_identity)
 {
   /* The same attribution every other record carries, with the same
    * meaning: client_ip is the socket peer, origin_ip is "" unless the header
@@ -176,7 +178,8 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                      (char *)(error_code ? error_code : ""),
                      (char *)(client_ip ? client_ip : ""),
                      (char *)(origin_ip ? origin_ip : ""),
-                     trusted_hops);
+                     trusted_hops, auth_src,
+                     (char *)(net_identity ? net_identity : ""));
 }
 
 /* ---- services with a network-identity binding ---------------------------

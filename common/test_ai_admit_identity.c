@@ -84,6 +84,8 @@ static struct {
   char client_ip[46];
   char origin_ip[46];
   int  trusted_hops;
+  int  auth_src;
+  char net_identity[64];
 } deny_stub;
 
 static struct {
@@ -139,9 +141,13 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    char *svc_ident, char *model_name,
                    char *tenant_id, char *key_id, char *user_id,
                    int stage, int http_status, char *error_code,
-                   char *client_ip, char *origin_ip, int trusted_hops)
+                   char *client_ip, char *origin_ip, int trusted_hops,
+                   int auth_src, char *net_identity)
 {
   deny_stub.calls++;
+  deny_stub.auth_src = auth_src;
+  snprintf(deny_stub.net_identity, sizeof(deny_stub.net_identity), "%s",
+           net_identity);
   snprintf(deny_stub.request_id, sizeof(deny_stub.request_id), "%s", request_id);
   deny_stub.producer_id = producer_id;
   snprintf(deny_stub.svc, sizeof(deny_stub.svc), "%s", svc_ident);
@@ -795,6 +801,10 @@ test_rate_limit_refusal_is_recorded_after_identity(void)
   assert(strcmp(deny_stub.origin_ip, "203.0.113.5") == 0);
   assert(deny_stub.trusted_hops == 2);
   assert(deny_stub.producer_id == 0);
+  /* No binding was asked for: the record says a credential decided and
+   * names none. */
+  assert(deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
+  assert(deny_stub.net_identity[0] == '\0');
 }
 
 static void
@@ -1000,6 +1010,9 @@ test_net_row2_stages_refuse_in_order(void)
   assert(deny_stub.calls == 1 && deny_stub.http_status == 400);
   assert(strcmp(deny_stub.tenant, "line-1-tenant") == 0);
   assert(strcmp(deny_stub.model, "m1") == 0);
+  /* The record says the network decided the tenant, and by which binding. */
+  assert(deny_stub.auth_src == AI_GW_AUTH_SRC_NETWORK);
+  assert(strcmp(deny_stub.net_identity, "line-1") == 0);
 
   /* The allowlist, before any budget is touched. */
   req.hdr_model = "";
@@ -1042,6 +1055,8 @@ test_net_row2_stages_refuse_in_order(void)
   assert(res.reserved_toks == 39);
   assert(deny_stub.calls == 1);
   assert(strcmp(deny_stub.tenant, "line-1-tenant") == 0);
+  assert(deny_stub.auth_src == AI_GW_AUTH_SRC_NETWORK);
+  assert(strcmp(deny_stub.net_identity, "line-1") == 0);
 }
 
 /* Row 3: an enforcing service, a credential, no binding of the source: the
@@ -1137,6 +1152,10 @@ test_net_row5_strict_binding_holds_the_credential(void)
   assert(deny_stub.calls == 1);
   assert(strcmp(deny_stub.error_code, "network_tenant_mismatch") == 0);
   assert(strcmp(deny_stub.tenant, "tenant-1") == 0 && strcmp(deny_stub.key, "key-1") == 0);
+  /* On the record: the credential's tenant, decided by the credential, and
+   * the binding that refused it. */
+  assert(deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
+  assert(strcmp(deny_stub.net_identity, "line-1") == 0);
 
   /* Tenant equal, model in both allowlists. */
   reset_stubs();
@@ -1157,6 +1176,7 @@ test_net_row5_strict_binding_holds_the_credential(void)
   assert(strcmp(res.error_code, "model_not_allowed") == 0);
   assert(strcmp(res.tenant_id, "tenant-1") == 0);
   assert(rl_stub.calls == 0 && deny_stub.calls == 1);
+  assert(strcmp(deny_stub.net_identity, "line-1") == 0);
 
   /* Tenant equal, model outside the credential's own allowlist: the
    * credential's refusal, before the binding is looked at. */
@@ -1448,6 +1468,9 @@ test_net_resolver_failure_fails_closed_where_asked(void)
       assert(rl_stub.calls == 0 && rs_stub.calls == 0);
       assert(deny_stub.calls == 1 && deny_stub.http_status == 503);
       assert(strcmp(deny_stub.error_code, "netid_unavailable") == 0);
+      /* The resolver did not answer: the record names no binding. */
+      assert(deny_stub.net_identity[0] == '\0');
+      assert(deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
     }
 
     /* A valid key: refused as well, and the refusal names the key's
@@ -1499,6 +1522,30 @@ test_net_resolver_failure_fails_closed_where_asked(void)
   assert(ai_gw_admit(&req, &res) == 0);
   assert(res.verdict == AI_GW_ADMIT_ALLOW);
   assert(strcmp(res.tenant_id, "line-1-tenant") == 0);
+}
+
+/* The capacity gate refuses after the policy gate admitted, through its own
+ * frame: the record carries what the policy gate resolved, the binding
+ * included, and a NULL binding reads as none. */
+static void
+test_capacity_deny_carries_the_binding(void)
+{
+  reset_stubs();
+  ai_gw_record_capacity_deny("req-cap", 3, NET_SVC, "m1", "line-1-tenant",
+                             "", "", 429, "admission_capacity", NET_SRC, "",
+                             0, AI_GW_AUTH_SRC_NETWORK, "line-1");
+  assert(deny_stub.calls == 1 && deny_stub.stage == AI_GW_STAGE_CAPACITY);
+  assert(deny_stub.http_status == 429);
+  assert(strcmp(deny_stub.tenant, "line-1-tenant") == 0);
+  assert(deny_stub.auth_src == AI_GW_AUTH_SRC_NETWORK);
+  assert(strcmp(deny_stub.net_identity, "line-1") == 0);
+
+  reset_stubs();
+  ai_gw_record_capacity_deny("req-cap", 3, NET_SVC, "m1", "tenant-1", "key-1",
+                             "", 503, "admission_no_capacity", NET_SRC, "",
+                             0, AI_GW_AUTH_SRC_CREDENTIAL, NULL);
+  assert(deny_stub.calls == 1 && deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
+  assert(deny_stub.net_identity[0] == '\0');
 }
 
 /* A streamed body: the gate has only the prefix, and the network path
@@ -1760,6 +1807,7 @@ main(void)
   test_net_presented_credential_never_falls_back();
   test_net_resolver_failure_is_no_binding();
   test_net_resolver_failure_fails_closed_where_asked();
+  test_capacity_deny_carries_the_binding();
   test_net_streamed_body_is_gated_on_the_prefix();
   test_netid_bound_set();
   test_netid_bound_set_carries_fail_closed();

@@ -224,7 +224,8 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
                         svc_ident, 0, notify_worker_id(),
                         (char *)pfe->l7_peer_ip,
                         (char *)proxy_origin_ip(pfe),
-                        (int)proxy_origin_trusted_hops(pfe));
+                        (int)proxy_origin_trusted_hops(pfe),
+                        (int)pfe->auth_src, (char *)pfe->auth_net_identity);
   pfe->metric_ai_recorded = 1;
   /* The response is complete: the backend's work for this request is done
    * and its capacity unit goes back before the connection idles on
@@ -1906,7 +1907,10 @@ skip_deferred_masking:
                                      (int)rfd_ent->usage_reserved_toks,
                                      rfd_ent->usage_res_epoch,
                                      (char *)proxy_request_id(rfd_ent),
-                                     notify_worker_id(), NULL);
+                                     notify_worker_id(),
+                                     (int)rfd_ent->auth_src,
+                                     (char *)rfd_ent->auth_net_identity,
+                                     NULL);
           /* Settled: the admission claim is spent. Zero it so no later
            * consume on this connection can release it a second time. */
           rfd_ent->usage_reserved_toks = 0;
@@ -2100,7 +2104,9 @@ skip_deferred_masking:
                                    (int)rfd_ent->usage_reserved_toks,
                                    rfd_ent->usage_res_epoch,
                                    (char *)proxy_request_id(rfd_ent),
-                                   notify_worker_id(), NULL);
+                                   notify_worker_id(),
+                                   (int)rfd_ent->auth_src,
+                                   (char *)rfd_ent->auth_net_identity, NULL);
         /* Settled: zero the claim so a spurious second [DONE] or a later
          * non-stream consume on this connection cannot double-release. */
         rfd_ent->usage_reserved_toks = 0;
@@ -2124,7 +2130,9 @@ skip_deferred_masking:
                               sse_rec_svc_ident, 1, notify_worker_id(),
                               (char *)rfd_ent->l7_peer_ip,
                               (char *)proxy_origin_ip(rfd_ent),
-                              (int)proxy_origin_trusted_hops(rfd_ent));
+                              (int)proxy_origin_trusted_hops(rfd_ent),
+                              (int)rfd_ent->auth_src,
+                              (char *)rfd_ent->auth_net_identity);
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         fc_permit_release(&rfd_ent->fc);  /* the stream ended: its capacity unit goes back */
         log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
@@ -5623,6 +5631,10 @@ typedef struct {
   char    request_id[256];
   int     reserved;
   int64_t res_epoch;
+  /* What decided the tenant and the binding that matched, copied with the
+   * identity so the release names the actor the request's records do. */
+  int     auth_src;
+  char    net_identity[64];
 } proxy_resv_rel_t;
 
 /* The connection's last response, copied out so it can be reported after the
@@ -5651,6 +5663,10 @@ typedef struct {
   char client_ip[L7_HOP_TEXT_MAX];
   char origin_ip[L7_HOP_TEXT_MAX];
   int  trusted_hops;
+  /* What decided the tenant and the binding that matched, copied with the
+   * identity. */
+  int  auth_src;
+  char net_identity[64];
 } proxy_umiss_t;
 
 typedef struct {
@@ -5743,6 +5759,9 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(r->model, sizeof(r->model), "%s", m ? m : "");
     snprintf(r->user, sizeof(r->user), "%s", pfe->auth_user_id);
     snprintf(r->key, sizeof(r->key), "%s", pfe->auth_key_id);
+    r->auth_src = (int)pfe->auth_src;
+    snprintf(r->net_identity, sizeof(r->net_identity), "%s",
+             pfe->auth_net_identity);
     proxy_pfe_svc_ident(pfe, r->svc_ident, sizeof(r->svc_ident));
     snprintf(r->request_id, sizeof(r->request_id), "%s",
              proxy_request_id(pfe));
@@ -5772,6 +5791,9 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(u->client_ip, sizeof(u->client_ip), "%s", pfe->l7_peer_ip);
     snprintf(u->origin_ip, sizeof(u->origin_ip), "%s", proxy_origin_ip(pfe));
     u->trusted_hops = (int)proxy_origin_trusted_hops(pfe);
+    u->auth_src     = (int)pfe->auth_src;
+    snprintf(u->net_identity, sizeof(u->net_identity), "%s",
+             pfe->auth_net_identity);
     u->status       = (int)pfe->metric_response_status;
     u->prompt_toks  = pfe->usage_prompt_toks;
     u->complet_toks = pfe->usage_complet_toks;
@@ -6398,7 +6420,8 @@ proxy_pdestroy(void *priv)
     llb_ai_token_quota_consume(r->tenant, r->model, r->user, r->key,
                                r->svc_ident, 0, 0, 0,
                                r->reserved, r->res_epoch,
-                               r->request_id, notify_worker_id(), NULL);
+                               r->request_id, notify_worker_id(),
+                               r->auth_src, r->net_identity, NULL);
     log_debug("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", r->reserved, r->tenant);
   }
@@ -6417,7 +6440,8 @@ proxy_pdestroy(void *priv)
                             u->prompt_toks, u->complet_toks, 0, 0, "",
                             u->request_id, u->user, u->key, u->svc_ident,
                             0, notify_worker_id(),
-                            u->client_ip, u->origin_ip, u->trusted_hops);
+                            u->client_ip, u->origin_ip, u->trusted_hops,
+                            u->auth_src, u->net_identity);
       log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d",
                u->tenant, u->model, u->status);
     }
@@ -6458,13 +6482,15 @@ proxy_pdestroy(void *priv)
     llb_ai_token_quota_consume(e->tenant, e->model, e->user, e->key,
                                e->svc_ident, e->prompt_toks, e->complet_toks,
                                0, e->reserved_toks, e->res_epoch,
-                               e->request_id, notify_worker_id(), NULL);
+                               e->request_id, notify_worker_id(),
+                               e->auth_src, e->net_identity, NULL);
     if (e->status > 0) {
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
                             e->prompt_toks, e->complet_toks, 0, 0, "",
                             e->request_id, e->user, e->key, e->svc_ident,
                             e->response_is_sse, notify_worker_id(),
-                            e->client_ip, e->origin_ip, e->trusted_hops);
+                            e->client_ip, e->origin_ip, e->trusted_hops,
+                            e->auth_src, e->net_identity);
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
        * with no backend status never completed a response, so it is a
@@ -8544,7 +8570,9 @@ handle_on_message_begin(llhttp_t* parser)
                                  0, 0, 0, (int)pfe->usage_reserved_toks,
                                  pfe->usage_res_epoch,
                                  (char *)proxy_request_id(pfe),
-                                 notify_worker_id(), NULL);
+                                 notify_worker_id(),
+                                 (int)pfe->auth_src,
+                                 (char *)pfe->auth_net_identity, NULL);
     }
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
@@ -8574,6 +8602,8 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->bearer_oversize = 0;
     pfe->auth_user_id[0] = '\0';
     pfe->auth_key_id[0] = '\0';
+    pfe->auth_net_identity[0] = '\0';
+    pfe->auth_src = 0;
     pfe->auth_strip_authz = 0;
     pfe->auth_fwd_identity = 0;
     pfe->auth_jwt_capable = 0;
@@ -8864,7 +8894,8 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
                              pfe->tenant_id, pfe->auth_key_id,
                              pfe->auth_user_id, status, code,
                              pfe->l7_peer_ip, proxy_origin_ip(pfe),
-                             (int)proxy_origin_trusted_hops(pfe));
+                             (int)proxy_origin_trusted_hops(pfe),
+                             (int)pfe->auth_src, pfe->auth_net_identity);
   log_info("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
            "inflight=%u queued=%u limit=%u%s tenant=%s model=%s%s",
            pfe->fd, status, code, role, inflight, queued, limit,
@@ -9211,6 +9242,9 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   pfe->auth_user_id[sizeof(pfe->auth_user_id) - 1] = '\0';
   strncpy(pfe->auth_key_id, adm.key_id, sizeof(pfe->auth_key_id) - 1);
   pfe->auth_key_id[sizeof(pfe->auth_key_id) - 1] = '\0';
+  snprintf(pfe->auth_net_identity, sizeof(pfe->auth_net_identity), "%s",
+           adm.net_identity);
+  pfe->auth_src = adm.auth_src;
   pfe->auth_strip_authz = (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
   pfe->auth_fwd_identity = (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
   pfe->auth_jwt_capable =

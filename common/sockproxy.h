@@ -1485,6 +1485,12 @@ struct proxy_fd_ent {
                                       // ai_gw_decision_t.key_id. Settle-path twin of tenant/user above:
                                       // the key's own tokens-per-minute bucket charges at consume time,
                                       // which runs long after key_dec has gone out of scope
+  char     auth_net_identity[64];     // Network-identity binding that matched this request's source
+                                      // ("" = none); sized to ai_gw_admit_result_t.net_identity. Set on
+                                      // every admitted request a binding matched, whether it decided the
+                                      // tenant or was noted beside a credential
+  uint8_t  auth_src;                  // AI_GW_AUTH_SRC_*: what decided tenant_id. Per request, with the
+                                      // identity above
   // Upstream hygiene, stamped by the admission gate per request:
   uint8_t  auth_strip_authz;          // 1 = strip Authorization before dispatch (JWT arm decided, no passthrough)
   uint8_t  auth_fwd_identity;         // 1 = inject X-Auth-Tenant/X-Auth-User upstream (verified values)

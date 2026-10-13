@@ -133,6 +133,8 @@ typedef struct proxy_h2_stream {
   char     tenant_id[128];
   char     auth_user_id[128];
   char     auth_key_id[64];
+  char     auth_net_identity[64];    // binding that matched the stream's source ("" = none)
+  uint8_t  auth_src;                 // AI_GW_AUTH_SRC_*: what decided tenant_id
   char     effective_model[128];     // the gate's body-first model resolution
   char     svc_ident[64];            // "VIP:port" captured at admission — teardown paths
                                      // must not chase the rule head after it may be gone
@@ -487,6 +489,10 @@ typedef struct h2_inflight_settle {
   char    client_ip[L7_HOP_TEXT_MAX];
   char    origin_ip[L7_HOP_TEXT_MAX];
   int     trusted_hops;
+  /* What decided the tenant and the binding that matched, copied with the
+   * identity above. */
+  int     auth_src;
+  char    net_identity[64];
 } h2_inflight_settle_t;
 
 /*

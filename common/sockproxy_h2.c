@@ -280,7 +280,9 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                              stream->svc_ident, up, uc, 0,
                              (int)stream->usage_reserved_toks,
                              stream->usage_res_epoch,
-                             stream->request_id, notify_worker_id(), NULL);
+                             stream->request_id, notify_worker_id(),
+                             (int)stream->auth_src, stream->auth_net_identity,
+                             NULL);
   stream->usage_reserved_toks = 0;
   stream->usage_res_epoch = 0;
 
@@ -315,7 +317,8 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           notify_worker_id(),
                           pfe ? pfe->l7_peer_ip : "",
                           stream->l7_origin_ip,
-                          (int)stream->l7_trusted_hops);
+                          (int)stream->l7_trusted_hops,
+                          (int)stream->auth_src, stream->auth_net_identity);
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -407,6 +410,9 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     snprintf(e->client_ip, sizeof(e->client_ip), "%s", pfe->l7_peer_ip);
     snprintf(e->origin_ip, sizeof(e->origin_ip), "%s", stream->l7_origin_ip);
     e->trusted_hops = (int)stream->l7_trusted_hops;
+    e->auth_src = (int)stream->auth_src;
+    snprintf(e->net_identity, sizeof(e->net_identity), "%s",
+             stream->auth_net_identity);
     e->response_is_sse = stream->response_is_sse;
     e->prompt_toks = up;
     e->complet_toks = uc;
@@ -3360,7 +3366,8 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                              stream->auth_user_id, status, code,
                              pfe ? pfe->l7_peer_ip : "",
                              stream->l7_origin_ip,
-                             (int)stream->l7_trusted_hops);
+                             (int)stream->l7_trusted_hops,
+                             (int)stream->auth_src, stream->auth_net_identity);
   log_info("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
            "role=%d inflight=%u limit=%u tenant=%s model=%s",
            stream->stream_id, status, code, role, inflight, limit,
@@ -4294,6 +4301,9 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
                adm.user_id);
       snprintf(stream->auth_key_id, sizeof(stream->auth_key_id), "%s",
                adm.key_id);
+      snprintf(stream->auth_net_identity, sizeof(stream->auth_net_identity),
+               "%s", adm.net_identity);
+      stream->auth_src = adm.auth_src;
       snprintf(stream->effective_model, sizeof(stream->effective_model), "%s",
                adm.effective_model);
       snprintf(stream->svc_ident, sizeof(stream->svc_ident), "%s",

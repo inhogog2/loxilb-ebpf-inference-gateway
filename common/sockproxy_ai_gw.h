@@ -199,6 +199,13 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *                   tells an origin that resolved back to the peer apart from
  *                   a client that connected directly, since both report
  *                   origin_ip == client_ip. 0 when nothing was derived
+ *   auth_src:       what decided tenant_id: 0 a credential (or nothing), 1 a
+ *                   network-identity binding (AI_GW_AUTH_SRC_* in
+ *                   sockproxy_ai_admit.h)
+ *   net_identity:   name of the network-identity binding that matched the
+ *                   request's source, "" when none did. Set with auth_src 0
+ *                   when a credential decided and the binding was only
+ *                   matched beside it
  *
  * Returns void.
  */
@@ -208,7 +215,8 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
                                   char *request_id, char *user_id, char *key_id,
                                   char *svc_ident, int is_stream, int producer_id,
                                   char *client_ip, char *origin_ip,
-                                  int trusted_hops);
+                                  int trusted_hops, int auth_src,
+                                  char *net_identity);
 
 /*
  * llb_ai_record_deny – record one request refused at the admission gate.
@@ -237,13 +245,18 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
  *                 does. Note that the gate runs BEFORE the header splice, so
  *                 on a refused request origin_ip is normally "" — not
  *                 derived — while client_ip is always known
+ *   auth_src, net_identity: what decided the tenant and the binding that
+ *                 matched, as llb_ai_record_request documents. A refusal
+ *                 the binding itself caused (another tenant's credential,
+ *                 a model the binding does not allow) names it here
  */
 extern void llb_ai_record_deny(char *request_id, int producer_id,
                                char *svc_ident, char *model_name,
                                char *tenant_id, char *key_id, char *user_id,
                                int stage, int http_status, char *error_code,
                                char *client_ip, char *origin_ip,
-                               int trusted_hops);
+                               int trusted_hops, int auth_src,
+                               char *net_identity);
 
 /*
  * llb_ai_stream_start – record the opening of an SSE stream.
@@ -319,6 +332,10 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  *                  llb_ai_token_quota_reserve; the release is skipped when
  *                  the window has already rolled over (the rollover wiped the
  *                  claim). Pass 0 when no reservation was made.
+ *   auth_src, net_identity  what decided tenant_id and the network-identity
+ *                  binding that matched, as llb_ai_record_request documents:
+ *                  the charge's record names the same actor the request's
+ *                  other records do
  *   result         output structure; decision may be set to 3 when quota exceeded
  *
  * Returns:
@@ -332,6 +349,7 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int estimated, int reserved_toks,
                                       int64_t res_epoch,
                                       char *request_id, int producer_id,
+                                      int auth_src, char *net_identity,
                                       ai_gw_decision_t *result);
 
 /*
