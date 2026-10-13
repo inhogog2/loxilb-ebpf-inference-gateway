@@ -4788,6 +4788,7 @@ proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
       strncpy(st->pool, tepval->ephash_key, sizeof(st->pool) - 1);
       st->pool[sizeof(st->pool) - 1] = '\0';
       sp_fc_fill_queue_stat(fc, st);
+      st->listener_default_tokens = ent->val.ephash->ai_default_tokens;
       n++;
     }
   }
@@ -4845,6 +4846,9 @@ proxy_get_fc_state(struct proxy_ent *key, const char *host_url,
       strncpy(out->pool, tepval->ephash_key, sizeof(out->pool) - 1);
       out->pool[sizeof(out->pool) - 1] = '\0';
       sp_fc_fill_queue_stat(fc, out);
+      /* The gate reads the default reservation from the listener's first
+       * pool, before a pool is routed to: report that one, not this pool's. */
+      out->listener_default_tokens = ent->val.ephash->ai_default_tokens;
       rc = 0;
     }
     break;
