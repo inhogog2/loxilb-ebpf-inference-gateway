@@ -67,6 +67,16 @@ struct ebpfcfg {
 };
 
 void loxilb_set_loglevel(struct ebpfcfg *cfg);
+/* The data-plane log (log.c). After the proxy has started, log calls queue
+ * their lines and the log's writer thread writes them. */
+/* The writer renames the log and opens it anew when it would pass max_bytes;
+ * 0 = never. */
+void loxilb_log_rotate(unsigned long long max_bytes);
+/* Shutdown: write what is queued, waiting at most two seconds for the log's
+ * device; log calls write for themselves after it. */
+void loxilb_log_stop(void);
+/* Lines dropped on a full ring since start; level is a log.h level. */
+unsigned long long loxilb_log_dropped(int level);
 int loxilb_main(struct ebpfcfg *cfg);
 /* Interfaces to attach XDP in native (driver) mode on: a comma-separated
  * list or "all"; empty/NULL = generic (skb) mode everywhere (the default).

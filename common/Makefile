@@ -373,6 +373,15 @@ test_in_ifindex: test_in_ifindex.c sockproxy_in_ifindex.h
 test_inif: test_in_ifindex
 	./test_in_ifindex
 
+# The operational log: per-thread rings and one writer thread. A log call
+# never waits for a sink; a full ring drops and counts.
+test_log_ring: test_log_ring.c log.c log.h
+	$(CC) -Wall -Wextra -o $@ test_log_ring.c log.c -I. -lpthread
+
+.PHONY: test_log
+test_log: test_log_ring
+	./test_log_ring
+
 # Capacity admission gate: ceilings hold under contention, units come back
 # exactly once, two legs of one request count one service unit, a moved leg
 # never over-admits, observe admits and counts, off touches nothing. Pure
@@ -869,7 +878,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

@@ -8956,7 +8956,7 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
                              pfe->l7_peer_ip, proxy_origin_ip(pfe),
                              (int)proxy_origin_trusted_hops(pfe),
                              (int)pfe->auth_src, pfe->auth_net_identity);
-  log_info("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
+  log_debug("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
            "inflight=%u queued=%u limit=%u%s tenant=%s model=%s%s",
            pfe->fd, status, code, role, inflight, queued, limit,
            queue_full ? " (queue full)" : "", pfe->tenant_id,
@@ -9271,26 +9271,26 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
                           adm.retry_body, adm.error_code, adm.error_msg);
     switch (adm.stage) {
     case AI_GW_STAGE_CONFLICT:
-      log_info("[AIGateway] fd=%d %s model conflict: tenant=%s X-Model=%s",
+      log_debug("[AIGateway] fd=%d %s model conflict: tenant=%s X-Model=%s",
                pfe->fd, site, adm.tenant_id, pfe->x_model_header);
       break;
     case AI_GW_STAGE_RATELIMIT:
-      log_info("[AIGateway] fd=%d %s rate-limited: key=%s tenant=%s error=%s retry=%d",
+      log_debug("[AIGateway] fd=%d %s rate-limited: key=%s tenant=%s error=%s retry=%d",
                pfe->fd, site, adm.key_id, adm.tenant_id, adm.error_code,
                adm.retry_after);
       break;
     case AI_GW_STAGE_RESERVE:
-      log_info("[AIGateway] fd=%d %s pre-admission denied: tenant=%s want=%u error=%s retry=%d",
+      log_debug("[AIGateway] fd=%d %s pre-admission denied: tenant=%s want=%u error=%s retry=%d",
                pfe->fd, site, adm.tenant_id, adm.reserved_toks,
                adm.error_code, adm.retry_after);
       break;
     default:
       if (adm.net_identity[0])
-        log_info("[AIGateway] fd=%d %s rejected: status=%d error=%s tenant=%s net_identity=%s",
+        log_debug("[AIGateway] fd=%d %s rejected: status=%d error=%s tenant=%s net_identity=%s",
                  pfe->fd, site, adm.http_status, adm.error_code,
                  adm.tenant_id, adm.net_identity);
       else
-        log_info("[AIGateway] fd=%d %s rejected: status=%d key=%.8s...",
+        log_debug("[AIGateway] fd=%d %s rejected: status=%d key=%.8s...",
                  pfe->fd, site, adm.http_status, pfe->x_api_key_raw);
       break;
     }
@@ -9447,7 +9447,7 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
              SP_JSON_ROUTE_PREFIX_MAX);
     sp_h1_send_admit_deny(pfe, 413, 0, 0,
                           "request_too_large_for_admission", msg);
-    log_info("[AIGateway] fd=%d streamed request refused 413: no top-level "
+    log_debug("[AIGateway] fd=%d streamed request refused 413: no top-level "
              "model within %u buffered body bytes (content_length=%zu)",
              fd, SP_JSON_ROUTE_PREFIX_MAX, pfe->http_content_length);
     return;
@@ -13185,7 +13185,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                       "request body exceeds the gateway's "
                                       "buffered maximum; send a Content-Length");
                 pfe->lb_err_body_sent = 1;
-                log_info("[AIGateway] fd=%d request refused 413: %zu buffered "
+                log_debug("[AIGateway] fd=%d request refused 413: %zu buffered "
                          "bytes without a streamable Content-Length "
                          "(content_length=%zu hok=%d)", fd, pfe->rcv_off,
                          pfe->http_content_length, pfe->http_hok);
@@ -13250,7 +13250,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 "ambiguously framed request refused before admission\"}\r\n";
               send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);
               shutdown(pfe->fd, SHUT_RDWR);
-              log_info("[AIGateway] fd=%d parse error on an enforcing "
+              log_debug("[AIGateway] fd=%d parse error on an enforcing "
                        "service — refused before admission (no raw relay)",
                        pfe->fd);
               return -1; // Restart — never relay an ungated request

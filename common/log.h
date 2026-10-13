@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
 
 #define LOG_VERSION "0.1.0"
@@ -48,6 +49,26 @@ void log_set_level(int level);
 void log_set_quiet(bool enable);
 int log_add_callback(log_LogFn fn, void *udata, int level);
 int log_add_fp(FILE *fp, int level);
+
+
+/* After log_async_start() a log call copies its line into the calling
+ * thread's ring and returns; one writer thread writes the sinks, rotates a
+ * file sink and reports what was dropped. A full ring drops the line and
+ * counts it. log_async_stop() empties the rings and makes log calls write
+ * for themselves again; it waits timeout_ms for a writer held by a stalled
+ * sink and returns -1 if that was not enough. A FATAL line is always
+ * written by its caller. */
+int  log_async_start(void);
+int  log_async_stop(int timeout_ms);
+/* Wait until what is queued now has been handed to the sinks; -1 on timeout. */
+int  log_flush(int timeout_ms);
+/* Lines dropped on a full ring since start, by level. */
+uint64_t log_dropped(int level);
+/* The writer renames path and opens it anew when the file behind fp would
+ * pass max_bytes (0 = never). fp is a sink already added with log_add_fp. */
+int  log_rotate_fp(FILE *fp, const char *path, uint64_t max_bytes);
+/* Async-signal-safe: the calling thread's unwritten lines, written to fd. */
+void log_emergency_dump(int fd);
 
 void log_log(int level, const char *file, int line, const char *fmt, ...);
 

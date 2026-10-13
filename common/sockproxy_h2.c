@@ -3369,7 +3369,7 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                              stream->l7_origin_ip,
                              (int)stream->l7_trusted_hops,
                              (int)stream->auth_src, stream->auth_net_identity);
-  log_info("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
+  log_debug("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
            "role=%d inflight=%u limit=%u tenant=%s model=%s",
            stream->stream_id, status, code, role, inflight, limit,
            stream->tenant_id, stream->effective_model);
@@ -4285,12 +4285,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
                             adm.http_status, adm.retry_after,
                             adm.retry_body, adm.error_code, adm.error_msg);
       if (adm.net_identity[0])
-        log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+        log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s net_identity=%s",
                  stream->stream_id, adm.http_status, adm.stage,
                  adm.error_code, adm.key_id, adm.tenant_id, adm.net_identity);
       else
-        log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+        log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s",
                  stream->stream_id, adm.http_status, adm.stage,
                  adm.error_code, adm.key_id, adm.tenant_id);
@@ -4706,7 +4706,7 @@ h2_have_tepval:
     if (fc_ep < 0)
       return 0;
     if (fc_ep != ep_idx)
-      log_info("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
+      log_debug("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
                stream->stream_id, ep_idx, fc_ep);
     ep_idx = fc_ep;
   }
