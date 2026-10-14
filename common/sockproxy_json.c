@@ -617,25 +617,29 @@ json_value_extent(const char *vs, const char *end)
   }
 }
 
-/* Locate the value of a DIRECT (depth-1) key of a JSON object with a single
- * string- and escape-aware depth walk. No token pool: unlike the jsmn-based
- * extractors above this handles bodies of any size, and like them it can
- * never be spoofed by key-shaped text inside string values (quotes there
- * are escaped) or inside nested objects (depth != 1).
- * Returns 0 with [*val_start, *val_end) set; -1 when the key is absent
- * (*root_close then points at the object's closing brace); -2 when the
- * input is not a complete JSON object. */
+/* Walk the DIRECT (depth-1) keys of a JSON object with a single string- and
+ * escape-aware depth walk, and hand the value of every occurrence of key to
+ * visit, in order. No token pool: unlike the jsmn-based extractors above
+ * this handles bodies of any size, and like them it can never be spoofed by
+ * key-shaped text inside string values (quotes there are escaped) or inside
+ * nested objects (depth != 1). Keys are compared byte for byte: an escaped
+ * spelling of the key is another key.
+ * visit returns 0 to stop the walk there, non-zero to go on; it may rewrite
+ * the bytes of the value it was handed, as long as what it leaves is a
+ * value of the same extent with no quote, brace or bracket in it.
+ * Returns 0 when visit stopped the walk; -1 when the object ended (*root_close
+ * then points at its closing brace); -2 when the input is not a complete
+ * JSON object. */
+typedef int (*json_top_visit_fn)(const char *vs, const char *ve, void *ctx);
+
 static int
-json_top_find(const char *body, size_t len, const char *key, size_t klen,
-              const char **val_start, const char **val_end,
-              const char **root_close)
+json_top_walk(const char *body, size_t len, const char *key, size_t klen,
+              json_top_visit_fn visit, void *ctx, const char **root_close)
 {
   const char *p = body, *end = body + len;
   const char *str_start = NULL;
   int depth = 0, instr = 0, esc = 0, expect_value = 0, key_matched = 0;
 
-  if (val_start) *val_start = NULL;
-  if (val_end) *val_end = NULL;
   if (root_close) *root_close = NULL;
   if (!body || len == 0)
     return -2;
@@ -674,9 +678,9 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
         ve = json_value_extent(vs, end);
         if (!ve)
           return -2;
-        if (val_start) *val_start = vs;
-        if (val_end) *val_end = ve;
-        return 0;
+        if (!visit(vs, ve, ctx))
+          return 0;
+        key_matched = 0;
       }
       if (depth == 1)
         expect_value = 1;
@@ -704,6 +708,45 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
     }
   }
   return -2;
+}
+
+typedef struct {
+  const char *vs, *ve;
+} json_top_span_t;
+
+static int
+json_top_first(const char *vs, const char *ve, void *ctx)
+{
+  json_top_span_t *sp = ctx;
+  sp->vs = vs;
+  sp->ve = ve;
+  return 0;
+}
+
+static int
+json_top_last(const char *vs, const char *ve, void *ctx)
+{
+  json_top_span_t *sp = ctx;
+  sp->vs = vs;
+  sp->ve = ve;
+  return 1;
+}
+
+/* Locate the value of the first occurrence of a direct key (json_top_walk).
+ * Returns 0 with [*val_start, *val_end) set; -1 when the key is absent
+ * (*root_close then points at the object's closing brace); -2 when the
+ * input is not a complete JSON object. */
+static int
+json_top_find(const char *body, size_t len, const char *key, size_t klen,
+              const char **val_start, const char **val_end,
+              const char **root_close)
+{
+  json_top_span_t sp = { NULL, NULL };
+  int rc = json_top_walk(body, len, key, klen, json_top_first, &sp, root_close);
+
+  if (val_start) *val_start = rc == 0 ? sp.vs : NULL;
+  if (val_end) *val_end = rc == 0 ? sp.ve : NULL;
+  return rc;
 }
 
 int
@@ -879,8 +922,8 @@ estimate_prompt_tokens(const char *body, size_t len)
 
 // extract_service_tier reads the request's top-level "service_tier" as a
 // class hint. Only the three values that name a tier are a hint; "auto",
-// "default", "scale" and anything that is not a string are none, and the
-// caller leaves them alone.
+// "default", "scale" and anything that is not a string are none. With the
+// key more than once, the last occurrence is the one read.
 int
 extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen)
 {
@@ -890,8 +933,16 @@ extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen)
 
   if (off) *off = 0;
   if (vlen) *vlen = 0;
-  if (json_top_find(body, len, "service_tier", 12, &vs, &ve, NULL) != 0)
-    return AI_TIER_NONE;
+  {
+    /* The last occurrence decides: a JSON parser that keeps the last of
+     * duplicate keys, as the engines' do, reads that one. */
+    json_top_span_t sp = { NULL, NULL };
+    if (json_top_walk(body, len, "service_tier", 12, json_top_last, &sp, NULL) != -1 ||
+        !sp.vs)
+      return AI_TIER_NONE;
+    vs = sp.vs;
+    ve = sp.ve;
+  }
   if (!vs || !ve || ve <= vs + 2 || *vs != '"' || ve[-1] != '"')
     return AI_TIER_NONE;
   n = (size_t)(ve - vs) - 2;
@@ -915,6 +966,33 @@ json_null_value(char *body, size_t body_len, size_t off, size_t vlen)
     return;
   memcpy(body + off, "null", 4);
   memset(body + off + 4, ' ', vlen - 4);
+}
+
+static int
+json_top_null(const char *vs, const char *ve, void *ctx)
+{
+  int *n = ctx;
+  size_t vlen = (size_t)(ve - vs);
+
+  /* Shorter than "null" cannot be overwritten in place; it cannot name a
+   * tier either. */
+  if (vlen >= 4) {
+    memcpy((char *)(uintptr_t)vs, "null", 4);
+    memset((char *)(uintptr_t)vs + 4, ' ', vlen - 4);
+    (*n)++;
+  }
+  return 1;
+}
+
+int
+json_null_top_key(char *body, size_t body_len, const char *key, size_t klen)
+{
+  int n = 0;
+
+  if (!body || !key)
+    return 0;
+  (void)json_top_walk(body, body_len, key, klen, json_top_null, &n, NULL);
+  return n;
 }
 
 

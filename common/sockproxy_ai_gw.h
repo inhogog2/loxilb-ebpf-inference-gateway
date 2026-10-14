@@ -265,6 +265,11 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
  *                 matched, as llb_ai_record_request documents. A refusal
  *                 the binding itself caused (another tenant's credential,
  *                 a model the binding does not allow) names it here
+ *   priority, class_info, objective: the class the request had when it was
+ *                 refused, with exactly the meanings llb_ai_record_request
+ *                 documents, so that the records of one request agree.
+ *                 class_info is 0 for a refusal made before the class stage
+ *                 ran (no tenant yet, or nothing configured)
  */
 extern void llb_ai_record_deny(char *request_id, int producer_id,
                                char *svc_ident, char *model_name,
@@ -272,7 +277,9 @@ extern void llb_ai_record_deny(char *request_id, int producer_id,
                                int stage, int http_status, char *error_code,
                                char *client_ip, char *origin_ip,
                                int trusted_hops, int auth_src,
-                               char *net_identity);
+                               char *net_identity,
+                               int priority, int class_info,
+                               char *objective);
 
 /*
  * llb_ai_stream_start – record the opening of an SSE stream.

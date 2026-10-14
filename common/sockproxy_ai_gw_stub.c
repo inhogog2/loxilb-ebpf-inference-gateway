@@ -175,11 +175,15 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    char *tenant_id, char *key_id, char *user_id,
                    int stage, int http_status, char *error_code,
                    char *client_ip, char *origin_ip, int trusted_hops,
-                   int auth_src, char *net_identity)
+                   int auth_src, char *net_identity,
+                   int priority, int class_info, char *objective)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)auth_src;
     (void)net_identity;
+    (void)priority;
+    (void)class_info;
+    (void)objective;
     (void)request_id;
     (void)producer_id;
     (void)svc_ident;

@@ -497,9 +497,27 @@ main(void)
       { "tier-null", "{\"service_tier\":null}", AI_TIER_NONE, NULL },
       { "tier-empty-string", "{\"service_tier\":\"\"}", AI_TIER_NONE, NULL },
       { "tier-nested", "{\"opts\":{\"service_tier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      /* A nested key after a comma of its own object: the walk keeps the
+       * depth, not only the key / value alternation. */
+      { "tier-nested-after-a-comma", "{\"opts\":{\"a\":1,\"service_tier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      { "tier-nested-after-a-comma-left", "{\"opts\":{\"a\":1,\"service_tier\":\"fast\"},\"service_tier\":\"flex\"}",
+        AI_TIER_FLEX, "{\"opts\":{\"a\":1,\"service_tier\":\"fast\"},\"service_tier\":null  }" },
       { "tier-in-a-message", "{\"messages\":[{\"content\":\"\\\"service_tier\\\":\\\"flex\\\"\"}]}",
         AI_TIER_NONE, NULL },
       { "tier-absent", "{\"model\":\"m\"}", AI_TIER_NONE, NULL },
+      /* Duplicate keys: the last one is read, as a parser that keeps the
+       * last duplicate reads it, and every one is nulled. */
+      { "tier-dup-last-decides", "{\"service_tier\":\"flex\",\"service_tier\":\"priority\"}",
+        AI_TIER_PRIORITY, "{\"service_tier\":null  ,\"service_tier\":null      }" },
+      { "tier-dup-three-all-nulled", "{\"service_tier\":\"fast\",\"n\":{\"service_tier\":\"x\"},\"service_tier\":\"auto\",\"service_tier\":\"flex\"}",
+        AI_TIER_FLEX, "{\"service_tier\":null  ,\"n\":{\"service_tier\":\"x\"},\"service_tier\":null  ,\"service_tier\":null  }" },
+      { "tier-dup-last-no-hint", "{\"service_tier\":\"priority\",\"service_tier\":\"auto\"}", AI_TIER_NONE, NULL },
+      { "tier-dup-last-short", "{\"service_tier\":\"flex\",\"service_tier\":1}", AI_TIER_NONE, NULL },
+      /* An escaped spelling of the key is another key to the gateway: not
+       * read, not nulled (a known limit, in the guide). */
+      { "tier-escaped-key-is-not-read", "{\"service\\u005ftier\":\"priority\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-key-is-left", "{\"service_tier\":\"flex\",\"service\\u005ftier\":\"priority\"}",
+        AI_TIER_FLEX, "{\"service_tier\":null  ,\"service\\u005ftier\":\"priority\"}" },
       { "tier-garbage", "not json", AI_TIER_NONE, NULL },
     };
     size_t vi;
@@ -514,7 +532,8 @@ main(void)
         ok = ok && off == 0 && vlen == 0 && !memcmp(buf, st_vecs[vi].body, len);
       } else {
         ok = ok && off + vlen <= len && buf[off] == '"' && buf[off + vlen - 1] == '"';
-        json_null_value(buf, len, off, vlen);
+        /* what the proxy does with a consumed tier */
+        ok = ok && json_null_top_key(buf, len, "service_tier", 12) > 0;
         ok = ok && st_vecs[vi].after && strlen(st_vecs[vi].after) == len &&
              !memcmp(buf, st_vecs[vi].after, len);
       }
@@ -527,6 +546,19 @@ main(void)
         printf("ok   %-38s tier=%d\n", st_vecs[vi].name, got);
       }
       free(buf);
+    }
+    /* Every top-level occurrence is overwritten, and only those. */
+    {
+      char b[] = "{\"service_tier\":\"flex\",\"service_tier\":\"priority\",\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}]}";
+      const char *want = "{\"service_tier\":null  ,\"service_tier\":null      ,\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}]}";
+      int n = json_null_top_key(b, strlen(b), "service_tier", 12);
+      g_cases++;
+      if (n != 2 || strcmp(b, want)) { printf("FAIL null-top-key-every-occurrence n=%d -> %s\n", n, b); g_fails++; }
+      else printf("ok   null-top-key-every-occurrence\n");
+      g_cases++;
+      if (json_null_top_key(NULL, 4, "service_tier", 12) != 0 || json_null_top_key(b, 0, "service_tier", 12) != 0) {
+        printf("FAIL null-top-key-empty\n"); g_fails++;
+      } else printf("ok   null-top-key-empty\n");
     }
     /* The overwrite refuses what does not fit: nothing is written. */
     {

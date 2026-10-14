@@ -3464,7 +3464,12 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                              pfe ? pfe->l7_peer_ip : "",
                              stream->l7_origin_ip,
                              (int)stream->l7_trusted_hops,
-                             (int)stream->auth_src, stream->auth_net_identity);
+                             (int)stream->auth_src, stream->auth_net_identity,
+                             (int)stream->adm_priority,
+                             AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
+                                              stream->adm_objective_denied,
+                                              stream->adm_hint_not_applied),
+                             stream->adm_objective);
   log_debug("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
            "role=%d inflight=%u limit=%u tenant=%s model=%s",
            stream->stream_id, status, code, role, inflight, limit,
@@ -4448,8 +4453,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       stream->adm_hint_not_applied = adm.hint_not_applied;
       snprintf(stream->adm_objective, sizeof(stream->adm_objective), "%s", adm.objective);
       if (adm.tier_consumed && stream->data_buf)
-        json_null_value((char *)stream->data_buf, stream->data_len,
-                        adm.tier_off, adm.tier_len);
+        (void)json_null_top_key((char *)stream->data_buf, stream->data_len,
+                                "service_tier", 12);
       stream->admit_mono_ns = get_timestamp_ns();
     }
   }
