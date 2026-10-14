@@ -260,6 +260,9 @@ typedef struct sp_resv_route {
 int sp_resv_default_tokens_of(void *arg, const char *model);
 int sp_resv_default_tokens_route(proxy_map_ent_t *ent, const char *host,
                                  const char *path, const char *model);
+int sp_resv_objective_strict_of(void *arg, const char *model);
+int sp_resv_objective_strict_route(proxy_map_ent_t *ent, const char *host,
+                                   const char *path, const char *model);
 int sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval);
 int sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel);
 int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,

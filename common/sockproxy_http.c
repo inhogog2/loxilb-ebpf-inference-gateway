@@ -9352,6 +9352,20 @@ sp_resv_default_tokens_of(void *arg, const char *model)
   return sp_resv_default_tokens_route(r->ent, host_only, r->path, model);
 }
 
+int
+sp_resv_objective_strict_of(void *arg, const char *model)
+{
+  sp_resv_route_t *r = arg;
+  char host_only[256];
+
+  if (!r || !r->ent)
+    return 0;
+  if (!r->host)
+    return sp_resv_objective_strict_route(r->ent, NULL, r->path, model);
+  strip_port_from_hostname(r->host, host_only, sizeof(host_only));
+  return sp_resv_objective_strict_route(r->ent, host_only, r->path, model);
+}
+
 static void
 sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
                              const proxy_map_ent_t *hent,
@@ -9373,7 +9387,7 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->hdr_model = pfe->x_model_header;
   req->class_on = ai_gw_class_on();
   req->objective_hint = pfe->obj_hint.name;
-  req->objective_strict = hent->val.ephash->ai_objective_strict;
+  req->objective_strict_of = sp_resv_objective_strict_of;
   req->auth_mode = hent->val.ephash->apikey_auth;
   /* The gate runs before the header splice, so a refused request normally
    * has no derived origin and proxy_origin_ip returns "" — which says "not
@@ -10565,15 +10579,13 @@ cresp_on_message_complete(llhttp_t *parser)
 {
   proxy_fd_ent_t *pfe = parser->data;
 
+  /* The read that completes a streamed answer records the stream's end
+   * (the scanner in proxy_try_epxmit reads cresp_sse.done), so the client's
+   * next request on this connection is a request boundary, not bytes sent
+   * into a running stream. */
   if (pfe) {
     creq_block_msg_done(&pfe->cresp_blk);
-    /* The framed end of a streamed answer is its end, whether or not it
-     * carried the [DONE] event: the read that completes the response is
-     * the one that records the stream's end, so the client's next request
-     * on this connection is a request boundary, not bytes sent into a
-     * running stream. */
-    if (pfe->cresp_sse.is_sse)
-      pfe->cresp_sse.done = 1;
+    sp_sse_message_done(&pfe->cresp_sse);
   }
   if (pfe && cresp_is_answer(parser->status_code)) {
     /* Capture ownership survives a policy change and names modern H1

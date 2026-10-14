@@ -1698,6 +1698,8 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       /* Non-final (1xx, e.g. 100 Continue, 103 Early Hints): relay as is.
        * The final response follows, so the stream stays open and the
        * response header injection below waits for it. */
+      if (cstream->resp_strip_api_key)
+        proxy_h2_drop_resp_header(mapping, "x-api-key", 9);
       rv = nghttp2_submit_headers(client_session->session, NGHTTP2_FLAG_NONE,
                                   client_stream_id, NULL,
                                   mapping->response_headers,
@@ -1717,6 +1719,12 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       if (nv->namelen == 12 && !memcmp(nv->name, "content-type", 12))
         cstream->response_is_sse = sp_sse_content_type((char *)nv->value, nv->valuelen);
     }
+
+    /* A backend's X-Api-Key does not leave a service that declares
+     * api_key_auth: the HTTP/1.1 rule (sp_resp_strip_api_key), on a
+     * response head, interim or final. Trailers are not a head and pass. */
+    if (cstream->resp_strip_api_key)
+      proxy_h2_drop_resp_header(mapping, "x-api-key", 9);
 
     /* The admission headers, when the stream holds its units on a pool
      * that exposes them. The values are read now, while the stream still
@@ -3003,6 +3011,29 @@ proxy_check_and_setup_h2(proxy_fd_ent_t *pfe)
  * cleanup loops free them uniformly; mapping->data_source (the request DATA
  * provider) is never touched, so the body stays attached.
  */
+size_t
+proxy_h2_drop_resp_header(stream_mapping_t *mapping, const char *name,
+                          size_t namelen)
+{
+  size_t i, j, dropped = 0;
+
+  if (!mapping || !mapping->response_headers || !name || namelen == 0)
+    return 0;
+  for (i = 0, j = 0; i < mapping->response_headers_count; i++) {
+    nghttp2_nv *nv = &mapping->response_headers[i];
+    if (nv->namelen == namelen &&
+        !strncasecmp((const char *)nv->name, name, namelen)) {
+      free(nv->name);
+      free(nv->value);
+      dropped++;
+      continue;
+    }
+    mapping->response_headers[j++] = *nv;
+  }
+  mapping->response_headers_count = j;
+  return dropped;
+}
+
 int
 proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
                              const nghttp2_nv *extra, size_t nextra)
@@ -4313,7 +4344,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .hdr_model = stream->x_model_header,
       .class_on = ai_gw_class_on(),
       .objective_hint = stream->obj_hint.name,
-      .objective_strict = ent->val.ephash->ai_objective_strict,
+      .objective_strict_of = sp_resv_objective_strict_of,
       .auth_mode = ent->val.ephash->apikey_auth,
       .default_tokens_of = sp_resv_default_tokens_of,
       .default_tokens_arg = &adm_route,
@@ -5161,6 +5192,10 @@ h2_have_tepval:
   int security_headers_built = 0;
   uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
   int hygiene_jwt = stream->ai_admitted && stream->auth_jwt_capable;
+  /* The same declaration closes the response direction: see the final
+   * response in proxy_h2_backend_on_frame_recv_callback. */
+  stream->resp_strip_api_key =
+    ai_security_should_strip_api_key(security_policy) ? 1 : 0;
   /* A service with a binding that forwards identity owns the X-Auth-*
    * family for every stream, admitted by a binding or not (parity with the
    * H1 splice). One atomic load while no such binding exists. */

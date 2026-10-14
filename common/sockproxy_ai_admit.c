@@ -481,7 +481,7 @@ typedef struct {
  * never a condition of admission. Returns -1 when it refused. */
 static int
 admit_class(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
-            const char *svc_ident, const admit_ident_t *id)
+            const char *svc_ident, const admit_ident_t *id, const char *model)
 {
   const char *hint = req->objective_hint ? req->objective_hint : "";
   const char *profile = (res->auth_src == AI_GW_AUTH_SRC_BEARER && req->jwt_profile)
@@ -510,7 +510,10 @@ admit_class(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
   res->objective_denied = cls.objective_denied ? 1 : 0;
   snprintf(res->objective, sizeof(res->objective), "%s", cls.objective);
 
-  if (res->objective_denied && req->objective_strict) {
+  if (res->objective_denied &&
+      (req->objective_strict_of
+         ? req->objective_strict_of(req->default_tokens_arg, model)
+         : req->objective_strict)) {
     set_deny(res, AI_GW_STAGE_OBJECTIVE, 403, 0, 0, "objective_not_allowed",
              "Objective not permitted for this identity");
     return -1;
@@ -568,7 +571,7 @@ admit_metered(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
    * configured. Before the rate limit: a request refused for the objective
    * it named is not counted against its tenant's rate. */
   if (req->class_on && id->tenant_id[0] &&
-      admit_class(req, res, svc_ident, id) != 0)
+      admit_class(req, res, svc_ident, id, model) != 0)
     return -1;
 
   /* Stage 3: per-key then per-tenant RPS check → 429. The body-bound model

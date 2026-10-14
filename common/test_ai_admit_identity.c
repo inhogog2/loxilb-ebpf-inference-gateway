@@ -650,6 +650,21 @@ dt_lookup(void *arg, const char *model)
   return dt_stub.answer;
 }
 
+/* Several rules share a listener: the strict knob is the routed rule's,
+ * asked with the model the gate resolved, and stands in for the plain
+ * value in both directions. */
+static struct { int calls; int answer; void *arg; char model[64]; } so_stub;
+static int
+so_lookup(void *arg, const char *model)
+{
+  so_stub.calls++;
+  so_stub.arg = arg;
+  snprintf(so_stub.model, sizeof(so_stub.model), "%s", model);
+  return so_stub.answer;
+}
+
+static void test_objective_strict_is_the_routed_rules(void);
+
 static void
 test_default_reservation_is_the_routed_rules(void)
 {
@@ -2096,6 +2111,47 @@ class_key_req(void)
   return req;
 }
 
+static void
+test_objective_strict_is_the_routed_rules(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+  int cookie;
+
+  req.objective_hint = "not-mine";
+  req.objective_strict_of = so_lookup;
+  req.default_tokens_arg = &cookie;
+
+  /* the routed rule is strict, the plain value is not: refused */
+  req.objective_strict = 0;
+  reset_stubs();
+  memset(&so_stub, 0, sizeof(so_stub));
+  so_stub.answer = 1;
+  cls_stub.out.objective_denied = 1;
+  assert(ai_gw_admit(&req, &res) != 0);
+  assert(res.verdict == AI_GW_ADMIT_DENY && res.stage == AI_GW_STAGE_OBJECTIVE);
+  assert(so_stub.calls == 1 && so_stub.arg == &cookie);
+  assert(strcmp(so_stub.model, res.effective_model) == 0 && so_stub.model[0]);
+  assert(rl_stub.calls == 0);
+
+  /* the routed rule is not strict, the plain value is: served on the default */
+  req.objective_strict = 1;
+  reset_stubs();
+  memset(&so_stub, 0, sizeof(so_stub));
+  so_stub.answer = 0;
+  cls_stub.out.objective_denied = 1;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW && res.objective_denied == 1);
+  assert(so_stub.calls == 1);
+
+  /* an objective that is allowed never asks the rule */
+  reset_stubs();
+  memset(&so_stub, 0, sizeof(so_stub));
+  so_stub.answer = 1;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW && so_stub.calls == 0);
+}
+
 /* With no class configured the gate asks nothing and reads nothing: the
  * request is decided exactly as before the stage existed. */
 static void
@@ -2478,6 +2534,7 @@ main(void)
   test_net_forward_flag_does_not_change_the_decision();
   test_netid_bound_set_is_replaced_under_readers();
   test_class_off_asks_nothing();
+  test_objective_strict_is_the_routed_rules();
   test_class_needs_a_tenant();
   test_class_key_arm();
   test_class_bearer_arm_names_its_profile();

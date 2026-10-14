@@ -155,6 +155,7 @@ typedef struct proxy_h2_stream {
   uint8_t  adm_objective_denied;
   uint8_t  adm_hint_not_applied;
   uint8_t  class_expose;             // the response head carries the class headers
+  uint8_t  resp_strip_api_key;       // the service declares api_key_auth: a backend's x-api-key stays out of a response head
   char     adm_objective[64];
   uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
   int64_t  usage_res_epoch;          // reservation window tag
@@ -559,6 +560,12 @@ int proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
  */
 int proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
                                  const nghttp2_nv *extra, size_t nextra);
+
+/* Drop every field named `name` (case-insensitive, the whole name) from the
+ * response header set collected for a stream, before it is submitted to the
+ * client. Returns the number of fields dropped. Touches nothing else. */
+size_t proxy_h2_drop_resp_header(stream_mapping_t *mapping,
+                                 const char *name, size_t namelen);
 
 /**
  * Create or get backend HTTP/2 session for endpoint

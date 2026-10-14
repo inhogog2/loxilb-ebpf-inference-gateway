@@ -188,10 +188,15 @@ typedef struct ai_gw_req_ctx {
    * objective_hint is the objective name the request's header asks for
    * ("" or NULL when it carries none). objective_strict is the rule's
    * ai_objective_strict: a request that names an objective it may not use
-   * is refused 403 instead of falling to its default. */
+   * is refused 403 instead of falling to its default. Several rules can
+   * share a listener, so the knob is the routed rule's, like the default
+   * reservation: objective_strict_of(default_tokens_arg, model), when set,
+   * is asked with the model the gate resolved and stands in for the plain
+   * value. */
   int         class_on;
   const char *objective_hint;
   int         objective_strict;
+  int       (*objective_strict_of)(void *arg, const char *model);
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {

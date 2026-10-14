@@ -298,3 +298,20 @@ sp_resv_default_tokens_route(proxy_map_ent_t *ent, const char *host,
     ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
   return ep ? (int)ep->ai_default_tokens : 0;
 }
+
+/* The same lookup for the rule's ai_objective_strict. 0 when no pool
+ * matches: the request is refused at dispatch whatever it names. */
+int
+sp_resv_objective_strict_route(proxy_map_ent_t *ent, const char *host,
+                               const char *path, const char *model)
+{
+  proxy_epval_t *ep;
+
+  if (!ent)
+    return 0;
+  if (!host)
+    ep = ent->val.ephash;
+  else
+    ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
+  return ep ? (int)ep->ai_objective_strict : 0;
+}
