@@ -27,6 +27,9 @@
  *   2. body/header model conflict (400)                — decided after the
  *      credential so an unauthenticated probe still reads as 401, before
  *      rate/quota so an ill-formed request never consumes budget.
+ *      Between 2 and 3, while any class is configured: the class of the
+ *      request (403 on a rule with ai_objective_strict when it names an
+ *      objective it may not use; otherwise never a refusal).
  *   3. RPS / token-quota latch (429, 503 on store loss)
  *   4. pre-admission token reservation (429)
  */
@@ -360,6 +363,20 @@ ai_gw_netid_fwd_any(void)
           (NETID_ST_ALL_FWD | NETID_ST_ANY_FWD)) != 0;
 }
 
+static _Atomic int class_on_state;
+
+void
+ai_gw_class_on_set(int on)
+{
+  atomic_store_explicit(&class_on_state, on ? 1 : 0, memory_order_relaxed);
+}
+
+int
+ai_gw_class_on(void)
+{
+  return atomic_load_explicit(&class_on_state, memory_order_relaxed);
+}
+
 void
 ai_gw_netid_ifmatch_set(int on)
 {
@@ -457,6 +474,57 @@ typedef struct {
   int         net_model_refused;
 } admit_ident_t;
 
+/* The class stage: what the request asks for, held under what its identity
+ * allows. Runs once the tenant is known and before anything is charged, so
+ * a refusal here spends nothing. A resolver that cannot answer leaves the
+ * request standard: a class is a preference between admitted requests,
+ * never a condition of admission. Returns -1 when it refused. */
+static int
+admit_class(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
+            const char *svc_ident, const admit_ident_t *id)
+{
+  const char *hint = req->objective_hint ? req->objective_hint : "";
+  const char *profile = (res->auth_src == AI_GW_AUTH_SRC_BEARER && req->jwt_profile)
+                        ? req->jwt_profile : "";
+  ai_gw_class_t cls;
+  size_t off = 0, vlen = 0;
+  int tier = AI_TIER_NONE;
+
+  /* The body's hint is read only from a body that is whole in the buffer,
+   * the condition the model is read under. */
+  if (req->body && req->body_len > 0 && !req->prefix_only)
+    tier = extract_service_tier(req->body, req->body_len, &off, &vlen);
+  else if (!hint[0])
+    res->hint_not_applied = 1;
+
+  memset(&cls, 0, sizeof(cls));
+  if (llb_ai_class_resolve((char *)id->tenant_id, (char *)id->key_id,
+                           (char *)res->net_identity, (char *)profile,
+                           (char *)svc_ident, (char *)hint, tier, &cls) != 0)
+    memset(&cls, 0, sizeof(cls));
+  cls.objective[sizeof(cls.objective) - 1] = '\0';
+
+  res->priority = cls.priority;
+  res->priority_class = cls.priority_class <= AI_GW_CLASS_SHEDDABLE
+                        ? cls.priority_class : AI_GW_CLASS_STANDARD;
+  res->objective_denied = cls.objective_denied ? 1 : 0;
+  snprintf(res->objective, sizeof(res->objective), "%s", cls.objective);
+
+  if (res->objective_denied && req->objective_strict) {
+    set_deny(res, AI_GW_STAGE_OBJECTIVE, 403, 0, 0, "objective_not_allowed",
+             "Objective not permitted for this identity");
+    return -1;
+  }
+  /* The gateway read the tier, so the backend does not get to read it
+   * again: the caller nulls the value, whichever hint decided. */
+  if (tier != AI_TIER_NONE) {
+    res->tier_consumed = 1;
+    res->tier_off = (uint32_t)off;
+    res->tier_len = (uint32_t)vlen;
+  }
+  return 0;
+}
+
 /* Stages 2 to 4 for an identity that is already decided: the conflict
  * rule, rate and quota, the reservation. One body for every way a tenant
  * is decided, so a network tenant is held to exactly what a credential's
@@ -495,6 +563,13 @@ admit_metered(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
   snprintf(res->user_id, sizeof(res->user_id), "%s", id->user_id);
   res->auth_flags = id->auth_flags;
   snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
+
+  /* The class, for a request that has a tenant, while any class is
+   * configured. Before the rate limit: a request refused for the objective
+   * it named is not counted against its tenant's rate. */
+  if (req->class_on && id->tenant_id[0] &&
+      admit_class(req, res, svc_ident, id) != 0)
+    return -1;
 
   /* Stage 3: per-key then per-tenant RPS check → 429. The body-bound model
    * rides along so the token-quota stage can consult the tenant|model

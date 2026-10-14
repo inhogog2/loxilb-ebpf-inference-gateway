@@ -29,6 +29,7 @@
 #include "log.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_json.h"
+#include "sockproxy_ai_gw.h"   /* AI_TIER_* */
 #include "sockproxy_json_unescape.h"
 
 // ============================================================================
@@ -875,6 +876,47 @@ estimate_prompt_tokens(const char *body, size_t len)
   if (est > 100000000L) est = 100000000L;
   return (int)est;
 }
+
+// extract_service_tier reads the request's top-level "service_tier" as a
+// class hint. Only the three values that name a tier are a hint; "auto",
+// "default", "scale" and anything that is not a string are none, and the
+// caller leaves them alone.
+int
+extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen)
+{
+  const char *vs = NULL, *ve = NULL;
+  size_t n;
+  int tier = AI_TIER_NONE;
+
+  if (off) *off = 0;
+  if (vlen) *vlen = 0;
+  if (json_top_find(body, len, "service_tier", 12, &vs, &ve, NULL) != 0)
+    return AI_TIER_NONE;
+  if (!vs || !ve || ve <= vs + 2 || *vs != '"' || ve[-1] != '"')
+    return AI_TIER_NONE;
+  n = (size_t)(ve - vs) - 2;
+  if (n == 4 && memcmp(vs + 1, "flex", 4) == 0)
+    tier = AI_TIER_FLEX;
+  else if (n == 8 && memcmp(vs + 1, "priority", 8) == 0)
+    tier = AI_TIER_PRIORITY;
+  else if (n == 4 && memcmp(vs + 1, "fast", 4) == 0)
+    tier = AI_TIER_FAST;
+  if (tier != AI_TIER_NONE) {
+    if (off) *off = (size_t)(vs - body);
+    if (vlen) *vlen = (size_t)(ve - vs);
+  }
+  return tier;
+}
+
+void
+json_null_value(char *body, size_t body_len, size_t off, size_t vlen)
+{
+  if (!body || vlen < 4 || off > body_len || vlen > body_len - off)
+    return;
+  memcpy(body + off, "null", 4);
+  memset(body + off + 4, ' ', vlen - 4);
+}
+
 
 // AI Gateway pre-admission: read the request's declared completion ceiling.
 // max_completion_tokens (the current OpenAI chat name) wins over the legacy

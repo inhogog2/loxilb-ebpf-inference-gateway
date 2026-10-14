@@ -281,10 +281,62 @@ nid_bind(const char *tenant, int strict, int credential_network)
   strcpy(nid_stub.out.binding, "line-1");
 }
 
+/* ---- class resolver double, and the body's tier ------------------------- */
+
+static struct {
+  int  calls;
+  char tenant[128];
+  char key[64];
+  char binding[64];
+  char profile[64];
+  char svc[64];
+  char hint[128];
+  int  tier;
+  int  rc;
+  ai_gw_class_t out;
+} cls_stub;
+
+int
+llb_ai_class_resolve(char *tenant, char *key_id, char *binding, char *profile,
+                     char *svc_ident, char *objective_hint, int tier_hint,
+                     ai_gw_class_t *out)
+{
+  cls_stub.calls++;
+  snprintf(cls_stub.tenant, sizeof(cls_stub.tenant), "%s", tenant);
+  snprintf(cls_stub.key, sizeof(cls_stub.key), "%s", key_id);
+  snprintf(cls_stub.binding, sizeof(cls_stub.binding), "%s", binding);
+  snprintf(cls_stub.profile, sizeof(cls_stub.profile), "%s", profile);
+  snprintf(cls_stub.svc, sizeof(cls_stub.svc), "%s", svc_ident);
+  snprintf(cls_stub.hint, sizeof(cls_stub.hint), "%s", objective_hint);
+  cls_stub.tier = tier_hint;
+  assert(out->priority == 0 && out->objective[0] == '\0');
+  *out = cls_stub.out;
+  return cls_stub.rc;
+}
+
+static struct {
+  int    calls;
+  int    tier;
+  size_t off, vlen;
+} tier_stub;
+
+int
+extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen)
+{
+  (void)body;
+  (void)len;
+  tier_stub.calls++;
+  *off = tier_stub.tier ? tier_stub.off : 0;
+  *vlen = tier_stub.tier ? tier_stub.vlen : 0;
+  return tier_stub.tier;
+}
+
 static void
 reset_stubs(void)
 {
   memset(&nid_stub, 0, sizeof(nid_stub));
+  memset(&cls_stub, 0, sizeof(cls_stub));
+  memset(&tier_stub, 0, sizeof(tier_stub));
   validate_key_calls = 0;
   validate_bearer_calls = 0;
   validate_key_decision = 0;
@@ -2027,6 +2079,310 @@ test_netid_bound_set_is_replaced_under_readers(void)
   assert(ai_gw_netid_bound("192.0.2.1:443") == 0);
 }
 
+/* ---- the class stage ----------------------------------------------------- */
+
+static ai_gw_req_ctx_t
+class_key_req(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "lxb_k",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .class_on = 1,
+  };
+  return req;
+}
+
+/* With no class configured the gate asks nothing and reads nothing: the
+ * request is decided exactly as before the stage existed. */
+static void
+test_class_off_asks_nothing(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  req.class_on = 0;
+  req.objective_hint = "realtime";
+  req.objective_strict = 1;
+  reset_stubs();
+  tier_stub.tier = AI_TIER_FLEX;
+  cls_stub.out.objective_denied = 1;   /* would refuse, were it asked */
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(cls_stub.calls == 0 && tier_stub.calls == 0);
+  assert(res.priority == 0 && res.priority_class == AI_GW_CLASS_STANDARD);
+  assert(res.objective[0] == '\0' && !res.objective_denied);
+  assert(!res.tier_consumed && !res.hint_not_applied);
+  assert(rl_stub.calls == 1 && rs_stub.calls == 1);
+}
+
+/* A keyless request on a service that asks for no credential has no tenant:
+ * no class is resolved for it. */
+static void
+test_class_needs_a_tenant(void)
+{
+  ai_gw_req_ctx_t req = {
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 0,
+    .svc_ident = "10.0.0.1:2040",
+    .class_on = 1,
+    .objective_hint = "realtime",
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  tier_stub.tier = AI_TIER_FLEX;
+  (void)ai_gw_admit(&req, &res);
+  assert(res.verdict != AI_GW_ADMIT_DENY);
+  assert(cls_stub.calls == 0 && tier_stub.calls == 0);
+  assert(!res.tier_consumed);
+}
+
+static void
+test_class_key_arm(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  req.objective_hint = "realtime";
+  reset_stubs();
+  cls_stub.out.priority = 10;
+  cls_stub.out.priority_class = AI_GW_CLASS_CRITICAL;
+  strcpy(cls_stub.out.objective, "realtime");
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(cls_stub.calls == 1);
+  assert(strcmp(cls_stub.tenant, "tenant-1") == 0 && strcmp(cls_stub.key, "key-1") == 0);
+  assert(cls_stub.binding[0] == '\0' && cls_stub.profile[0] == '\0');
+  assert(strcmp(cls_stub.svc, "10.0.0.1:2040") == 0);
+  assert(strcmp(cls_stub.hint, "realtime") == 0 && cls_stub.tier == AI_TIER_NONE);
+  assert(res.priority == 10 && res.priority_class == AI_GW_CLASS_CRITICAL);
+  assert(strcmp(res.objective, "realtime") == 0 && !res.objective_denied);
+  assert(!res.tier_consumed && !res.hint_not_applied);
+  /* The class is decided before rate and reservation, which still run. */
+  assert(rl_stub.calls == 1 && rs_stub.calls == 1);
+
+  /* No header at all is an empty hint, not a NULL the resolver must guard. */
+  req.objective_hint = NULL;
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(cls_stub.calls == 1 && cls_stub.hint[0] == '\0');
+  assert(res.priority_class == AI_GW_CLASS_STANDARD && !res.hint_not_applied);
+
+  /* A class number the gate does not know is not passed on. */
+  reset_stubs();
+  cls_stub.out.priority_class = 9;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.priority_class == AI_GW_CLASS_STANDARD);
+
+  /* An objective with no terminator is cut, not read past. */
+  reset_stubs();
+  memset(cls_stub.out.objective, 'x', sizeof(cls_stub.out.objective));
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(strlen(res.objective) == sizeof(res.objective) - 1);
+}
+
+static void
+test_class_bearer_arm_names_its_profile(void)
+{
+  ai_gw_req_ctx_t req = {
+    .bearer = "Bearer tok",
+    .jwt_profile = "kc",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 3,
+    .svc_ident = "10.0.0.1:2040",
+    .class_on = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(cls_stub.calls == 1);
+  assert(strcmp(cls_stub.profile, "kc") == 0);
+  assert(strcmp(cls_stub.tenant, "tenant-1") == 0 && cls_stub.key[0] == '\0');
+
+  /* A key on a key-or-token service was not verified by the profile. */
+  req.bearer = NULL;
+  req.api_key = "lxb_k";
+  req.auth_mode = 4;
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(cls_stub.calls == 1 && cls_stub.profile[0] == '\0');
+  assert(strcmp(cls_stub.key, "key-1") == 0);
+}
+
+static void
+test_class_network_arm_names_its_binding(void)
+{
+  ai_gw_req_ctx_t req = {
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 0,
+    .svc_ident = NET_SVC,
+    .client_ip = NET_SRC,
+    .netid_bound = 1,
+    .class_on = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  nid_bind("line-1-tenant", 0, 0);
+  cls_stub.out.priority = -1;
+  cls_stub.out.priority_class = AI_GW_CLASS_SHEDDABLE;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(cls_stub.calls == 1);
+  assert(strcmp(cls_stub.tenant, "line-1-tenant") == 0);
+  assert(strcmp(cls_stub.binding, "line-1") == 0);
+  assert(cls_stub.key[0] == '\0' && cls_stub.profile[0] == '\0');
+  assert(res.priority == -1 && res.priority_class == AI_GW_CLASS_SHEDDABLE);
+}
+
+/* A request that names an objective it may not use is admitted at its
+ * default, with the fact on the result; on a strict rule it is refused 403
+ * before the rate limit and the reservation are asked. */
+static void
+test_class_denied_falls_through_unless_strict(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  req.objective_hint = "not-mine";
+  reset_stubs();
+  cls_stub.out.objective_denied = 1;
+  cls_stub.out.priority = -5;
+  cls_stub.out.priority_class = AI_GW_CLASS_SHEDDABLE;
+  strcpy(cls_stub.out.objective, "batch");
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(res.objective_denied == 1);
+  assert(res.priority == -5 && strcmp(res.objective, "batch") == 0);
+  assert(rl_stub.calls == 1 && rs_stub.calls == 1 && deny_stub.calls == 0);
+
+  req.objective_strict = 1;
+  reset_stubs();
+  cls_stub.out.objective_denied = 1;
+  tier_stub.tier = AI_TIER_FLEX;
+  tier_stub.off = 3;
+  tier_stub.vlen = 6;
+  assert(ai_gw_admit(&req, &res) != 0);
+  assert(res.verdict == AI_GW_ADMIT_DENY);
+  assert(res.stage == AI_GW_STAGE_OBJECTIVE && res.http_status == 403);
+  assert(strcmp(res.error_code, "objective_not_allowed") == 0);
+  assert(res.error_msg[0] != '\0' && res.retry_after == 0 && res.retry_body == 0);
+  assert(strcmp(res.tenant_id, "tenant-1") == 0 && strcmp(res.key_id, "key-1") == 0);
+  assert(rl_stub.calls == 0 && rs_stub.calls == 0);   /* nothing charged */
+  assert(deny_stub.calls == 1);                       /* and it is recorded */
+  assert(!res.tier_consumed);                         /* nothing is forwarded */
+
+  /* Strict refuses a denied objective only. */
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+}
+
+/* A tier the gateway read is handed back to be nulled, with where it is,
+ * whether the tier or a header decided. A value that is no tier is not. */
+static void
+test_class_tier_is_consumed_whoever_decided(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  tier_stub.tier = AI_TIER_PRIORITY;
+  tier_stub.off = 17;
+  tier_stub.vlen = 10;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(tier_stub.calls == 1 && cls_stub.tier == AI_TIER_PRIORITY);
+  assert(res.tier_consumed == 1 && res.tier_off == 17 && res.tier_len == 10);
+  assert(!res.hint_not_applied);
+
+  req.objective_hint = "realtime";
+  reset_stubs();
+  tier_stub.tier = AI_TIER_FLEX;
+  tier_stub.off = 5;
+  tier_stub.vlen = 6;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(strcmp(cls_stub.hint, "realtime") == 0 && cls_stub.tier == AI_TIER_FLEX);
+  assert(res.tier_consumed == 1 && res.tier_off == 5 && res.tier_len == 6);
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(tier_stub.calls == 1 && !res.tier_consumed && res.tier_len == 0);
+}
+
+/* A body that is not whole in the buffer is not searched for a tier. With
+ * no header hint either, the result says a body hint could not be read. */
+static void
+test_class_streamed_body(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "lxb_k",
+    .prefix_model = "m9",
+    .prefix_only = 1,
+    .declared_content_length = 4000,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .class_on = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  tier_stub.tier = AI_TIER_FLEX;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(tier_stub.calls == 0 && cls_stub.calls == 1 && cls_stub.tier == AI_TIER_NONE);
+  assert(res.hint_not_applied == 1 && !res.tier_consumed);
+
+  req.objective_hint = "realtime";
+  reset_stubs();
+  tier_stub.tier = AI_TIER_FLEX;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(tier_stub.calls == 0 && strcmp(cls_stub.hint, "realtime") == 0);
+  assert(!res.hint_not_applied && !res.tier_consumed);
+}
+
+/* A resolver that cannot answer leaves the request standard and admitted,
+ * strict rule or not: a class is not a condition of admission. */
+static void
+test_class_resolver_failure_is_standard(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  req.objective_hint = "realtime";
+  req.objective_strict = 1;
+  reset_stubs();
+  cls_stub.rc = -1;
+  cls_stub.out.priority = 10;
+  cls_stub.out.priority_class = AI_GW_CLASS_CRITICAL;
+  cls_stub.out.objective_denied = 1;
+  strcpy(cls_stub.out.objective, "realtime");
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(res.priority == 0 && res.priority_class == AI_GW_CLASS_STANDARD);
+  assert(res.objective[0] == '\0' && !res.objective_denied);
+  assert(rl_stub.calls == 1 && rs_stub.calls == 1);
+}
+
+static void
+test_class_on_switch(void)
+{
+  assert(ai_gw_class_on() == 0);
+  ai_gw_class_on_set(1);
+  assert(ai_gw_class_on() == 1);
+  ai_gw_class_on_set(7);
+  assert(ai_gw_class_on() == 1);
+  ai_gw_class_on_set(0);
+  assert(ai_gw_class_on() == 0);
+}
+
 int
 main(void)
 {
@@ -2070,6 +2426,19 @@ main(void)
   test_netid_ifmatch_switch();
   test_net_forward_flag_does_not_change_the_decision();
   test_netid_bound_set_is_replaced_under_readers();
+  test_class_off_asks_nothing();
+  test_class_needs_a_tenant();
+  test_class_key_arm();
+  test_class_bearer_arm_names_its_profile();
+  test_class_network_arm_names_its_binding();
+  test_class_denied_falls_through_unless_strict();
+  test_class_tier_is_consumed_whoever_decided();
+  test_class_streamed_body();
+  test_class_resolver_failure_is_standard();
+  test_class_on_switch();
+  puts("PASS: class stage: off asks nothing, every arm hands its identity over, "
+       "a denied objective refuses only on a strict rule and before any charge, "
+       "a tier that was read is handed back to be nulled");
   puts("PASS: network identity: one case per decision-table row, the conflict "
        "rule on the network path, a presented credential never falls back, "
        "a resolver failure is no binding");

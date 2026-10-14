@@ -42,6 +42,7 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 #include "log.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_ai_bench.h"
@@ -273,6 +274,24 @@ llb_ai_netid_resolve(char *client_ip, int in_ifindex,
     if (out)
         out->matched = 0;
     return 0;  /* no binding: the request is decided as if none existed */
+}
+
+__attribute__((weak)) int
+llb_ai_class_resolve(char *tenant, char *key_id, char *binding, char *profile,
+                     char *svc_ident, char *objective_hint, int tier_hint,
+                     ai_gw_class_t *out)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)tenant;
+    (void)key_id;
+    (void)binding;
+    (void)profile;
+    (void)svc_ident;
+    (void)objective_hint;
+    (void)tier_hint;
+    if (out)
+        memset(out, 0, sizeof(*out));
+    return 0;  /* nothing configured: standard */
 }
 
 __attribute__((weak)) void

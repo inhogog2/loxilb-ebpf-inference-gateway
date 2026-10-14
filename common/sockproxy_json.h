@@ -71,6 +71,18 @@ int estimate_prompt_tokens(const char *body, size_t len);
  */
 int extract_max_tokens(const char *body, size_t len);
 
+/* The body's top-level "service_tier" read as a class hint.
+ * Returns AI_TIER_FLEX, AI_TIER_PRIORITY or AI_TIER_FAST when the value is
+ * exactly that string, and then sets [*off, *off + *vlen) to the value in
+ * the body, quotes included. Returns AI_TIER_NONE for any other value, an
+ * absent key, or a body that is not a complete JSON object. The AI_TIER_*
+ * values are in sockproxy_ai_gw.h, beside the export they are handed to. */
+int extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen);
+
+/* Overwrite a JSON value of at least four bytes in place with null, padded
+ * with spaces to the same length: the document keeps its size. */
+void json_null_value(char *body, size_t body_len, size_t off, size_t vlen);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *

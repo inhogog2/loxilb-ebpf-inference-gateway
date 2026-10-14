@@ -92,6 +92,7 @@ typedef enum {
   AI_GW_STAGE_RATELIMIT,       /* RPS / quota-latch check (429/503) */
   AI_GW_STAGE_RESERVE,         /* pre-admission token reservation (429) */
   AI_GW_STAGE_CAPACITY,        /* service/endpoint capacity, after policy (429/503) */
+  AI_GW_STAGE_OBJECTIVE,       /* the objective a request named is not its to use (403, strict rules) */
 } ai_gw_admit_stage_t;
 
 /* How the tenant was decided. BEARER is set once a bearer token has
@@ -180,6 +181,17 @@ typedef struct ai_gw_req_ctx {
   const char *client_ip;
   const char *origin_ip;
   int         trusted_hops;
+
+  /* The class of the request. class_on is ai_gw_class_on() as the caller
+   * read it: 0 means no class is configured anywhere, the stage is skipped
+   * and neither the hint header nor the body's service_tier is looked at.
+   * objective_hint is the objective name the request's header asks for
+   * ("" or NULL when it carries none). objective_strict is the rule's
+   * ai_objective_strict: a request that names an objective it may not use
+   * is refused 403 instead of falling to its default. */
+  int         class_on;
+  const char *objective_hint;
+  int         objective_strict;
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {
@@ -227,6 +239,21 @@ typedef struct ai_gw_admit_result {
   uint8_t  auth_src;
   uint8_t  net_forward_identity;
   char     net_identity[64];
+
+  /* The class stage's answer; all zero when the stage did not run.
+   * tier_consumed: the body's service_tier was read as a hint; the caller
+   * overwrites the value at [tier_off, tier_off + tier_len) of the body it
+   * passed with null before it forwards the request. hint_not_applied: the
+   * body was not whole in the buffer and no header hint was given, so a
+   * body hint, if there was one, could not be read. */
+  int32_t  priority;
+  uint8_t  priority_class;     /* AI_GW_CLASS_* */
+  uint8_t  objective_denied;
+  uint8_t  tier_consumed;
+  uint8_t  hint_not_applied;
+  uint32_t tier_off;
+  uint32_t tier_len;
+  char     objective[64];
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
@@ -298,6 +325,13 @@ void ai_gw_netid_bound_set(const char *const *svc_idents, const uint8_t *flags,
                            int n, int all);
 int  ai_gw_netid_bound(const char *svc_ident);
 int  ai_gw_netid_fwd_any(void);
+
+/* Whether any class is configured: an objective, a tenant or key with a
+ * class field, a binding or JWT profile that lowers its requests. The
+ * control plane sets it; the request path reads it once per request. While
+ * it is 0 a request is handled exactly as before classes existed. */
+void ai_gw_class_on_set(int on);
+int  ai_gw_class_on(void);
 void ai_gw_netid_ifmatch_set(int on);
 int  ai_gw_netid_ifmatch(void);
 

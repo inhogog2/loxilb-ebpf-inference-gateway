@@ -454,6 +454,51 @@ extern int llb_ai_netid_resolve(char *client_ip, int in_ifindex,
                                 ai_gw_netid_t *out);
 
 /*
+ * ai_gw_class_t - the class llb_ai_class_resolve found for a request.
+ * Zeroed memory is "standard, nothing applied", which is also what a failed
+ * call leaves.
+ */
+/* The body's service_tier as a hint (extract_service_tier). */
+#define AI_TIER_NONE     0
+#define AI_TIER_FLEX     1   /* "flex" */
+#define AI_TIER_PRIORITY 2   /* "priority" */
+#define AI_TIER_FAST     3   /* "fast" */
+
+#define AI_GW_CLASS_STANDARD  0
+#define AI_GW_CLASS_CRITICAL  1
+#define AI_GW_CLASS_SHEDDABLE 2
+typedef struct ai_gw_class {
+    int32_t priority;          /* the priority in force, after the cap */
+    uint8_t priority_class;    /* AI_GW_CLASS_*: the sign of priority */
+    uint8_t objective_denied;  /* the header named an objective this request may not use */
+    uint8_t pad[2];
+    char    objective[64];     /* the hint applied: an objective name, "tier:<value>", or "" */
+} ai_gw_class_t;
+
+/*
+ * llb_ai_class_resolve - the class of a request whose tenant is decided.
+ *
+ * Called by the admission gate at most once per request, and only while
+ * ai_gw_class_on() says classes are configured at all.
+ *
+ *   tenant          the request's tenant
+ *   key_id          its API key's id ("" when no key decided it)
+ *   binding         the network-identity binding that named the tenant ("")
+ *   profile         the JWT profile that verified its token ("")
+ *   svc_ident       service identity "VIP:port"
+ *   objective_hint  the objective name the request's header asks for ("")
+ *   tier_hint       AI_TIER_* read from the body (0 = none)
+ *   out             output structure, zeroed by the caller
+ *
+ * Returns 0 when it answered, -1 when it could not; the gate then treats
+ * the request as standard. It reads immutable snapshots and takes no lock.
+ */
+extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
+                                char *profile, char *svc_ident,
+                                char *objective_hint, int tier_hint,
+                                ai_gw_class_t *out);
+
+/*
  * llb_ai_pd_record – record a P/D disaggregation lifecycle event.
  *
  * C sockproxy calls this at P/D completion (success or error) to record
