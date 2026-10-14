@@ -905,6 +905,26 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
   while (node) {   
     if (cmp_proxy_ent(&node->key, &ent)) {
       found_ent = node;  // Save for catalog_id lookup
+      if (pfe && node->val.ephash == NULL) {
+        /* A listener kept after its last rule was deleted (the rule delete
+         * keeps the socket so a client sees an HTTP error, not a refused
+         * connection, until a rule takes the address again). Say that,
+         * not "no pool for this model": the request named a model the
+         * operator may well serve elsewhere, and the "model_unavailable"
+         * answer sent operators to the pools instead of the rule table. */
+        static const char no_rule_resp[] =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"no_route\","
+            "\"detail\":\"no rule on this listener (kept open after its last rule was deleted)\"}\r\n";
+        proxy_send_local_response(pfe, no_rule_resp, sizeof(no_rule_resp) - 1);
+        log_info("[PROXY_NO_ROUTE] 503 sent: listener %s:%u has no rule (kept after delete), fd=%d",
+                 inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport), pfe->fd);
+        pfe->lb_err_body_sent = 1;
+        return -1;
+      }
 #ifdef HAVE_HTTP_TRACE
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[CATALOG_MATCH] Found proxy entry: xip=%08x xport=%04x proxy_mode=%d", 

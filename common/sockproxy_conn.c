@@ -1660,6 +1660,16 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   if (conn_holds_load_unit(fd_ent)) {
     proxy_epval_t *epv = (proxy_epval_t *)fd_ent->epv;
     chwbl_dec_runtime(epv, fd_ent->ep_num);
+    /* Given back once. This release runs twice for a client whose backend
+     * leg ends first: the leg's teardown releases its peer (the client)
+     * through proxy_release_rfd_ctx, then the client's own teardown comes
+     * here again. With ep_num left as it was the second pass took a unit
+     * the endpoint no longer owed - the "underflow protection" line, or,
+     * with another connection in flight on the same endpoint, that
+     * connection's unit (the cluster report of 2026-10-13, item 3). The
+     * keep-alive park and the parse-phase stale-unit guard already pair
+     * their release with ep_num = -1; so does this one. */
+    fd_ent->ep_num = -1;
   }
 #endif /* HAVE_DP_GPU_ROUTING */
 
