@@ -8951,7 +8951,12 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
                              pfe->auth_user_id, status, code,
                              pfe->l7_peer_ip, proxy_origin_ip(pfe),
                              (int)proxy_origin_trusted_hops(pfe),
-                             (int)pfe->auth_src, pfe->auth_net_identity);
+                             (int)pfe->auth_src, pfe->auth_net_identity,
+                             (int)pfe->adm_priority,
+                             AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
+                                              pfe->adm_objective_denied,
+                                              pfe->adm_hint_not_applied),
+                             pfe->adm_objective);
   log_debug("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
            "inflight=%u queued=%u limit=%u%s tenant=%s model=%s%s",
            pfe->fd, status, code, role, inflight, queued, limit,
@@ -9337,8 +9342,8 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   if (adm.tier_consumed && req->body &&
       (const uint8_t *)req->body >= pfe->rcvbuf &&
       (const uint8_t *)req->body + req->body_len <= pfe->rcvbuf + pfe->rcv_off)
-    json_null_value((char *)(uintptr_t)req->body, req->body_len,
-                    adm.tier_off, adm.tier_len);
+    (void)json_null_top_key((char *)(uintptr_t)req->body, req->body_len,
+                            "service_tier", 12);
   return 0;
 }
 

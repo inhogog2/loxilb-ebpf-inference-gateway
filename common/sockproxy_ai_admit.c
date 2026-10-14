@@ -153,7 +153,11 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
                        (char *)(req->client_ip ? req->client_ip : ""),
                        (char *)(req->origin_ip ? req->origin_ip : ""),
                        req->trusted_hops, (int)res->auth_src,
-                       res->net_identity);
+                       res->net_identity, res->priority,
+                       AI_GW_CLASS_INFO(res->class_ran, res->priority_class,
+                                        res->objective_denied,
+                                        res->hint_not_applied),
+                       res->objective);
   }
   return rc;
 }
@@ -166,7 +170,9 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            const char *error_code,
                            const char *client_ip, const char *origin_ip,
                            int trusted_hops, int auth_src,
-                           const char *net_identity)
+                           const char *net_identity,
+                           int priority, int class_info,
+                           const char *objective)
 {
   /* The same attribution every other record carries, with the same
    * meaning: client_ip is the socket peer, origin_ip is "" unless the header
@@ -182,7 +188,9 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                      (char *)(client_ip ? client_ip : ""),
                      (char *)(origin_ip ? origin_ip : ""),
                      trusted_hops, auth_src,
-                     (char *)(net_identity ? net_identity : ""));
+                     (char *)(net_identity ? net_identity : ""),
+                     priority, class_info,
+                     (char *)(objective ? objective : ""));
 }
 
 /* ---- services with a network-identity binding ---------------------------
@@ -490,6 +498,7 @@ admit_class(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
   size_t off = 0, vlen = 0;
   int tier = AI_TIER_NONE;
 
+  res->class_ran = 1;
   /* The body's hint is read only from a body that is whole in the buffer,
    * the condition the model is read under. */
   if (req->body && req->body_len > 0 && !req->prefix_only)

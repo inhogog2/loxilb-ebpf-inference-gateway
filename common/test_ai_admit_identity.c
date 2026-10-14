@@ -89,6 +89,9 @@ static struct {
   int  trusted_hops;
   int  auth_src;
   char net_identity[64];
+  int  priority;
+  int  class_info;
+  char objective[64];
 } deny_stub;
 
 static struct {
@@ -145,9 +148,13 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    char *tenant_id, char *key_id, char *user_id,
                    int stage, int http_status, char *error_code,
                    char *client_ip, char *origin_ip, int trusted_hops,
-                   int auth_src, char *net_identity)
+                   int auth_src, char *net_identity,
+                   int priority, int class_info, char *objective)
 {
   deny_stub.calls++;
+  deny_stub.priority = priority;
+  deny_stub.class_info = class_info;
+  snprintf(deny_stub.objective, sizeof(deny_stub.objective), "%s", objective);
   deny_stub.auth_src = auth_src;
   snprintf(deny_stub.net_identity, sizeof(deny_stub.net_identity), "%s",
            net_identity);
@@ -1740,19 +1747,25 @@ test_capacity_deny_carries_the_binding(void)
   reset_stubs();
   ai_gw_record_capacity_deny("req-cap", 3, NET_SVC, "m1", "line-1-tenant",
                              "", "", 429, "admission_capacity", NET_SRC, "",
-                             0, AI_GW_AUTH_SRC_NETWORK, "line-1");
+                             0, AI_GW_AUTH_SRC_NETWORK, "line-1", -1,
+                             AI_GW_CLASSF_SET | AI_GW_CLASS_SHEDDABLE, "tier:flex");
   assert(deny_stub.calls == 1 && deny_stub.stage == AI_GW_STAGE_CAPACITY);
   assert(deny_stub.http_status == 429);
   assert(strcmp(deny_stub.tenant, "line-1-tenant") == 0);
   assert(deny_stub.auth_src == AI_GW_AUTH_SRC_NETWORK);
   assert(strcmp(deny_stub.net_identity, "line-1") == 0);
+  /* the class the request was admitted with, as its completion would say */
+  assert(deny_stub.priority == -1 &&
+         deny_stub.class_info == (AI_GW_CLASSF_SET | AI_GW_CLASS_SHEDDABLE) &&
+         strcmp(deny_stub.objective, "tier:flex") == 0);
 
   reset_stubs();
   ai_gw_record_capacity_deny("req-cap", 3, NET_SVC, "m1", "tenant-1", "key-1",
                              "", 503, "admission_no_capacity", NET_SRC, "",
-                             0, AI_GW_AUTH_SRC_CREDENTIAL, NULL);
+                             0, AI_GW_AUTH_SRC_CREDENTIAL, NULL, 0, 0, NULL);
   assert(deny_stub.calls == 1 && deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
   assert(deny_stub.net_identity[0] == '\0');
+  assert(deny_stub.class_info == 0 && deny_stub.objective[0] == '\0');
 }
 
 /* A streamed body: the gate has only the prefix, and the network path
@@ -2343,6 +2356,54 @@ test_class_denied_falls_through_unless_strict(void)
   assert(res.verdict == AI_GW_ADMIT_ALLOW);
 }
 
+/* A refusal's record carries the class the request had, so the records of
+ * one request agree: an objective refusal and a refusal after the class
+ * stage say what class it was; one made before the stage ran says none. */
+static void
+test_class_on_the_refusal_record(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  /* the objective refusal itself */
+  req.objective_hint = "not-mine";
+  req.objective_strict = 1;
+  reset_stubs();
+  cls_stub.out.objective_denied = 1;
+  cls_stub.out.priority = -5;
+  cls_stub.out.priority_class = AI_GW_CLASS_SHEDDABLE;
+  strcpy(cls_stub.out.objective, "batch");
+  assert(ai_gw_admit(&req, &res) != 0 && res.stage == AI_GW_STAGE_OBJECTIVE);
+  assert(deny_stub.calls == 1);
+  assert(deny_stub.class_info == (AI_GW_CLASSF_SET | AI_GW_CLASS_SHEDDABLE |
+                                  AI_GW_CLASSF_DENIED));
+  assert(deny_stub.priority == -5 && strcmp(deny_stub.objective, "batch") == 0);
+
+  /* a refusal after the class stage: the rate limit */
+  req.objective_hint = NULL;
+  req.objective_strict = 0;
+  reset_stubs();
+  cls_stub.out.priority = 10;
+  cls_stub.out.priority_class = AI_GW_CLASS_CRITICAL;
+  strcpy(cls_stub.out.objective, "realtime");
+  rl_stub.rc = -1;
+  rl_stub.decision = 3;
+  assert(ai_gw_admit(&req, &res) != 0 && res.stage == AI_GW_STAGE_RATELIMIT);
+  assert(deny_stub.calls == 1);
+  assert(deny_stub.class_info == (AI_GW_CLASSF_SET | AI_GW_CLASS_CRITICAL));
+  assert(deny_stub.priority == 10 && strcmp(deny_stub.objective, "realtime") == 0);
+
+  /* a refusal before the stage ran: no class */
+  req.api_key = "";
+  reset_stubs();
+  cls_stub.out.priority = 10;
+  cls_stub.out.priority_class = AI_GW_CLASS_CRITICAL;
+  assert(ai_gw_admit(&req, &res) != 0 && res.stage == AI_GW_STAGE_AUTH);
+  assert(deny_stub.calls == 1 && cls_stub.calls == 0);
+  assert(deny_stub.class_info == 0 && deny_stub.priority == 0 &&
+         deny_stub.objective[0] == '\0');
+}
+
 /* A tier the gateway read is handed back to be nulled, with where it is,
  * whether the tier or a header decided. A value that is no tier is not. */
 static void
@@ -2541,6 +2602,7 @@ main(void)
   test_class_network_arm_names_its_binding();
   test_class_denied_falls_through_unless_strict();
   test_class_tier_is_consumed_whoever_decided();
+  test_class_on_the_refusal_record();
   test_class_streamed_body();
   test_class_streamed_prefix_is_not_read();
   test_class_key_without_a_tenant();

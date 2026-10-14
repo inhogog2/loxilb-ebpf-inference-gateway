@@ -256,6 +256,9 @@ typedef struct ai_gw_admit_result {
   uint8_t  objective_denied;
   uint8_t  tier_consumed;
   uint8_t  hint_not_applied;
+  /* class_ran: the class stage ran for this request; what the refusal
+   * record says about its class. */
+  uint8_t  class_ran;
   uint32_t tier_off;
   uint32_t tier_len;
   char     objective[64];
@@ -277,7 +280,9 @@ void ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                                 const char *error_code,
                                 const char *client_ip, const char *origin_ip,
                                 int trusted_hops, int auth_src,
-                                const char *net_identity);
+                                const char *net_identity,
+                                int priority, int class_info,
+                                const char *objective);
 
 /* Write a fresh request ID into buf: 32 lowercase hex digits shaped as a
  * UUID v4, from a per-thread generator that needs neither the trace ring
