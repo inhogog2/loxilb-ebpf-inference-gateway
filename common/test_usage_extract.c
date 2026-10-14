@@ -449,6 +449,11 @@ main(void)
       { "mt-negative-unlimited", "{\"max_tokens\":-1}", 0 },
       { "mt-string-value", "{\"max_tokens\":\"256\"}", 0 },
       { "mt-float-value", "{\"max_tokens\":25.6}", 0 },
+      { "mt-exponent-value", "{\"max_tokens\":1e3}", 0 },
+      { "mt-object-value", "{\"max_tokens\":{\"n\":256}}", 0 },
+      { "mt-array-value", "{\"max_tokens\":[256]}", 0 },
+      { "mt-null-value", "{\"max_tokens\":null}", 0 },
+      { "mt-explicit-zero", "{\"max_tokens\":0}", 0 },
       { "mt-nested-spoof",
         "{\"opts\":{\"max_tokens\":512},\"stream\":true}", 0 },
       { "mt-string-embedded-spoof",
@@ -469,6 +474,74 @@ main(void)
       } else {
         printf("ok   %-38s max=%d\n", mt_vecs[vi].name, got);
       }
+    }
+  }
+
+  /* The body's service_tier as a class hint, and its overwrite with null:
+   * where the value is, that the document keeps its length and every other
+   * byte, and what is not a hint. */
+  {
+    static const struct {
+      const char *name; const char *body; int want; const char *after;
+    } st_vecs[] = {
+      { "tier-flex", "{\"model\":\"m\",\"service_tier\":\"flex\"}", AI_TIER_FLEX,
+        "{\"model\":\"m\",\"service_tier\":null  }" },
+      { "tier-priority-first-key", "{\"service_tier\":\"priority\",\"n\":1}", AI_TIER_PRIORITY,
+        "{\"service_tier\":null      ,\"n\":1}" },
+      { "tier-fast-whitespace", "{\"service_tier\" :\t \"fast\" ,\"n\":1}", AI_TIER_FAST,
+        "{\"service_tier\" :\t null   ,\"n\":1}" },
+      { "tier-auto-is-no-hint", "{\"service_tier\":\"auto\"}", AI_TIER_NONE, NULL },
+      { "tier-default-is-no-hint", "{\"service_tier\":\"default\"}", AI_TIER_NONE, NULL },
+      { "tier-case-differs", "{\"service_tier\":\"Flex\"}", AI_TIER_NONE, NULL },
+      { "tier-number", "{\"service_tier\":1}", AI_TIER_NONE, NULL },
+      { "tier-null", "{\"service_tier\":null}", AI_TIER_NONE, NULL },
+      { "tier-empty-string", "{\"service_tier\":\"\"}", AI_TIER_NONE, NULL },
+      { "tier-nested", "{\"opts\":{\"service_tier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      { "tier-in-a-message", "{\"messages\":[{\"content\":\"\\\"service_tier\\\":\\\"flex\\\"\"}]}",
+        AI_TIER_NONE, NULL },
+      { "tier-absent", "{\"model\":\"m\"}", AI_TIER_NONE, NULL },
+      { "tier-garbage", "not json", AI_TIER_NONE, NULL },
+    };
+    size_t vi;
+    for (vi = 0; vi < sizeof(st_vecs) / sizeof(st_vecs[0]); vi++) {
+      size_t len = strlen(st_vecs[vi].body), off = 99, vlen = 99;
+      char *buf = malloc(len);          /* exact size: the sanitizer sees a step outside */
+      int got, ok;
+      memcpy(buf, st_vecs[vi].body, len);
+      got = extract_service_tier(buf, len, &off, &vlen);
+      ok = got == st_vecs[vi].want;
+      if (got == AI_TIER_NONE) {
+        ok = ok && off == 0 && vlen == 0 && !memcmp(buf, st_vecs[vi].body, len);
+      } else {
+        ok = ok && off + vlen <= len && buf[off] == '"' && buf[off + vlen - 1] == '"';
+        json_null_value(buf, len, off, vlen);
+        ok = ok && st_vecs[vi].after && strlen(st_vecs[vi].after) == len &&
+             !memcmp(buf, st_vecs[vi].after, len);
+      }
+      g_cases++;
+      if (!ok) {
+        printf("FAIL %-38s tier=%d (want %d) off=%zu vlen=%zu -> %.*s\n",
+               st_vecs[vi].name, got, st_vecs[vi].want, off, vlen, (int)len, buf);
+        g_fails++;
+      } else {
+        printf("ok   %-38s tier=%d\n", st_vecs[vi].name, got);
+      }
+      free(buf);
+    }
+    /* The overwrite refuses what does not fit: nothing is written. */
+    {
+      char b[] = "0123456789";
+      json_null_value(b, 10, 8, 4);     /* runs past the end */
+      json_null_value(b, 10, 11, 4);    /* starts past the end */
+      json_null_value(b, 10, 2, 3);     /* too short for null */
+      json_null_value(NULL, 10, 0, 4);
+      g_cases++;
+      if (memcmp(b, "0123456789", 10)) { printf("FAIL null-value-bounds -> %s\n", b); g_fails++; }
+      else printf("ok   null-value-bounds\n");
+      json_null_value(b, 10, 6, 4);     /* the last four bytes: fits exactly */
+      g_cases++;
+      if (memcmp(b, "012345null", 10)) { printf("FAIL null-value-exact-fit -> %s\n", b); g_fails++; }
+      else printf("ok   null-value-exact-fit\n");
     }
   }
 

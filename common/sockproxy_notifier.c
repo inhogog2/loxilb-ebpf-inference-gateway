@@ -541,6 +541,9 @@ llb_fatal_handler(int sig, siginfo_t *si, void *uc)
       llb_async_write2("[FAILLOUD] C backtrace (innermost first):\n");
       backtrace_symbols_fd(bt, nbt, 2);
     }
+    /* The worker's last log lines may still be in its ring. */
+    llb_async_write2("[FAILLOUD] this worker's unwritten log lines:\n");
+    log_emergency_dump(2);
     signal(sig, SIG_DFL);
     raise(sig);
     _exit(134);
@@ -935,6 +938,13 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
     }
   }
 #endif
+
+  /* From here on a log call queues its line and the log's writer thread does
+   * the writing: no worker waits for the log's device. Start-up above wrote
+   * for itself. */
+  if (log_async_start() != 0) {
+    log_error("log: the writer thread did not start; log lines stay synchronous");
+  }
 
   /* Stage 1: install the fail-loud fatal-signal handler BEFORE any raw worker
    * thread starts, so a worker fault crashes loud+fast instead of wedging ~30s. */

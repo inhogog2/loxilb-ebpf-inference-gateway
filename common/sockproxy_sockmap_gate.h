@@ -24,7 +24,10 @@
  *                            declaration is a credential (it warns once)
  *   a declared apikey_auth   request — the credential verdict and the
  *                            X-Api-Key strip happen before dispatch, on every
- *                            request; nothing in it touches a response byte
+ *                            request. A backend's X-Api-Key is taken out of
+ *                            its response head only where the relay carries
+ *                            the response; that is not a reason to keep the
+ *                            response direction from the kernel
  *
  * So a service that declares api_key_auth and nothing else keeps its request
  * direction on the relay, where the credential is checked on every request of

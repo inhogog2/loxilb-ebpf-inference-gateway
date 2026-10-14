@@ -2952,6 +2952,8 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->fc_tenant_share_pct = dat->fc_tenant_share_pct;
   pval->fc_expose_headers = dat->fc_expose_headers;
   pval->half_close_mode = dat->half_close_mode;
+  pval->ai_objective_strict = dat->ai_objective_strict;
+  pval->ai_default_tokens = dat->ai_default_tokens;
 
   // Per-endpoint circuit breaker enable (opt-in per rule)
   pval->cb_enable = dat->cb_enable;
@@ -4728,6 +4730,26 @@ loxilb_set_loglevel(struct ebpfcfg *cfg)
       log_add_fp(xh->logfp, cfg->loglevel);
   }
   log_warn("ebpf: new loglevel %d", cfg->loglevel);
+}
+
+void
+loxilb_log_rotate(unsigned long long max_bytes)
+{
+  if (xh && xh->logfp) {
+    log_rotate_fp(xh->logfp, LOXILB_DP_LOGF, max_bytes);
+  }
+}
+
+void
+loxilb_log_stop(void)
+{
+  log_async_stop(2000);
+}
+
+unsigned long long
+loxilb_log_dropped(int level)
+{
+  return log_dropped(level);
 }
 
 /* A previous container run can leak an entire eBPF program/map generation in

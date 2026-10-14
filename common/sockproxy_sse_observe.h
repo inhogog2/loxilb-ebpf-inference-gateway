@@ -73,4 +73,10 @@ static inline void sp_sse_body(sp_sse_observer_t *s, const char *at, size_t n)
     s->tail_len = keep+n;
   }
 }
+/* The framed end of a streamed answer is its end, whether or not it carried
+ * the [DONE] event: a backend may end a stream with its last chunk alone. */
+static inline void sp_sse_message_done(sp_sse_observer_t *s)
+{
+  if (s->is_sse) s->done = 1;
+}
 #endif

@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include "uthash.h"
 #include "sockproxy_fc.h"   /* per-stream capacity admission permit */
+#include "sockproxy_obj_hint.h"   /* the objective a request asks for by header */
 #include "sockproxy_l7trust.h"   /* l7_hop_list_t on the per-stream request state */
 
 // Forward declarations
@@ -133,6 +134,8 @@ typedef struct proxy_h2_stream {
   char     tenant_id[128];
   char     auth_user_id[128];
   char     auth_key_id[64];
+  char     auth_net_identity[64];    // binding that matched the stream's source ("" = none)
+  uint8_t  auth_src;                 // AI_GW_AUTH_SRC_*: what decided tenant_id
   char     effective_model[128];     // the gate's body-first model resolution
   char     svc_ident[64];            // "VIP:port" captured at admission — teardown paths
                                      // must not chase the rule head after it may be gone
@@ -142,6 +145,18 @@ typedef struct proxy_h2_stream {
   uint8_t  auth_strip_authz;         // upstream hygiene switches, parity with the H1 splice
   uint8_t  auth_fwd_identity;
   uint8_t  auth_jwt_capable;
+  uint8_t  auth_netid_fwd;           // the matched binding forwards identity upstream
+  // The class of the request: what its header asked for, and the gate's
+  // answer (all zero while no class is configured).
+  sp_obj_hint_t obj_hint;
+  int32_t  adm_priority;
+  uint8_t  adm_class;                // AI_GW_CLASS_*
+  uint8_t  adm_class_set;            // the class stage ran
+  uint8_t  adm_objective_denied;
+  uint8_t  adm_hint_not_applied;
+  uint8_t  class_expose;             // the response head carries the class headers
+  uint8_t  resp_strip_api_key;       // the service declares api_key_auth: a backend's x-api-key stays out of a response head
+  char     adm_objective[64];
   uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
   int64_t  usage_res_epoch;          // reservation window tag
   uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)
@@ -487,6 +502,14 @@ typedef struct h2_inflight_settle {
   char    client_ip[L7_HOP_TEXT_MAX];
   char    origin_ip[L7_HOP_TEXT_MAX];
   int     trusted_hops;
+  /* What decided the tenant and the binding that matched, copied with the
+   * identity above. */
+  int     auth_src;
+  char    net_identity[64];
+  /* The request's class, for the same record. */
+  int     priority;
+  int     class_info;   /* AI_GW_CLASSF_* */
+  char    objective[64];
 } h2_inflight_settle_t;
 
 /*
@@ -537,6 +560,12 @@ int proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
  */
 int proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
                                  const nghttp2_nv *extra, size_t nextra);
+
+/* Drop every field named `name` (case-insensitive, the whole name) from the
+ * response header set collected for a stream, before it is submitted to the
+ * client. Returns the number of fields dropped. Touches nothing else. */
+size_t proxy_h2_drop_resp_header(stream_mapping_t *mapping,
+                                 const char *name, size_t namelen);
 
 /**
  * Create or get backend HTTP/2 session for endpoint

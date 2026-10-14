@@ -28,6 +28,7 @@
 #include "sockproxy_internal.h"
 #include "sockproxy.h"
 #include "sockproxy_ai_security.h"
+#include "sockproxy_in_ifindex.h"
 #include "sockproxy_ai_admit.h"   /* the shared H1/H2 admission gate */
 #include "sockproxy_ai_gw.h"      /* settle-path ladder calls */
 #include "sockproxy_pd.h"         /* dialect ops for usage extraction */
@@ -280,7 +281,9 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                              stream->svc_ident, up, uc, 0,
                              (int)stream->usage_reserved_toks,
                              stream->usage_res_epoch,
-                             stream->request_id, notify_worker_id(), NULL);
+                             stream->request_id, notify_worker_id(),
+                             (int)stream->auth_src, stream->auth_net_identity,
+                             NULL);
   stream->usage_reserved_toks = 0;
   stream->usage_res_epoch = 0;
 
@@ -315,7 +318,13 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           notify_worker_id(),
                           pfe ? pfe->l7_peer_ip : "",
                           stream->l7_origin_ip,
-                          (int)stream->l7_trusted_hops);
+                          (int)stream->l7_trusted_hops,
+                          (int)stream->auth_src, stream->auth_net_identity,
+                          (int)stream->adm_priority,
+                          AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
+                                           stream->adm_objective_denied,
+                                           stream->adm_hint_not_applied),
+                          stream->adm_objective);
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -407,6 +416,14 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     snprintf(e->client_ip, sizeof(e->client_ip), "%s", pfe->l7_peer_ip);
     snprintf(e->origin_ip, sizeof(e->origin_ip), "%s", stream->l7_origin_ip);
     e->trusted_hops = (int)stream->l7_trusted_hops;
+    e->auth_src = (int)stream->auth_src;
+    snprintf(e->net_identity, sizeof(e->net_identity), "%s",
+             stream->auth_net_identity);
+    e->priority = (int)stream->adm_priority;
+    e->class_info = AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
+                                     stream->adm_objective_denied,
+                                     stream->adm_hint_not_applied);
+    snprintf(e->objective, sizeof(e->objective), "%s", stream->adm_objective);
     e->response_is_sse = stream->response_is_sse;
     e->prompt_toks = up;
     e->complet_toks = uc;
@@ -780,6 +797,13 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   } else if (HEADER_MATCHES("x-model")) {
     snprintf(stream->x_model_header, sizeof(stream->x_model_header),
              "%.*s", (int)valuelen, value);
+  } else if (sp_obj_hint_which((const char *)name, namelen) != SP_OBJ_NOT) {
+    /* The objective the request asks for, by name. A header field is one
+     * whole value here; the new name wins over the deprecated one. */
+    sp_obj_hint_name(&stream->obj_hint);
+    sp_obj_hint_val(&stream->obj_hint,
+                    sp_obj_hint_which((const char *)name, namelen),
+                    (const char *)value, valuelen);
   }
 
   // append into the bounded generic L7 header/cookie store on
@@ -1163,6 +1187,52 @@ h2_expose_admission(stream_mapping_t *mapping, const fc_permit_t *permit)
     };
     proxy_h2_inject_resp_headers(mapping, add, 3);
   }
+}
+
+/* The class headers of an admitted response: the class, and the hint that
+ * was applied when there was one. A backend's own headers of those two
+ * names are dropped first; this runs after h2_expose_admission, which
+ * removes the whole admission family before it adds its values. */
+static void
+h2_expose_class(stream_mapping_t *mapping, const proxy_h2_stream_t *cstream)
+{
+  static const char n_obj[] = SP_CLASS_HDR_OBJ;
+  static const char n_class[] = SP_CLASS_HDR_CLASS;
+  const char *cls = sp_class_name(cstream->adm_class);
+  nghttp2_nv add[2];
+  size_t i, j, n = 0;
+
+  for (i = 0, j = 0; mapping->response_headers &&
+                     i < mapping->response_headers_count; i++) {
+    nghttp2_nv *nv = &mapping->response_headers[i];
+    if ((nv->namelen == sizeof(n_obj) - 1 &&
+         !strncasecmp((const char *)nv->name, n_obj, nv->namelen)) ||
+        (nv->namelen == sizeof(n_class) - 1 &&
+         !strncasecmp((const char *)nv->name, n_class, nv->namelen))) {
+      free(nv->name);
+      free(nv->value);
+      continue;
+    }
+    mapping->response_headers[j++] = *nv;
+  }
+  if (mapping->response_headers)
+    mapping->response_headers_count = j;
+
+  if (sp_class_hdr_value_ok(cstream->adm_objective)) {
+    add[n].name = (uint8_t *)n_obj;
+    add[n].namelen = sizeof(n_obj) - 1;
+    add[n].value = (uint8_t *)cstream->adm_objective;
+    add[n].valuelen = strlen(cstream->adm_objective);
+    add[n].flags = NGHTTP2_NV_FLAG_NONE;
+    n++;
+  }
+  add[n].name = (uint8_t *)n_class;
+  add[n].namelen = sizeof(n_class) - 1;
+  add[n].value = (uint8_t *)cls;
+  add[n].valuelen = strlen(cls);
+  add[n].flags = NGHTTP2_NV_FLAG_NONE;
+  n++;
+  proxy_h2_inject_resp_headers(mapping, add, n);
 }
 
 static void
@@ -1628,6 +1698,8 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       /* Non-final (1xx, e.g. 100 Continue, 103 Early Hints): relay as is.
        * The final response follows, so the stream stays open and the
        * response header injection below waits for it. */
+      if (cstream->resp_strip_api_key)
+        proxy_h2_drop_resp_header(mapping, "x-api-key", 9);
       rv = nghttp2_submit_headers(client_session->session, NGHTTP2_FLAG_NONE,
                                   client_stream_id, NULL,
                                   mapping->response_headers,
@@ -1648,10 +1720,18 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
         cstream->response_is_sse = sp_sse_content_type((char *)nv->value, nv->valuelen);
     }
 
+    /* A backend's X-Api-Key does not leave a service that declares
+     * api_key_auth: the HTTP/1.1 rule (sp_resp_strip_api_key), on a
+     * response head, interim or final. Trailers are not a head and pass. */
+    if (cstream->resp_strip_api_key)
+      proxy_h2_drop_resp_header(mapping, "x-api-key", 9);
+
     /* The admission headers, when the stream holds its units on a pool
      * that exposes them. The values are read now, while the stream still
      * holds its own unit. */
     h2_expose_admission(mapping, &cstream->fc);
+    if (cstream->class_expose)
+      h2_expose_class(mapping, cstream);
 
     // on the L7_Proxy peer only ( gate),
     // inject a stateless HTTP_COOKIE Set-Cookie into the relayed HEADERS frame
@@ -2931,6 +3011,29 @@ proxy_check_and_setup_h2(proxy_fd_ent_t *pfe)
  * cleanup loops free them uniformly; mapping->data_source (the request DATA
  * provider) is never touched, so the body stays attached.
  */
+size_t
+proxy_h2_drop_resp_header(stream_mapping_t *mapping, const char *name,
+                          size_t namelen)
+{
+  size_t i, j, dropped = 0;
+
+  if (!mapping || !mapping->response_headers || !name || namelen == 0)
+    return 0;
+  for (i = 0, j = 0; i < mapping->response_headers_count; i++) {
+    nghttp2_nv *nv = &mapping->response_headers[i];
+    if (nv->namelen == namelen &&
+        !strncasecmp((const char *)nv->name, name, namelen)) {
+      free(nv->name);
+      free(nv->value);
+      dropped++;
+      continue;
+    }
+    mapping->response_headers[j++] = *nv;
+  }
+  mapping->response_headers_count = j;
+  return dropped;
+}
+
 int
 proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
                              const nghttp2_nv *extra, size_t nextra)
@@ -3360,8 +3463,9 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                              stream->auth_user_id, status, code,
                              pfe ? pfe->l7_peer_ip : "",
                              stream->l7_origin_ip,
-                             (int)stream->l7_trusted_hops);
-  log_info("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
+                             (int)stream->l7_trusted_hops,
+                             (int)stream->auth_src, stream->auth_net_identity);
+  log_debug("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
            "role=%d inflight=%u limit=%u tenant=%s model=%s",
            stream->stream_id, status, code, role, inflight, limit,
            stream->tenant_id, stream->effective_model);
@@ -3375,6 +3479,10 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 {
   int is_post = stream->method[0] && !strcasecmp(stream->method, "POST");
 
+  /* The class headers have their own trigger: a request is given a class
+   * whether or not its pool has a ceiling. */
+  stream->class_expose =
+    (stream->adm_class_set && tepval->fc.cfg.expose_headers) ? 1 : 0;
   fc_permit_release(&stream->fc);
   if (fc_active(&tepval->fc) &&
       !(tepval->mcp_stateless && is_post) &&
@@ -4217,6 +4325,14 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     if (stream->request_id[0] == '\0')
       ai_gw_mint_request_id(stream->request_id, sizeof(stream->request_id));
 
+    /* The default reservation is the routed rule's: the gate asks for it
+     * with the model it resolved, by the host and path the pool lookup
+     * below uses. */
+    sp_resv_route_t adm_route = {
+      .ent = ent,
+      .host = stream->authority,
+      .path = stream->path[0] ? stream->path : "/",
+    };
     ai_gw_req_ctx_t adm_req = {
       .api_key = stream->x_api_key_raw,
       .bearer = stream->bearer_raw,
@@ -4226,8 +4342,16 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .body_len = stream->data_len,
       .prefix_model = body_model,
       .hdr_model = stream->x_model_header,
+      .class_on = ai_gw_class_on(),
+      .objective_hint = stream->obj_hint.name,
+      .objective_strict_of = sp_resv_objective_strict_of,
       .auth_mode = ent->val.ephash->apikey_auth,
+      .default_tokens_of = sp_resv_default_tokens_of,
+      .default_tokens_arg = &adm_route,
       .svc_ident = adm_svc_ident,
+      /* A service property; a rule that is not an AI-gateway one has no
+       * identity here and so is never bound. */
+      .netid_bound = ai_gw_netid_bound(adm_svc_ident),
       .request_id = stream->request_id,
       .producer_id = notify_worker_id(),
       /* The gate runs BEFORE the header splice, so no origin has been
@@ -4238,6 +4362,11 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .origin_ip = stream->l7_origin_ip,
       .trusted_hops = (int)stream->l7_trusted_hops,
     };
+    /* The interface the connection arrived on: the connection's, so every
+     * stream reads the same one, and read once. */
+    if (adm_req.netid_bound && pfe)
+      adm_req.in_ifindex = sp_in_ifindex_cached(&pfe->l7_in_ifindex, pfe->fd,
+                                                ai_gw_netid_ifmatch());
     ai_gw_admit_result_t adm;
     ai_gw_admit(&adm_req, &adm);
 
@@ -4267,10 +4396,16 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       proxy_h2_send_ai_deny(pfe, stream,
                             adm.http_status, adm.retry_after,
                             adm.retry_body, adm.error_code, adm.error_msg);
-      log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
-               "status=%d stage=%d error=%s key=%s tenant=%s",
-               stream->stream_id, adm.http_status, adm.stage,
-               adm.error_code, adm.key_id, adm.tenant_id);
+      if (adm.net_identity[0])
+        log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+                 "status=%d stage=%d error=%s key=%s tenant=%s net_identity=%s",
+                 stream->stream_id, adm.http_status, adm.stage,
+                 adm.error_code, adm.key_id, adm.tenant_id, adm.net_identity);
+      else
+        log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+                 "status=%d stage=%d error=%s key=%s tenant=%s",
+                 stream->stream_id, adm.http_status, adm.stage,
+                 adm.error_code, adm.key_id, adm.tenant_id);
       return 0;
     } else {
       /* Admitted. Persist the identity, the gate's model resolution, the
@@ -4284,6 +4419,9 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
                adm.user_id);
       snprintf(stream->auth_key_id, sizeof(stream->auth_key_id), "%s",
                adm.key_id);
+      snprintf(stream->auth_net_identity, sizeof(stream->auth_net_identity),
+               "%s", adm.net_identity);
+      stream->auth_src = adm.auth_src;
       snprintf(stream->effective_model, sizeof(stream->effective_model), "%s",
                adm.effective_model);
       snprintf(stream->svc_ident, sizeof(stream->svc_ident), "%s",
@@ -4295,10 +4433,23 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       stream->auth_jwt_capable =
         (ent->val.ephash->apikey_auth == 3 ||
          ent->val.ephash->apikey_auth == 4) ? 1 : 0;
+      stream->auth_netid_fwd = adm.net_forward_identity ? 1 : 0;
       if (adm.res_epoch != 0) {
         stream->usage_reserved_toks = adm.reserved_toks;
         stream->usage_res_epoch = adm.res_epoch;
       }
+      /* The class the gate found. A service_tier it read as a hint is
+       * the gateway's, not the engine's: its value becomes null in the
+       * buffered body, which is what is sent on. */
+      stream->adm_class_set = adm_req.class_on ? 1 : 0;
+      stream->adm_priority = adm.priority;
+      stream->adm_class = adm.priority_class;
+      stream->adm_objective_denied = adm.objective_denied;
+      stream->adm_hint_not_applied = adm.hint_not_applied;
+      snprintf(stream->adm_objective, sizeof(stream->adm_objective), "%s", adm.objective);
+      if (adm.tier_consumed && stream->data_buf)
+        json_null_value((char *)stream->data_buf, stream->data_len,
+                        adm.tier_off, adm.tier_len);
       stream->admit_mono_ns = get_timestamp_ns();
     }
   }
@@ -4679,7 +4830,7 @@ h2_have_tepval:
     if (fc_ep < 0)
       return 0;
     if (fc_ep != ep_idx)
-      log_info("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
+      log_debug("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
                stream->stream_id, ep_idx, fc_ep);
     ep_idx = fc_ep;
   }
@@ -5041,7 +5192,22 @@ h2_have_tepval:
   int security_headers_built = 0;
   uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
   int hygiene_jwt = stream->ai_admitted && stream->auth_jwt_capable;
-  if (ai_security_should_strip_api_key(security_policy) || hygiene_jwt) {
+  /* The same declaration closes the response direction: see the final
+   * response in proxy_h2_backend_on_frame_recv_callback. */
+  stream->resp_strip_api_key =
+    ai_security_should_strip_api_key(security_policy) ? 1 : 0;
+  /* A service with a binding that forwards identity owns the X-Auth-*
+   * family for every stream, admitted by a binding or not (parity with the
+   * H1 splice). One atomic load while no such binding exists. */
+  int hygiene_netid = 0;
+  if (ai_gw_netid_fwd_any()) {
+    char fwd_svc_ident[64];
+    ai_gw_svc_ident(ent->key.xip, ent->key.xport,
+                    fwd_svc_ident, sizeof(fwd_svc_ident));
+    hygiene_netid = (ai_gw_netid_bound(fwd_svc_ident) & AI_GW_NETID_FWD) != 0;
+  }
+  if (ai_security_should_strip_api_key(security_policy) || hygiene_jwt ||
+      hygiene_netid) {
     size_t hygiene_cap = nheaders + 2;   /* + injected X-Auth-Tenant/User */
     security_headers_nv = calloc(hygiene_cap, sizeof(*security_headers_nv));
     if (!security_headers_nv) {
@@ -5052,8 +5218,10 @@ h2_have_tepval:
     }
     nheaders = ai_security_h2_upstream_hygiene(
         headers, nheaders, security_headers_nv, hygiene_cap,
-        security_policy, hygiene_jwt,
-        stream->auth_strip_authz, stream->auth_fwd_identity,
+        security_policy, hygiene_jwt, hygiene_netid,
+        stream->auth_strip_authz,
+        (hygiene_jwt && stream->auth_fwd_identity) ||
+        (hygiene_netid && stream->ai_admitted && stream->auth_netid_fwd),
         stream->tenant_id, stream->auth_user_id);
     headers = security_headers_nv;
     security_headers_built = 1;

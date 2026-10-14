@@ -199,16 +199,40 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *                   tells an origin that resolved back to the peer apart from
  *                   a client that connected directly, since both report
  *                   origin_ip == client_ip. 0 when nothing was derived
+ *   auth_src:       what decided tenant_id: 0 an API key (or nothing), 1 a
+ *                   network-identity binding, 2 a validated bearer token
+ *                   (AI_GW_AUTH_SRC_* in sockproxy_ai_admit.h)
+ *   net_identity:   name of the network-identity binding that matched the
+ *                   request's source, "" when none did. Set with auth_src 0
+ *                   or 2 when a credential decided and the binding was only
+ *                   matched beside it
+ *   priority:       the request's priority after the cap (0 when the class
+ *                   stage did not run)
+ *   class_info:     AI_GW_CLASSF_* bits around the AI_GW_CLASS_* value; 0
+ *                   when the class stage did not run for the request
+ *   objective:      the hint that was applied: an objective name,
+ *                   "tier:<value>", or ""
  *
  * Returns void.
  */
+#define AI_GW_CLASSF_MASK        0x03   /* AI_GW_CLASS_* */
+#define AI_GW_CLASSF_SET         0x04   /* the class stage ran */
+#define AI_GW_CLASSF_DENIED      0x08   /* the header named an objective the request may not use */
+#define AI_GW_CLASSF_HINT_UNREAD 0x10   /* a body hint could not be read (streamed body) */
+#define AI_GW_CLASS_INFO(set, cls, denied, unread)                         \
+  ((set) ? (AI_GW_CLASSF_SET | ((cls) & AI_GW_CLASSF_MASK) |              \
+            ((denied) ? AI_GW_CLASSF_DENIED : 0) |                         \
+            ((unread) ? AI_GW_CLASSF_HINT_UNREAD : 0)) : 0)
 extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                                   int64_t latency_ms, int prompt_tokens, int complet_tokens,
                                   int stream_start, int stream_end, char *error_code,
                                   char *request_id, char *user_id, char *key_id,
                                   char *svc_ident, int is_stream, int producer_id,
                                   char *client_ip, char *origin_ip,
-                                  int trusted_hops);
+                                  int trusted_hops, int auth_src,
+                                  char *net_identity,
+                                  int priority, int class_info,
+                                  char *objective);
 
 /*
  * llb_ai_record_deny – record one request refused at the admission gate.
@@ -237,13 +261,18 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
  *                 does. Note that the gate runs BEFORE the header splice, so
  *                 on a refused request origin_ip is normally "" — not
  *                 derived — while client_ip is always known
+ *   auth_src, net_identity: what decided the tenant and the binding that
+ *                 matched, as llb_ai_record_request documents. A refusal
+ *                 the binding itself caused (another tenant's credential,
+ *                 a model the binding does not allow) names it here
  */
 extern void llb_ai_record_deny(char *request_id, int producer_id,
                                char *svc_ident, char *model_name,
                                char *tenant_id, char *key_id, char *user_id,
                                int stage, int http_status, char *error_code,
                                char *client_ip, char *origin_ip,
-                               int trusted_hops);
+                               int trusted_hops, int auth_src,
+                               char *net_identity);
 
 /*
  * llb_ai_stream_start – record the opening of an SSE stream.
@@ -319,6 +348,10 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  *                  llb_ai_token_quota_reserve; the release is skipped when
  *                  the window has already rolled over (the rollover wiped the
  *                  claim). Pass 0 when no reservation was made.
+ *   auth_src, net_identity  what decided tenant_id and the network-identity
+ *                  binding that matched, as llb_ai_record_request documents:
+ *                  the charge's record names the same actor the request's
+ *                  other records do
  *   result         output structure; decision may be set to 3 when quota exceeded
  *
  * Returns:
@@ -332,6 +365,7 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int estimated, int reserved_toks,
                                       int64_t res_epoch,
                                       char *request_id, int producer_id,
+                                      int auth_src, char *net_identity,
                                       ai_gw_decision_t *result);
 
 /*
@@ -365,10 +399,18 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
  *               rule-scope defaults and the per-VIP shared bucket
  *   prompt_est  prompt-token estimate from the request body; 0 when unknown
  *   max_tokens  declared completion ceiling from the request body; 0 when
- *               the client did not declare one (only the prompt estimate is
- *               then reserved — an undeclared ceiling cannot be guessed)
+ *               the client did not declare one
+ *   default_tokens  the rule's default reservation, passed only when
+ *               max_tokens is 0; 0 = off (the prompt estimate alone is
+ *               reserved). It is an elastic claim: each bucket shrinks it to
+ *               what it still holds, down to nothing, and it is never the
+ *               reason for a denial
  *   res_epoch   output: the reservation's window tag to echo at settlement;
  *               0 when nothing was reserved (no quota configured)
+ *   granted     output: the tokens held on every bucket after the call —
+ *               prompt_est + max_tokens, plus what was left of
+ *               default_tokens. This, not the asked amount, is what the
+ *               caller echoes at settlement. Meaningful when *res_epoch != 0
  *   result      output structure; on denial decision=3, retry_after set and
  *               error_code = "token_quota_would_exceed" (distinct from the
  *               post-hoc "token_quota_exceeded" latch denial)
@@ -381,8 +423,96 @@ extern int llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                                       char *user_id, char *key_id,
                                       char *svc_ident,
                                       int prompt_est, int max_tokens,
-                                      int64_t *res_epoch,
+                                      int default_tokens,
+                                      int64_t *res_epoch, int *granted,
                                       ai_gw_decision_t *result);
+
+/*
+ * ai_gw_netid_t - what llb_ai_netid_resolve found for a request's source.
+ * Zeroed memory is "no binding", which is also what a failed call leaves.
+ */
+typedef struct ai_gw_netid {
+    int  matched;            /* 0 = no binding matches this source on this service */
+    int  enforce;            /* 0 advisory, 1 strict */
+    int  credential_network; /* 1 = the binding admits a request with no credential */
+    int  model_ok;           /* the model is in the binding's allowlist (or it has none) */
+    int  forward_identity;   /* the binding asks for the tenant to be forwarded upstream */
+    char tenant_id[128];     /* the binding's tenant */
+    char binding[64];        /* the binding's name, for records */
+} ai_gw_netid_t;
+
+/*
+ * llb_ai_netid_resolve - find the network-identity binding of a request's
+ * source: the one that names the tenant of traffic from a CIDR or an
+ * ingress interface on this service.
+ *
+ * Called from the admission gate, at most once per request, and only for a
+ * service the control plane marked as bound (ai_gw_netid_bound): a service
+ * with no binding never makes this call. It must not block: it reads an
+ * immutable snapshot.
+ *
+ * Parameters:
+ *   client_ip   the socket peer, dotted IPv4 (NUL-terminated; "" when unknown)
+ *   in_ifindex  the interface the connection arrived on; 0 when not read
+ *   svc_ident   service identity "VIP:port" (NUL-terminated)
+ *   model       effective model name, for model_ok ("" when the request
+ *               names none)
+ *   out         output structure, zeroed by the caller
+ *
+ * Returns:
+ *    0  answered; out->matched says whether a binding matches
+ *   -1  the resolver could not answer (no snapshot, internal error). The
+ *       gate reads this as "no binding": it never admits on a failure. A
+ *       service that asked to fail closed refuses the request instead (503).
+ */
+extern int llb_ai_netid_resolve(char *client_ip, int in_ifindex,
+                                char *svc_ident, char *model,
+                                ai_gw_netid_t *out);
+
+/*
+ * ai_gw_class_t - the class llb_ai_class_resolve found for a request.
+ * Zeroed memory is "standard, nothing applied", which is also what a failed
+ * call leaves.
+ */
+/* The body's service_tier as a hint (extract_service_tier). */
+#define AI_TIER_NONE     0
+#define AI_TIER_FLEX     1   /* "flex" */
+#define AI_TIER_PRIORITY 2   /* "priority" */
+#define AI_TIER_FAST     3   /* "fast" */
+
+#define AI_GW_CLASS_STANDARD  0
+#define AI_GW_CLASS_CRITICAL  1
+#define AI_GW_CLASS_SHEDDABLE 2
+typedef struct ai_gw_class {
+    int32_t priority;          /* the priority in force, after the cap */
+    uint8_t priority_class;    /* AI_GW_CLASS_*: the sign of priority */
+    uint8_t objective_denied;  /* the header named an objective this request may not use */
+    uint8_t pad[2];
+    char    objective[64];     /* the hint applied: an objective name, "tier:<value>", or "" */
+} ai_gw_class_t;
+
+/*
+ * llb_ai_class_resolve - the class of a request whose tenant is decided.
+ *
+ * Called by the admission gate at most once per request, and only while
+ * ai_gw_class_on() says classes are configured at all.
+ *
+ *   tenant          the request's tenant
+ *   key_id          its API key's id ("" when no key decided it)
+ *   binding         the network-identity binding that named the tenant ("")
+ *   profile         the JWT profile that verified its token ("")
+ *   svc_ident       service identity "VIP:port"
+ *   objective_hint  the objective name the request's header asks for ("")
+ *   tier_hint       AI_TIER_* read from the body (0 = none)
+ *   out             output structure, zeroed by the caller
+ *
+ * Returns 0 when it answered, -1 when it could not; the gate then treats
+ * the request as standard. It reads immutable snapshots and takes no lock.
+ */
+extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
+                                char *profile, char *svc_ident,
+                                char *objective_hint, int tier_hint,
+                                ai_gw_class_t *out);
 
 /*
  * llb_ai_pd_record – record a P/D disaggregation lifecycle event.
@@ -463,6 +593,17 @@ extern void llb_ai_normal_session_hit(char *model_name);
  *   vip  service VIP the request arrived on (NUL-terminated)
  */
 extern void llb_ai_record_unmetered(char *vip);
+
+/*
+ * llb_ai_record_stream_early_close – record an HTTP/1.1 connection closed
+ * because its client sent bytes while a streamed answer was running on it.
+ *
+ * Called from the relay path at the close, once per connection.
+ *
+ * Parameters:
+ *   svc_ident  service identity "VIP:port" (NUL-terminated)
+ */
+extern void llb_ai_record_stream_early_close(char *svc_ident);
 
 /*
  * Reason values for llb_ai_record_usage_missing's reason parameter. Each names

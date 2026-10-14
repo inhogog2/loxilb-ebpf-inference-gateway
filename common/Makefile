@@ -139,7 +139,8 @@ sockproxy_http.o: sockproxy_http.c sockproxy_http.h sockproxy_internal.h \
                   sockproxy_stream_fallback.h \
                   sockproxy_trace.h sockproxy_cache.h sockproxy_lb.h \
                   sockproxy_health.h sockproxy_ssl.h sockproxy_conn.h \
-                  sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h
+                  sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h \
+                  sockproxy_creq_block.h sockproxy_h1_hdr.h
 	$(CC) $(CFLAGS) $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_LLAMAFIREWALL) -c -o $@ $<
 
 sockproxy_notifier.o: sockproxy_notifier.c sockproxy_notifier.h sockproxy_internal.h \
@@ -362,6 +363,26 @@ test_ai_admit_identity: test_ai_admit_identity.c sockproxy_ai_admit.c sockproxy_
 test_aiident: test_ai_admit_identity
 	./test_ai_admit_identity
 
+# Ingress interface of an accepted connection (network-identity bindings that
+# match on an interface): the read on a loopback connection, the socket left
+# as found, the control-buffer parse, the once-per-connection cache.
+# Header-only; needs loopback and nothing else.
+test_in_ifindex: test_in_ifindex.c sockproxy_in_ifindex.h
+	$(CC) -Wall -Wextra -o $@ test_in_ifindex.c -I.
+
+.PHONY: test_inif
+test_inif: test_in_ifindex
+	./test_in_ifindex
+
+# The operational log: per-thread rings and one writer thread. A log call
+# never waits for a sink; a full ring drops and counts.
+test_log_ring: test_log_ring.c log.c log.h
+	$(CC) -Wall -Wextra -o $@ test_log_ring.c log.c -I. -lpthread
+
+.PHONY: test_log
+test_log: test_log_ring
+	./test_log_ring
+
 # Capacity admission gate: ceilings hold under contention, units come back
 # exactly once, two legs of one request count one service unit, a moved leg
 # never over-admits, observe admits and counts, off touches nothing. Pure
@@ -381,13 +402,17 @@ test_fc_tenant: test_fc_tenant.c sockproxy_fc.c sockproxy_fc.h
 test_fc_expose: test_fc_expose.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_expose.c sockproxy_fc.c -I. -lpthread
 
+test_fc_tenant_slots: test_fc_tenant_slots.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -Wl,--wrap=calloc -o $@ test_fc_tenant_slots.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
 	./test_fc_tenant
 	./test_fc_expose
+	./test_fc_tenant_slots
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.
@@ -722,6 +747,32 @@ test_ka_leg: test_ka_leg.c sockproxy_ka_leg.h
 test_ka: test_ka_leg
 	./test_ka_leg
 
+# A request's header block is edited once and a body read never: the per-read
+# answer of the request framer (sockproxy_creq_block.h) and the header edits
+# (sockproxy_h1_hdr.h), driven by the real llhttp framer over reads cut the
+# way a socket cuts them. The test scores each body case against the pre-fix
+# rule as its own red twin. Address and undefined-behaviour sanitizers on.
+test_creq_block: test_creq_block.c sockproxy_creq_block.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -c -o test_creq_block.to $< -I.
+	$(CC) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_creq_block.to llhttp.c httpapi.c http.c -I.
+	rm -f test_creq_block.to
+
+.PHONY: test_creq
+test_creq: test_creq_block
+	./test_creq_block
+
+# The objective header's capture, the class headers of an admitted response
+# and the strip of a backend's X-Api-Key from its response head, on the
+# real framers under ASan and UBSan.
+test_obj_hint: test_obj_hint.c sockproxy_obj_hint.h sockproxy_creq_block.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -c -o test_obj_hint.to $< -I.
+	$(CC) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_obj_hint.to llhttp.c httpapi.c http.c -I.
+	rm -f test_obj_hint.to
+
+.PHONY: test_objhint
+test_objhint: test_obj_hint
+	./test_obj_hint
+
 # Backend connect in two halves: the relay path issues the connect and
 # finishes the leg from the writable event instead of holding its worker for
 # the round trip. Header-only and standalone; the test measures the kept
@@ -854,7 +905,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
