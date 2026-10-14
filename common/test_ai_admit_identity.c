@@ -69,6 +69,7 @@ static int validate_bearer_calls;
 /* Forced outcome of the API-key arm: 0 = validate, otherwise the decision
  * the arm refuses with (2 = model refused for a known tenant). */
 static int validate_key_decision;
+static const char *validate_key_tenant = "tenant-1";
 /* The same for the JWT arm. */
 static int validate_bearer_decision;
 static struct {
@@ -127,7 +128,7 @@ llb_ai_validate_key(char *raw_key, char *model, ai_gw_decision_t *result)
     return -1;
   }
   strcpy(result->key_id, "key-1");
-  strcpy(result->tenant_id, "tenant-1");
+  strcpy(result->tenant_id, validate_key_tenant);
   if (validate_key_decision != 0) {
     /* The credential validated and named its tenant; the refusal is the
      * arm's decision (a model this key may not use). */
@@ -2348,6 +2349,56 @@ test_class_streamed_body(void)
   assert(!res.hint_not_applied && !res.tier_consumed);
 }
 
+/* A streamed request hands the gate the part of its body that has arrived.
+ * A service_tier in that part is not read and not marked for nulling: the
+ * rest of the body is not in the buffer, and what is relayed must be what
+ * the client sent. */
+static void
+test_class_streamed_prefix_is_not_read(void)
+{
+  static const char prefix[] = "{\"service_tier\":\"flex\",\"model\":\"m9\",\"messages\":[";
+  ai_gw_req_ctx_t req = {
+    .api_key = "lxb_k",
+    .body = prefix,
+    .body_len = sizeof(prefix) - 1,
+    .prefix_model = "m9",
+    .prefix_only = 1,
+    .declared_content_length = 4000,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .class_on = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  tier_stub.tier = AI_TIER_FLEX;
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(tier_stub.calls == 0 && cls_stub.calls == 1 && cls_stub.tier == AI_TIER_NONE);
+  assert(res.hint_not_applied == 1 && !res.tier_consumed && res.tier_len == 0);
+}
+
+/* A credential that validates and names no tenant has nothing a class
+ * could be looked up by: the resolver is not asked. */
+static void
+test_class_key_without_a_tenant(void)
+{
+  ai_gw_req_ctx_t req = class_key_req();
+  ai_gw_admit_result_t res;
+
+  req.objective_hint = "realtime";
+  req.objective_strict = 1;
+  reset_stubs();
+  validate_key_tenant = "";
+  tier_stub.tier = AI_TIER_FLEX;
+  cls_stub.out.objective_denied = 1;   /* would refuse, were it asked */
+  (void)ai_gw_admit(&req, &res);
+  validate_key_tenant = "tenant-1";
+  assert(cls_stub.calls == 0 && tier_stub.calls == 0);
+  assert(!res.tier_consumed && !res.objective_denied);
+  assert(res.stage != AI_GW_STAGE_OBJECTIVE);
+}
+
 /* A resolver that cannot answer leaves the request standard and admitted,
  * strict rule or not: a class is not a condition of admission. */
 static void
@@ -2434,6 +2485,8 @@ main(void)
   test_class_denied_falls_through_unless_strict();
   test_class_tier_is_consumed_whoever_decided();
   test_class_streamed_body();
+  test_class_streamed_prefix_is_not_read();
+  test_class_key_without_a_tenant();
   test_class_resolver_failure_is_standard();
   test_class_on_switch();
   puts("PASS: class stage: off asks nothing, every arm hands its identity over, "

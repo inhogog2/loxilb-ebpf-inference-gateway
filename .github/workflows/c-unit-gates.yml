@@ -66,6 +66,9 @@ jobs:
       - name: A request's header block is edited once and a body read never (request framer state, header edits; ASan + UBSan)
         run: make -C common test_creq
 
+      - name: The objective header's capture, the class headers of an admitted response, and a backend's X-Api-Key in its response head (real framers, ASan + UBSan)
+        run: make -C common test_objhint
+
       - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off) and its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize)
         run: make -C common test_fc
 

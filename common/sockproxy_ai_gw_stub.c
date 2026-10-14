@@ -117,11 +117,15 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       char *request_id, char *user_id, char *key_id,
                       char *svc_ident, int is_stream, int producer_id,
                       char *client_ip, char *origin_ip, int trusted_hops,
-                      int auth_src, char *net_identity)
+                      int auth_src, char *net_identity,
+                      int priority, int class_info, char *objective)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)auth_src;
     (void)net_identity;
+    (void)priority;
+    (void)class_info;
+    (void)objective;
     (void)tenant_id;
     (void)model_name;
     (void)status_code;
@@ -334,6 +338,13 @@ llb_ai_record_unmetered(char *vip)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)vip;
+}
+
+__attribute__((weak)) void
+llb_ai_record_stream_early_close(char *svc_ident)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)svc_ident;
 }
 
 __attribute__((weak)) void

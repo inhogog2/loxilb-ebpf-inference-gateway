@@ -319,7 +319,12 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           pfe ? pfe->l7_peer_ip : "",
                           stream->l7_origin_ip,
                           (int)stream->l7_trusted_hops,
-                          (int)stream->auth_src, stream->auth_net_identity);
+                          (int)stream->auth_src, stream->auth_net_identity,
+                          (int)stream->adm_priority,
+                          AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
+                                           stream->adm_objective_denied,
+                                           stream->adm_hint_not_applied),
+                          stream->adm_objective);
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -414,6 +419,11 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     e->auth_src = (int)stream->auth_src;
     snprintf(e->net_identity, sizeof(e->net_identity), "%s",
              stream->auth_net_identity);
+    e->priority = (int)stream->adm_priority;
+    e->class_info = AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
+                                     stream->adm_objective_denied,
+                                     stream->adm_hint_not_applied);
+    snprintf(e->objective, sizeof(e->objective), "%s", stream->adm_objective);
     e->response_is_sse = stream->response_is_sse;
     e->prompt_toks = up;
     e->complet_toks = uc;
@@ -787,6 +797,13 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   } else if (HEADER_MATCHES("x-model")) {
     snprintf(stream->x_model_header, sizeof(stream->x_model_header),
              "%.*s", (int)valuelen, value);
+  } else if (sp_obj_hint_which((const char *)name, namelen) != SP_OBJ_NOT) {
+    /* The objective the request asks for, by name. A header field is one
+     * whole value here; the new name wins over the deprecated one. */
+    sp_obj_hint_name(&stream->obj_hint);
+    sp_obj_hint_val(&stream->obj_hint,
+                    sp_obj_hint_which((const char *)name, namelen),
+                    (const char *)value, valuelen);
   }
 
   // append into the bounded generic L7 header/cookie store on
@@ -1170,6 +1187,52 @@ h2_expose_admission(stream_mapping_t *mapping, const fc_permit_t *permit)
     };
     proxy_h2_inject_resp_headers(mapping, add, 3);
   }
+}
+
+/* The class headers of an admitted response: the class, and the hint that
+ * was applied when there was one. A backend's own headers of those two
+ * names are dropped first; this runs after h2_expose_admission, which
+ * removes the whole admission family before it adds its values. */
+static void
+h2_expose_class(stream_mapping_t *mapping, const proxy_h2_stream_t *cstream)
+{
+  static const char n_obj[] = SP_CLASS_HDR_OBJ;
+  static const char n_class[] = SP_CLASS_HDR_CLASS;
+  const char *cls = sp_class_name(cstream->adm_class);
+  nghttp2_nv add[2];
+  size_t i, j, n = 0;
+
+  for (i = 0, j = 0; mapping->response_headers &&
+                     i < mapping->response_headers_count; i++) {
+    nghttp2_nv *nv = &mapping->response_headers[i];
+    if ((nv->namelen == sizeof(n_obj) - 1 &&
+         !strncasecmp((const char *)nv->name, n_obj, nv->namelen)) ||
+        (nv->namelen == sizeof(n_class) - 1 &&
+         !strncasecmp((const char *)nv->name, n_class, nv->namelen))) {
+      free(nv->name);
+      free(nv->value);
+      continue;
+    }
+    mapping->response_headers[j++] = *nv;
+  }
+  if (mapping->response_headers)
+    mapping->response_headers_count = j;
+
+  if (sp_class_hdr_value_ok(cstream->adm_objective)) {
+    add[n].name = (uint8_t *)n_obj;
+    add[n].namelen = sizeof(n_obj) - 1;
+    add[n].value = (uint8_t *)cstream->adm_objective;
+    add[n].valuelen = strlen(cstream->adm_objective);
+    add[n].flags = NGHTTP2_NV_FLAG_NONE;
+    n++;
+  }
+  add[n].name = (uint8_t *)n_class;
+  add[n].namelen = sizeof(n_class) - 1;
+  add[n].value = (uint8_t *)cls;
+  add[n].valuelen = strlen(cls);
+  add[n].flags = NGHTTP2_NV_FLAG_NONE;
+  n++;
+  proxy_h2_inject_resp_headers(mapping, add, n);
 }
 
 static void
@@ -1659,6 +1722,8 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
      * that exposes them. The values are read now, while the stream still
      * holds its own unit. */
     h2_expose_admission(mapping, &cstream->fc);
+    if (cstream->class_expose)
+      h2_expose_class(mapping, cstream);
 
     // on the L7_Proxy peer only ( gate),
     // inject a stateless HTTP_COOKIE Set-Cookie into the relayed HEADERS frame
@@ -3383,6 +3448,10 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 {
   int is_post = stream->method[0] && !strcasecmp(stream->method, "POST");
 
+  /* The class headers have their own trigger: a request is given a class
+   * whether or not its pool has a ceiling. */
+  stream->class_expose =
+    (stream->adm_class_set && tepval->fc.cfg.expose_headers) ? 1 : 0;
   fc_permit_release(&stream->fc);
   if (fc_active(&tepval->fc) &&
       !(tepval->mcp_stateless && is_post) &&
@@ -4242,6 +4311,9 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .body_len = stream->data_len,
       .prefix_model = body_model,
       .hdr_model = stream->x_model_header,
+      .class_on = ai_gw_class_on(),
+      .objective_hint = stream->obj_hint.name,
+      .objective_strict = ent->val.ephash->ai_objective_strict,
       .auth_mode = ent->val.ephash->apikey_auth,
       .default_tokens_of = sp_resv_default_tokens_of,
       .default_tokens_arg = &adm_route,
@@ -4335,6 +4407,18 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
         stream->usage_reserved_toks = adm.reserved_toks;
         stream->usage_res_epoch = adm.res_epoch;
       }
+      /* The class the gate found. A service_tier it read as a hint is
+       * the gateway's, not the engine's: its value becomes null in the
+       * buffered body, which is what is sent on. */
+      stream->adm_class_set = adm_req.class_on ? 1 : 0;
+      stream->adm_priority = adm.priority;
+      stream->adm_class = adm.priority_class;
+      stream->adm_objective_denied = adm.objective_denied;
+      stream->adm_hint_not_applied = adm.hint_not_applied;
+      snprintf(stream->adm_objective, sizeof(stream->adm_objective), "%s", adm.objective);
+      if (adm.tier_consumed && stream->data_buf)
+        json_null_value((char *)stream->data_buf, stream->data_len,
+                        adm.tier_off, adm.tier_len);
       stream->admit_mono_ns = get_timestamp_ns();
     }
   }

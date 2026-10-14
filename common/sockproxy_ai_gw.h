@@ -206,9 +206,23 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *                   request's source, "" when none did. Set with auth_src 0
  *                   or 2 when a credential decided and the binding was only
  *                   matched beside it
+ *   priority:       the request's priority after the cap (0 when the class
+ *                   stage did not run)
+ *   class_info:     AI_GW_CLASSF_* bits around the AI_GW_CLASS_* value; 0
+ *                   when the class stage did not run for the request
+ *   objective:      the hint that was applied: an objective name,
+ *                   "tier:<value>", or ""
  *
  * Returns void.
  */
+#define AI_GW_CLASSF_MASK        0x03   /* AI_GW_CLASS_* */
+#define AI_GW_CLASSF_SET         0x04   /* the class stage ran */
+#define AI_GW_CLASSF_DENIED      0x08   /* the header named an objective the request may not use */
+#define AI_GW_CLASSF_HINT_UNREAD 0x10   /* a body hint could not be read (streamed body) */
+#define AI_GW_CLASS_INFO(set, cls, denied, unread)                         \
+  ((set) ? (AI_GW_CLASSF_SET | ((cls) & AI_GW_CLASSF_MASK) |              \
+            ((denied) ? AI_GW_CLASSF_DENIED : 0) |                         \
+            ((unread) ? AI_GW_CLASSF_HINT_UNREAD : 0)) : 0)
 extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                                   int64_t latency_ms, int prompt_tokens, int complet_tokens,
                                   int stream_start, int stream_end, char *error_code,
@@ -216,7 +230,9 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
                                   char *svc_ident, int is_stream, int producer_id,
                                   char *client_ip, char *origin_ip,
                                   int trusted_hops, int auth_src,
-                                  char *net_identity);
+                                  char *net_identity,
+                                  int priority, int class_info,
+                                  char *objective);
 
 /*
  * llb_ai_record_deny – record one request refused at the admission gate.
@@ -577,6 +593,17 @@ extern void llb_ai_normal_session_hit(char *model_name);
  *   vip  service VIP the request arrived on (NUL-terminated)
  */
 extern void llb_ai_record_unmetered(char *vip);
+
+/*
+ * llb_ai_record_stream_early_close – record an HTTP/1.1 connection closed
+ * because its client sent bytes while a streamed answer was running on it.
+ *
+ * Called from the relay path at the close, once per connection.
+ *
+ * Parameters:
+ *   svc_ident  service identity "VIP:port" (NUL-terminated)
+ */
+extern void llb_ai_record_stream_early_close(char *svc_ident);
 
 /*
  * Reason values for llb_ai_record_usage_missing's reason parameter. Each names

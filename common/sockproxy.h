@@ -21,6 +21,7 @@
 #include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
 #include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
+#include "sockproxy_obj_hint.h"     /* the objective a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
 
 // Forward declaration for HTTP/2 support
@@ -623,6 +624,7 @@ typedef struct proxy_epval {
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
   uint8_t  hold_mode;              // enum sp_hold_mode: hold a client that half-closed after its request
+  uint8_t  ai_objective_strict;    // 1 = a request naming an objective it may not use is refused 403
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   uint32_t ai_default_tokens;      // completion tokens reserved for a request without max_tokens (0 = off)
@@ -1118,6 +1120,7 @@ struct proxy_fd_ent {
    * than through it. */
   llhttp_t creq_parser;            // HTTP_REQUEST; settings are one shared static
   uint8_t  creq_parser_inited;
+  creq_block_t cresp_blk;            // the same for a backend read and its response, kept by the response framer
   creq_block_t creq_blk;             // where the last client read stands in its request (sockproxy_creq_block.h)
 
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
@@ -1508,6 +1511,17 @@ struct proxy_fd_ent {
   uint8_t  auth_netid_fwd;            // 1 = the binding that matched this request's source forwards identity:
                                       // inject X-Auth-Tenant/X-Auth-User upstream. Per request. The strip of
                                       // client-sent X-Auth-* is the service's, not the request's (ai_gw_netid_bound)
+  // The class of the request, per request with the identity above.
+  // obj_hint is what the request's header asked for; the rest is the
+  // admission gate's answer, zero while no class is configured.
+  sp_obj_hint_t obj_hint;
+  int32_t  adm_priority;              // the priority in force, after the cap
+  uint8_t  adm_class;                 // AI_GW_CLASS_*
+  uint8_t  adm_class_set;             // 1 = the class stage ran for this request
+  uint8_t  adm_objective_denied;      // the header named an objective the request may not use
+  uint8_t  adm_hint_not_applied;      // a body hint could not be read (streamed body)
+  uint8_t  class_expose_pending;      // 1 = the response head still owes the class headers
+  char     adm_objective[64];         // the hint applied: an objective name, "tier:<value>", or ""
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer
@@ -2086,6 +2100,8 @@ struct proxy_arg {
   // Half-close hold mode, same hop as the admission fields: enum
   // sp_hold_mode (0 = the process default).
   uint8_t  half_close_mode;
+  // Same hop: 1 = a request naming an objective it may not use is refused.
+  uint8_t  ai_objective_strict;
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   // Default reservation, same hop: completion tokens the admission gate

@@ -226,7 +226,12 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
                         (char *)pfe->l7_peer_ip,
                         (char *)proxy_origin_ip(pfe),
                         (int)proxy_origin_trusted_hops(pfe),
-                        (int)pfe->auth_src, (char *)pfe->auth_net_identity);
+                        (int)pfe->auth_src, (char *)pfe->auth_net_identity,
+                        (int)pfe->adm_priority,
+                        AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
+                                         pfe->adm_objective_denied,
+                                         pfe->adm_hint_not_applied),
+                        (char *)pfe->adm_objective);
   pfe->metric_ai_recorded = 1;
   /* The response is complete: the backend's work for this request is done
    * and its capacity unit goes back before the connection idles on
@@ -798,6 +803,39 @@ proxy_svc_forwards_netid(proxy_map_ent_t *node)
     return 0;
   ai_gw_svc_ident(node->key.xip, node->key.xport, svc_ident, sizeof(svc_ident));
   return (ai_gw_netid_bound(svc_ident) & AI_GW_NETID_FWD) != 0;
+}
+
+/*
+ * sp_resp_strip_api_key — remove a backend's X-Api-Key from the head of its
+ * response. Returns the (possibly shrunk) length.
+ *
+ * X-Api-Key is the gateway's credential header on a service that declares
+ * api_key_auth (any declared value): the caller's is consumed or removed on
+ * the way in, and a backend's is not let out, so a key a backend echoes or
+ * mints never reaches a client under the gateway's own header name. A
+ * service that made no declaration owns the header and it passes.
+ *
+ * Only a read the response framer marked: one that began at a response's
+ * first byte and holds its whole header block. A head split across reads
+ * is left as it is, and so is every body byte. X-Auth-* response headers
+ * are not touched on any service.
+ */
+static size_t
+sp_resp_strip_api_key(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen)
+{
+  proxy_map_ent_t *node;
+  size_t cur = buflen;
+
+  if (!client || !buf || !client->cresp_blk.hdr_block)
+    return buflen;
+  client->cresp_blk.hdr_block = 0;       /* once per read */
+  node = (proxy_map_ent_t *)client->head;
+  if (!node || !node->val.ephash ||
+      !ai_security_should_strip_api_key(node->val.ephash->apikey_auth))
+    return buflen;
+  if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
+    return buflen;
+  return cur;
 }
 
 /*
@@ -2098,7 +2136,13 @@ skip_deferred_masking:
                               (char *)proxy_origin_ip(rfd_ent),
                               (int)proxy_origin_trusted_hops(rfd_ent),
                               (int)rfd_ent->auth_src,
-                              (char *)rfd_ent->auth_net_identity);
+                              (char *)rfd_ent->auth_net_identity,
+                              (int)rfd_ent->adm_priority,
+                              AI_GW_CLASS_INFO(rfd_ent->adm_class_set,
+                                               rfd_ent->adm_class,
+                                               rfd_ent->adm_objective_denied,
+                                               rfd_ent->adm_hint_not_applied),
+                              (char *)rfd_ent->adm_objective);
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         fc_permit_release(&rfd_ent->fc);  /* the stream ended: its capacity unit goes back */
         log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
@@ -2267,6 +2311,11 @@ skip_deferred_masking:
  * listeners — byte-for-byte unchanged. */
       len = l7_inject_hsts_h1(rfd_ent, (uint8_t *)msg, len, SP_SOCK_MSG_LEN);
     }
+    /* A backend's X-Api-Key does not leave a service that declares
+     * api_key_auth. Same legs as the response framer that marks the read. */
+    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 && !ent->pd_sg_drain &&
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING)
+      len = sp_resp_strip_api_key(rfd_ent, (uint8_t *)msg, len);
 
     /* The admission headers on the admitted response's head. Not on the
      * seam above: a chunked or event-stream response is marked chunked by
@@ -2285,6 +2334,17 @@ skip_deferred_masking:
       if (fc_x && xr == FC_EXPOSE_H1_SKIPPED)
         log_debug("[AIGateway] fd=%d admission headers not added: the response "
                   "head is not whole in this read, or has no room", rfd_ent->fd);
+    }
+    /* The class headers, after the block above: it removes every line of
+     * the admission family the backend sent before it adds its own. */
+    if (ent->odir == 1 && rfd_ent->odir == 0 && rfd_ent->class_expose_pending &&
+        !ent->pd_sg_drain && rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
+      int xr = SP_CLASS_H1_SKIPPED;
+
+      len = sp_class_expose_h1((uint8_t *)msg, len, SP_SOCK_MSG_LEN,
+                               rfd_ent->adm_objective, rfd_ent->adm_class, &xr);
+      if (xr != SP_CLASS_H1_INTERIM)
+        rfd_ent->class_expose_pending = 0;
     }
 
     rfd_ent->chunk_seq++;  // Increment sequence for each transmission attempt
@@ -3148,6 +3208,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         /* Requests admitted from here on; a claim already held settles
          * for what it was granted. */
         tepval->ai_default_tokens = arg->ai_default_tokens;
+        tepval->ai_objective_strict = arg->ai_objective_strict;
         /* The prefill timeout follows a rule update too: the reaper reads it
          * on every tick, so requests already waiting get the new value. */
         tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
@@ -3309,6 +3370,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         sp_fc_apply_rule(tepval, arg, new_ent, 1);
         tepval->hold_mode = arg->half_close_mode;
         tepval->ai_default_tokens = arg->ai_default_tokens;
+        tepval->ai_objective_strict = arg->ai_objective_strict;
         /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
@@ -3731,6 +3793,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   sp_fc_apply_rule(tepval, arg, new_ent, 1);
   tepval->hold_mode = arg->half_close_mode;
   tepval->ai_default_tokens = arg->ai_default_tokens;
+  tepval->ai_objective_strict = arg->ai_objective_strict;
   /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();
@@ -5629,6 +5692,10 @@ typedef struct {
    * identity. */
   int  auth_src;
   char net_identity[64];
+  /* The request's class, for the same record. */
+  int  priority;
+  int  class_info;     /* AI_GW_CLASSF_* */
+  char objective[64];
 } proxy_umiss_t;
 
 typedef struct {
@@ -5756,6 +5823,11 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     u->auth_src     = (int)pfe->auth_src;
     snprintf(u->net_identity, sizeof(u->net_identity), "%s",
              pfe->auth_net_identity);
+    u->priority     = (int)pfe->adm_priority;
+    u->class_info   = AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
+                                       pfe->adm_objective_denied,
+                                       pfe->adm_hint_not_applied);
+    snprintf(u->objective, sizeof(u->objective), "%s", pfe->adm_objective);
     u->status       = (int)pfe->metric_response_status;
     u->prompt_toks  = pfe->usage_prompt_toks;
     u->complet_toks = pfe->usage_complet_toks;
@@ -6403,7 +6475,8 @@ proxy_pdestroy(void *priv)
                             u->request_id, u->user, u->key, u->svc_ident,
                             0, notify_worker_id(),
                             u->client_ip, u->origin_ip, u->trusted_hops,
-                            u->auth_src, u->net_identity);
+                            u->auth_src, u->net_identity,
+                            u->priority, u->class_info, u->objective);
       log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d",
                u->tenant, u->model, u->status);
     }
@@ -6452,7 +6525,8 @@ proxy_pdestroy(void *priv)
                             e->request_id, e->user, e->key, e->svc_ident,
                             e->response_is_sse, notify_worker_id(),
                             e->client_ip, e->origin_ip, e->trusted_hops,
-                            e->auth_src, e->net_identity);
+                            e->auth_src, e->net_identity,
+                            e->priority, e->class_info, e->objective);
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
        * with no backend status never completed a response, so it is a
@@ -8570,6 +8644,14 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->auth_fwd_identity = 0;
     pfe->auth_jwt_capable = 0;
     pfe->auth_netid_fwd = 0;
+    sp_obj_hint_reset(&pfe->obj_hint);
+    pfe->adm_priority = 0;
+    pfe->adm_class = 0;
+    pfe->adm_class_set = 0;
+    pfe->adm_objective_denied = 0;
+    pfe->adm_hint_not_applied = 0;
+    pfe->adm_objective[0] = '\0';
+    pfe->class_expose_pending = 0;
     pfe->x_model_header[0] = '\0';
     pfe->effective_model[0] = '\0';
     pfe->json_stream_route_pending = 0;
@@ -8745,6 +8827,7 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->custom_session_header_value[0] = '\0';
   pfe->has_custom_session_header = 0;
   pfe->x_model_header[0] = '\0';
+  sp_obj_hint_reset(&pfe->obj_hint);
   l7_origin_reset(pfe);
   pfe->vllm_request_id[0] = '\0';
   pfe->has_vllm_request_id = 0;
@@ -8883,6 +8966,10 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
 
   if (!pfe || !tepval || pfe->odir != 0)
     return 0;
+  /* The class headers have their own trigger: a request is given a class
+   * whether or not its pool has a ceiling. */
+  pfe->class_expose_pending =
+    (pfe->adm_class_set && tepval->fc.cfg.expose_headers) ? 1 : 0;
   /* The request already holds its permit: this is the same request driven
    * again (a backend connect that completed asynchronously re-enters the
    * dispatch), not a new one. A new request always passes the message-begin
@@ -9227,6 +9314,21 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
     pfe->usage_reserved_toks = adm.reserved_toks;
     pfe->usage_res_epoch = adm.res_epoch;
   }
+  /* The class the gate found, for the queue, the response head and the
+   * records. A service_tier the gate read as a hint is the gateway's, not
+   * the engine's: its value becomes null, in place, before the body is
+   * forwarded. req->body points into this connection's receive buffer. */
+  pfe->adm_class_set = req->class_on ? 1 : 0;
+  pfe->adm_priority = adm.priority;
+  pfe->adm_class = adm.priority_class;
+  pfe->adm_objective_denied = adm.objective_denied;
+  pfe->adm_hint_not_applied = adm.hint_not_applied;
+  snprintf(pfe->adm_objective, sizeof(pfe->adm_objective), "%s", adm.objective);
+  if (adm.tier_consumed && req->body &&
+      (const uint8_t *)req->body >= pfe->rcvbuf &&
+      (const uint8_t *)req->body + req->body_len <= pfe->rcvbuf + pfe->rcv_off)
+    json_null_value((char *)(uintptr_t)req->body, req->body_len,
+                    adm.tier_off, adm.tier_len);
   return 0;
 }
 
@@ -9269,6 +9371,9 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->jwt_profile = hent->val.ephash->jwt_auth_profile;
   req->prefix_model = pfe->prefix_key.model;
   req->hdr_model = pfe->x_model_header;
+  req->class_on = ai_gw_class_on();
+  req->objective_hint = pfe->obj_hint.name;
+  req->objective_strict = hent->val.ephash->ai_objective_strict;
   req->auth_mode = hent->val.ephash->apikey_auth;
   /* The gate runs before the header splice, so a refused request normally
    * has no derived origin and proxy_origin_ip returns "" — which says "not
@@ -10384,7 +10489,10 @@ static int
 cresp_on_message_begin(llhttp_t *parser)
 {
   proxy_fd_ent_t *pfe = parser->data;
-  if (pfe) memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+  if (pfe) {
+    memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+    creq_block_msg_begin(&pfe->cresp_blk);
+  }
   return 0;
 }
 static int cresp_on_field(llhttp_t *parser, const char *at, size_t len)
@@ -10425,6 +10533,7 @@ cresp_on_headers_complete(llhttp_t *parser)
   if (!pfe) {
     return 0;
   }
+  creq_block_hdrs_done(&pfe->cresp_blk);
   /* An interim response (100 Continue, 103 Early Hints) is not the answer:
    * llhttp completes it as a message of its own, and the final response to
    * the same request follows. It takes no HEAD bit and completes nothing. */
@@ -10456,6 +10565,16 @@ cresp_on_message_complete(llhttp_t *parser)
 {
   proxy_fd_ent_t *pfe = parser->data;
 
+  if (pfe) {
+    creq_block_msg_done(&pfe->cresp_blk);
+    /* The framed end of a streamed answer is its end, whether or not it
+     * carried the [DONE] event: the read that completes the response is
+     * the one that records the stream's end, so the client's next request
+     * on this connection is a request boundary, not bytes sent into a
+     * running stream. */
+    if (pfe->cresp_sse.is_sse)
+      pfe->cresp_sse.done = 1;
+  }
   if (pfe && cresp_is_answer(parser->status_code)) {
     /* Capture ownership survives a policy change and names modern H1
      * requests independently of the AI accounting marker. Release execution
@@ -10500,6 +10619,7 @@ cresp_parser_init(proxy_fd_ent_t *pfe)
     cresp_settings_inited = 1;
   }
   llhttp_init(&pfe->cresp_parser, HTTP_RESPONSE, &cresp_settings);
+  creq_block_reset(&pfe->cresp_blk);
   pfe->cresp_parser.data = pfe;
   pfe->cresp_parser_inited = 1;
 }
@@ -10517,7 +10637,11 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   if (!client->cresp_parser_inited) {
     cresp_parser_init(client);
   }
+  /* Where this read stands in its response, for the one edit made to a
+   * backend's header block (sp_resp_strip_api_key). */
+  creq_block_read_begin(&client->cresp_blk);
   rerr = llhttp_execute(&client->cresp_parser, (const char *)msg, len);
+  creq_block_read_end(&client->cresp_blk, 1);
   if (rerr == HPE_PAUSED_UPGRADE) {
     llhttp_resume_after_upgrade(&client->cresp_parser);
     return;
@@ -10530,6 +10654,7 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
     log_debug("[CRESP_FRAMING] fd=%d llhttp err=%d (%s) — relay unaffected, framer reset",
               client->fd, rerr, llhttp_errno_name(rerr));
     cresp_parser_init(client);
+    creq_block_read_end(&client->cresp_blk, 0);
   }
 }
 
@@ -10610,6 +10735,7 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
   // A new header name ends any in-progress Authorization value
   // accumulation (handle_header_val appends across value fragments).
   pfe->bearer_capturing = 0;
+  sp_obj_hint_name(&pfe->obj_hint);
 
   if (strncasecmp("Host", str, length) == 0) {
     pfe->http_hok = 1;
@@ -10823,6 +10949,14 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
       pfe->x_model_header[length] = '\0';
     }
   }
+
+  // The objective the request asks for, by name. Appended across value
+  // fragments; the whole header name is compared.
+  if (!pfe->odir)
+    sp_obj_hint_val(&pfe->obj_hint,
+                    sp_obj_hint_which(pfe->last_header_name,
+                                      strlen(pfe->last_header_name)),
+                    at, length);
 
   // AI Gateway: Extract X-Api-Key header for data-plane enforcement
   if (!strncasecmp("X-Api-Key", pfe->last_header_name, 9)) {
@@ -11889,6 +12023,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->custom_session_header_value[0] = '\0';
     pfe->has_custom_session_header = 0;
     pfe->x_model_header[0] = '\0';  // Reset X-Model header for next request
+    sp_obj_hint_reset(&pfe->obj_hint);
 
 
     /* Snapshot the correlation key BEFORE the reset below clears it, for the
@@ -13433,8 +13568,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * (proxy_try_epxmit), and the next request is then a boundary the
        * parse phase takes. */
       if (!pfe->odir && pfe->sse_active) {
-        log_debug("[STREAM_INTRUSION] fd=%d: %zd client bytes while a streamed "
-                  "answer is running; closing, nothing relayed", fd, (ssize_t)rc);
+        proxy_map_ent_t *enode = (proxy_map_ent_t *)pfe->head;
+        char esvc[64] = "";
+
+        /* Counted and said once: the connection does not come back. */
+        if (enode)
+          ai_gw_svc_ident(enode->key.xip, enode->key.xport, esvc, sizeof(esvc));
+        llb_ai_record_stream_early_close(esvc);
+        log_debug("[STREAM_INTRUSION] fd=%d svc=%s: %zd client bytes while a "
+                  "streamed answer is running; closing, nothing relayed",
+                  fd, esvc, (ssize_t)rc);
         /* The return alone only ends this read; the shutdown is what
          * closes, as on the other refusals of this loop. */
         shutdown(pfe->fd, SHUT_RDWR);

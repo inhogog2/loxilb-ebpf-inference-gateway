@@ -1171,7 +1171,9 @@ struct dp_proxy_tacts {
   // sends 1 for a rule that cannot take hold. The next byte of the same
   // padding.
   uint8_t  half_close_mode;
-  uint8_t  fc_pad3[1];
+  // A request that names an objective it may not use: 0 falls to its
+  // default objective, 1 is refused 403. The last byte of the same padding.
+  uint8_t  ai_objective_strict;
   // Completion tokens the admission gate reserves for a request that
   // declares no max_tokens, already resolved by the control plane (rule,
   // then environment, then off). 0 = off: the prompt estimate alone is
@@ -1246,6 +1248,7 @@ struct dp_proxy_tacts {
 // fc_tenant_share_pct(1)+fc_pad3[3] replace the u32 fc_pad3: no size change.
 // fc_expose_headers(1)+fc_pad3[2] replace fc_pad3[3]: no size change.
 // half_close_mode(1)+fc_pad3[1] replace fc_pad3[2]: no size change.
+// ai_objective_strict(1) replaces fc_pad3[1]: no size change.
 // ABI guard updated for: +ai_default_tokens(4)+ai_pad(4) = +8 (8-aligned
 //   region; one padding byte was left, a u32 does not fit): all four asserts
 //   shift by +8 (2960→2968, 2952→2960, 3992→4000, 3984→3992). Set from Go

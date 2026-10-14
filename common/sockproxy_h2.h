@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include "uthash.h"
 #include "sockproxy_fc.h"   /* per-stream capacity admission permit */
+#include "sockproxy_obj_hint.h"   /* the objective a request asks for by header */
 #include "sockproxy_l7trust.h"   /* l7_hop_list_t on the per-stream request state */
 
 // Forward declarations
@@ -145,6 +146,16 @@ typedef struct proxy_h2_stream {
   uint8_t  auth_fwd_identity;
   uint8_t  auth_jwt_capable;
   uint8_t  auth_netid_fwd;           // the matched binding forwards identity upstream
+  // The class of the request: what its header asked for, and the gate's
+  // answer (all zero while no class is configured).
+  sp_obj_hint_t obj_hint;
+  int32_t  adm_priority;
+  uint8_t  adm_class;                // AI_GW_CLASS_*
+  uint8_t  adm_class_set;            // the class stage ran
+  uint8_t  adm_objective_denied;
+  uint8_t  adm_hint_not_applied;
+  uint8_t  class_expose;             // the response head carries the class headers
+  char     adm_objective[64];
   uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
   int64_t  usage_res_epoch;          // reservation window tag
   uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)
@@ -494,6 +505,10 @@ typedef struct h2_inflight_settle {
    * identity above. */
   int     auth_src;
   char    net_identity[64];
+  /* The request's class, for the same record. */
+  int     priority;
+  int     class_info;   /* AI_GW_CLASSF_* */
+  char    objective[64];
 } h2_inflight_settle_t;
 
 /*
