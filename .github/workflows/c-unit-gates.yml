@@ -63,6 +63,9 @@ jobs:
       - name: Operational log (per-thread rings, one writer thread; a full ring never blocks the caller)
         run: make -C common test_log
 
+      - name: A request's header block is edited once and a body read never (request framer state, header edits; ASan + UBSan)
+        run: make -C common test_creq
+
       - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off) and its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize)
         run: make -C common test_fc
 

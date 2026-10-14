@@ -21,6 +21,7 @@
 #include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
 #include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
+#include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
@@ -1117,6 +1118,7 @@ struct proxy_fd_ent {
    * than through it. */
   llhttp_t creq_parser;            // HTTP_REQUEST; settings are one shared static
   uint8_t  creq_parser_inited;
+  creq_block_t creq_blk;             // where the last client read stands in its request (sockproxy_creq_block.h)
 
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;

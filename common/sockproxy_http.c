@@ -696,123 +696,9 @@ inject_request_id_header(void *msg, size_t *len, size_t bufsize,
  * The X-Forwarded-* trio is emitted by the applier as SET (always overwrite).
  * =========================================================================== */
 
-/* Strip EVERY occurrence of header `name` (case-insensitive) from the request
- * header block in [msg, *len). Returns the (possibly shrunk) header terminator,
- * or NULL if the \r\n\r\n terminator is lost. Bounded to the header block only. */
-static uint8_t *
-l7h1_strip_header(uint8_t *msg, size_t *len, const char *name)
-{
-  uint8_t *headers_end = memmem(msg, *len, "\r\n\r\n", 4);
-  size_t name_len = strlen(name);
-  if (!headers_end || name_len == 0)
-    return headers_end;
-
-  /* Walk header lines from the first CRLF after the request-line. */
-  uint8_t *line = memmem(msg, (size_t)(headers_end - msg), "\r\n", 2);
-  while (line && line < headers_end) {
-    uint8_t *hdr = line + 2;                 /* start of the next header line */
-    if (hdr >= headers_end)
-      break;
-    /* Match "<name>:" case-insensitively at the start of this header line. */
-    if ((size_t)(headers_end - hdr) > name_len &&
-        strncasecmp((const char *)hdr, name, name_len) == 0 &&
-        hdr[name_len] == ':') {
-      uint8_t *line_end = memmem(hdr, (size_t)(*len - (size_t)(hdr - msg)),
-                                 "\r\n", 2);
-      if (!line_end)
-        break;
-      line_end += 2;                         /* include the trailing CRLF */
-      size_t remove_len = (size_t)(line_end - hdr);
-      memmove(hdr, line_end, *len - (size_t)(line_end - msg));
-      *len -= remove_len;
-      headers_end = memmem(msg, *len, "\r\n\r\n", 4);
-      if (!headers_end)
-        return NULL;
-      /* Re-scan from the same `line` (hdr now holds the following header). */
-      continue;
-    }
-    line = memmem(hdr, (size_t)(headers_end - hdr), "\r\n", 2);
-  }
-  return headers_end;
-}
-
-/* Strip every header whose name starts with prefix (case-insensitive) from
- * the header block in [msg, *len): a whole family a client must not be able
- * to send upstream, whatever its members are called. Same contract as
- * l7h1_strip_header: the header terminator, or NULL if it was lost. */
-static uint8_t *
-l7h1_strip_header_prefix(uint8_t *msg, size_t *len, const char *prefix)
-{
-  uint8_t *headers_end = memmem(msg, *len, "\r\n\r\n", 4);
-  size_t plen = strlen(prefix);
-  if (!headers_end || plen == 0)
-    return headers_end;
-
-  uint8_t *line = memmem(msg, (size_t)(headers_end - msg), "\r\n", 2);
-  while (line && line < headers_end) {
-    uint8_t *hdr = line + 2;
-    if (hdr >= headers_end)
-      break;
-    if ((size_t)(headers_end - hdr) > plen &&
-        strncasecmp((const char *)hdr, prefix, plen) == 0) {
-      uint8_t *line_end = memmem(hdr, (size_t)(*len - (size_t)(hdr - msg)),
-                                 "\r\n", 2);
-      if (!line_end)
-        break;
-      line_end += 2;
-      size_t remove_len = (size_t)(line_end - hdr);
-      memmove(hdr, line_end, *len - (size_t)(line_end - msg));
-      *len -= remove_len;
-      headers_end = memmem(msg, *len, "\r\n\r\n", 4);
-      if (!headers_end)
-        return NULL;
-      continue;
-    }
-    line = memmem(hdr, (size_t)(headers_end - hdr), "\r\n", 2);
-  }
-  return headers_end;
-}
-
-/* Splice one "<name>: <value>\r\n" line before the final \r\n\r\n. */
-static int
-l7h1_splice_header(uint8_t *msg, size_t *len, size_t bufsize,
-                   const char *name, const char *value)
-{
-  char inject_buf[L7_HDR_NAME_MAX + L7_HDR_VALUE_MAX + 8];
-
-  /*
-   * A field carrying CR or LF would not stay one header line: everything
-   * after the break becomes a header line of the receiver's own. Refuse the
-   * splice. Nothing untrusted is logged -- the name is exactly the string
-   * under suspicion, and writing it into a log is the same mistake one layer
-   * down.
-   */
-  if (l7_hdr_pair_unsafe(name, value)) {
-    log_error("l7h1_splice_header: refused a header field carrying a line "
-              "break or an empty name (name_len=%zu value_len=%zu)",
-              name ? strlen(name) : (size_t)0,
-              value ? strlen(value) : (size_t)0);
-    return -1;
-  }
-
-  int n = snprintf(inject_buf, sizeof(inject_buf), "%s: %s\r\n", name, value);
-  if (n <= 0 || (size_t)n >= sizeof(inject_buf))
-    return -1;
-  size_t inject_len = (size_t)n;
-
-  uint8_t *headers_end = memmem(msg, *len, "\r\n\r\n", 4);
-  if (!headers_end)
-    return -1;
-  if (*len + inject_len >= bufsize)
-    return -1;
-
-  uint8_t *insert_point = headers_end + 2;   /* after last header CRLF */
-  size_t tail_len = *len - (size_t)(insert_point - msg);
-  memmove(insert_point + inject_len, insert_point, tail_len);
-  memcpy(insert_point, inject_buf, inject_len);
-  *len += inject_len;
-  return 0;
-}
+/* The three header-block edits (strip a header, strip a family, splice a
+ * line) live in sockproxy_h1_hdr.h, where the unit test reaches them. */
+#include "sockproxy_h1_hdr.h"
 
 /* Emit-callback context for the H1 path: the mutable request buffer. */
 typedef struct {
@@ -901,6 +787,19 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
   return cur;
 }
 
+/* Whether a network-identity binding that forwards identity names this
+ * service. One atomic load while no such binding exists. */
+static int
+proxy_svc_forwards_netid(proxy_map_ent_t *node)
+{
+  char svc_ident[64];
+
+  if (!node || !ai_gw_netid_fwd_any())
+    return 0;
+  ai_gw_svc_ident(node->key.xip, node->key.xport, svc_ident, sizeof(svc_ident));
+  return (ai_gw_netid_bound(svc_ident) & AI_GW_NETID_FWD) != 0;
+}
+
 /*
  * ai_strip_upstream_api_key — remove the caller's X-Api-Key from a request on
  * its way to the backend. Returns the (possibly shrunk) buffer length.
@@ -921,16 +820,28 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
  *
  * Plain L4 rules are out of scope: there is no HTTP parser in that path to
  * strip with, and no AI service runs there.
+ *
+ * The buffer must begin with a request's header block: the function acts on
+ * everything before the first blank line and has no other way to know what
+ * that is. Both callers hold that. The dispatch step passes the request the
+ * parse phase framed (at_gate 1). The relay path passes a read only when the
+ * request framer marked it as a header block (creq_blk.hdr_block, at_gate
+ * 0); body bytes, which may carry a blank line of their own, and anything a
+ * backend sends never come here.
+ *
+ * Identity is injected only at_gate: the tenant and user on the connection
+ * are the admission gate's answer for the request it just admitted, and a
+ * read on the relay path was admitted by nothing.
  */
 static size_t
 ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
-                          size_t bufsize)
+                          size_t bufsize, int at_gate)
 {
   proxy_map_ent_t *node;
   size_t cur = buflen;
   int strip_key, netid_fwd_svc = 0;
 
-  if (!pfe || !buf)
+  if (!pfe || !buf || pfe->odir)
     return buflen;
   node = (proxy_map_ent_t *)pfe->head;
   if (!node || !node->val.ephash)
@@ -944,12 +855,7 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
    * as the gateway's word. The binding's service list is the declaration;
    * nothing else about the rule is asked. One atomic load while no such
    * binding exists. */
-  if (ai_gw_netid_fwd_any()) {
-    char fwd_svc_ident[64];
-    ai_gw_svc_ident(node->key.xip, node->key.xport,
-                    fwd_svc_ident, sizeof(fwd_svc_ident));
-    netid_fwd_svc = (ai_gw_netid_bound(fwd_svc_ident) & AI_GW_NETID_FWD) != 0;
-  }
+  netid_fwd_svc = proxy_svc_forwards_netid(node);
   if (!strip_key && !netid_fwd_svc)
     return buflen;
   if (buflen < 4 || !memmem(buf, buflen, "\r\n\r\n", 4))
@@ -990,7 +896,8 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
   /* One injection, whichever arm asked for it: the JWT profile of the
    * deciding token, or the binding that matched this request's source on a
    * service that forwards identity. The values are the gate's. */
-  if (((pfe->auth_jwt_capable && pfe->auth_fwd_identity) ||
+  if (at_gate &&
+      ((pfe->auth_jwt_capable && pfe->auth_fwd_identity) ||
        (netid_fwd_svc && pfe->auth_netid_fwd)) && pfe->tenant_id[0]) {
     size_t scan = (cur < 2048) ? cur : 2048;
     if (!memmem(buf, scan, "Transfer-Encoding: chunked", 26) &&
@@ -10308,6 +10215,7 @@ creq_on_message_complete(llhttp_t *parser)
   if (!pfe) {
     return 0;
   }
+  creq_block_msg_done(&pfe->creq_blk);
   atomic_fetch_add_explicit(&pfe->cresp_forwarded, 1, memory_order_relaxed);
   /* A response to HEAD carries no body however its Content-Length reads, and
    * llhttp in response mode cannot know the method. Queue the bit for the
@@ -10326,6 +10234,7 @@ static int
 creq_on_message_begin(llhttp_t *parser)
 {
   if (parser->data) {
+    creq_block_msg_begin(&((proxy_fd_ent_t *)parser->data)->creq_blk);
     hc_req_begin(parser->data);
   }
   return 0;
@@ -10371,6 +10280,7 @@ static int
 creq_on_headers_complete(llhttp_t *parser)
 {
   if (parser->data) {
+    creq_block_hdrs_done(&((proxy_fd_ent_t *)parser->data)->creq_blk);
     hc_req_headers_done(parser->data);
   }
   return 0;                          /* a request's body follows its framing */
@@ -10393,10 +10303,15 @@ creq_parser_init(proxy_fd_ent_t *pfe)
   llhttp_init(&pfe->creq_parser, HTTP_REQUEST, &creq_settings);
   pfe->creq_parser.data = pfe;
   pfe->creq_parser_inited = 1;
+  creq_block_reset(&pfe->creq_blk);
 }
 
 /* Feeds the bytes a client just sent to its own request framer. Runs on that
- * client's worker, beside the read, so no lock is taken or needed. */
+ * client's worker, beside the read, so no lock is taken or needed.
+ *
+ * It also leaves, in creq_blk.hdr_block, where this read stands in its
+ * request (sockproxy_creq_block.h). The relay path asks that before it
+ * treats a read as a header block; a blank line in a body is not one. */
 static void
 creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
 {
@@ -10408,8 +10323,10 @@ creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   if (!client->creq_parser_inited) {
     creq_parser_init(client);
   }
+  creq_block_read_begin(&client->creq_blk);
   rerr = llhttp_execute(&client->creq_parser, (const char *)msg, len);
   if (rerr == HPE_PAUSED_UPGRADE) {
+    creq_block_read_end(&client->creq_blk, 1);
     llhttp_resume_after_upgrade(&client->creq_parser);
     return;
   }
@@ -10417,7 +10334,10 @@ creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
     log_debug("[CREQ_FRAMING] fd=%d llhttp err=%d (%s) — relay unaffected, framer reset",
               client->fd, rerr, llhttp_errno_name(rerr));
     creq_parser_init(client);
+    creq_block_read_end(&client->creq_blk, 0);
+    return;
   }
+  creq_block_read_end(&client->creq_blk, 1);
 }
 
 /* A response that answers the request. 101 ends HTTP on the connection, so it
@@ -11766,7 +11686,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     /* Drop the tenant credential before it leaves the gateway. Runs after the
      * header policy so an operator-configured rule cannot re-add it. */
     pfe->rcv_off = ai_strip_upstream_api_key(pfe, pfe->rcvbuf, pfe->rcv_off,
-                                             SP_SOCK_MSG_LEN);
+                                             SP_SOCK_MSG_LEN, 1);
 
     /* P/D request-ID override — generate with prefill/decode addresses
  * so vllm-router can route correctly. Must happen BEFORE normal path. */
@@ -12667,15 +12587,25 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * the P/D arm, this assumes the client does not pipeline request N+1
        * before N's response drains. */
       int ai_gw_boundary = 0;
+      int ai_gw_conn = 0;
       int mcp_boundary = sp_mcp_enabled(pfe);
       if (mcp_boundary && atomic_load_explicit(&pfe->mcp_inflight, memory_order_acquire))
         return sp_mcp_h1_refuse(pfe, 400);
       if (pfe->head) {
         proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
-        if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode &&
-            pfe->sse_active == 0)
-          ai_gw_boundary = 1;
+        if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode) {
+          ai_gw_conn = 1;
+          if (pfe->sse_active == 0)
+            ai_gw_boundary = 1;
+        }
       }
+      /* A service whose binding forwards identity owns the X-Auth-* family
+       * on every request, and only the parse phase can keep that: it frames
+       * the request and strips its header block once, wherever the reads
+       * fall. On the relay path a header block split over two reads would
+       * pass unstripped. So such a service re-enters the parse phase at
+       * each boundary too when it is not an AI-gateway service. One that is
+       * has the arm above, with its condition on a running stream. */
       if (pfe->rcv_off == 0 && pfe->n_rfd > 0 &&
           pfe->pd_phase == PD_PHASE_NONE) {
         if (pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) {
@@ -12683,7 +12613,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                    "request (n_rfd=%d rfd0=%d) — reframe",
                    pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
-        } else if (mcp_boundary || ai_gw_boundary) {
+        } else if (mcp_boundary || ai_gw_boundary ||
+                   (!ai_gw_conn &&
+                    proxy_svc_forwards_netid((proxy_map_ent_t *)pfe->head))) {
           log_trace("[KA_FIX] fd=%d gate re-arm on live backend leg "
                     "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           pfe->ka_reparse = 1;
@@ -13489,6 +13421,25 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
     // Normal forwarding (backend already connected OR backend→client)
     if (pfe->rfd[0] > 0) {
+      /* Client bytes while a streamed answer is running. The request that
+       * is being answered was framed, admitted and forwarded whole, so these
+       * belong to no admitted request: relayed, they would reach the backend
+       * behind that request without the admission gate (a second request
+       * sent early is served with no credential checked and nothing
+       * charged). HTTP/1.1 has no way to answer them before the answer in
+       * progress ends, so the connection is closed; the stream ends as one
+       * its client left. A client that waits for its answer never comes
+       * here: the stream's end is recorded before its last bytes are sent
+       * (proxy_try_epxmit), and the next request is then a boundary the
+       * parse phase takes. */
+      if (!pfe->odir && pfe->sse_active) {
+        log_debug("[STREAM_INTRUSION] fd=%d: %zd client bytes while a streamed "
+                  "answer is running; closing, nothing relayed", fd, (ssize_t)rc);
+        /* The return alone only ends this read; the shutdown is what
+         * closes, as on the other refusals of this loop. */
+        shutdown(pfe->fd, SHUT_RDWR);
+        return -1;
+      }
       // CRITICAL FIX: Inject X-Forwarded-Proto headers for Keep-Alive requests
       // When backend already exists (Keep-Alive), we bypass HTTP parsing above,
       // but we MUST still inject headers for EVERY request on client→backend path.
@@ -13569,10 +13520,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
       }
 
-      /* Same strip on the keep-alive/burst egress: without it the second and
-       * later requests on a reused connection would carry the key upstream. */
-      rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc,
-                                              SP_SOCK_MSG_LEN);
+      /* Same strip for a request that reaches the backend on the relay path,
+       * so it cannot carry the key upstream. Only a read the request framer
+       * marked as a header block is one: every other client read here is the
+       * rest of a request (a body may hold a blank line, and a line that
+       * looks like a header), and a backend's bytes are never a request.
+       * Nothing is injected: no gate admitted this read. */
+      if (!pfe->odir && pfe->creq_blk.hdr_block) {
+        rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc,
+                                                SP_SOCK_MSG_LEN, 0);
+      }
 
       PROXY_ENT_LOCK(pfe);
       pfe_ent_accouting(pfe, rc, 0);

@@ -139,7 +139,8 @@ sockproxy_http.o: sockproxy_http.c sockproxy_http.h sockproxy_internal.h \
                   sockproxy_stream_fallback.h \
                   sockproxy_trace.h sockproxy_cache.h sockproxy_lb.h \
                   sockproxy_health.h sockproxy_ssl.h sockproxy_conn.h \
-                  sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h
+                  sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h \
+                  sockproxy_creq_block.h sockproxy_h1_hdr.h
 	$(CC) $(CFLAGS) $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_LLAMAFIREWALL) -c -o $@ $<
 
 sockproxy_notifier.o: sockproxy_notifier.c sockproxy_notifier.h sockproxy_internal.h \
@@ -746,6 +747,20 @@ test_ka_leg: test_ka_leg.c sockproxy_ka_leg.h
 test_ka: test_ka_leg
 	./test_ka_leg
 
+# A request's header block is edited once and a body read never: the per-read
+# answer of the request framer (sockproxy_creq_block.h) and the header edits
+# (sockproxy_h1_hdr.h), driven by the real llhttp framer over reads cut the
+# way a socket cuts them. The test scores each body case against the pre-fix
+# rule as its own red twin. Address and undefined-behaviour sanitizers on.
+test_creq_block: test_creq_block.c sockproxy_creq_block.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -c -o test_creq_block.to $< -I.
+	$(CC) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_creq_block.to llhttp.c httpapi.c http.c -I.
+	rm -f test_creq_block.to
+
+.PHONY: test_creq
+test_creq: test_creq_block
+	./test_creq_block
+
 # Backend connect in two halves: the relay path issues the connect and
 # finishes the leg from the writable event instead of holding its worker for
 # the round trip. Header-only and standalone; the test measures the kept
@@ -878,7 +893,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
