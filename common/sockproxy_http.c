@@ -423,6 +423,16 @@ proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
   if (n < 0 || n >= (int)sizeof(resp)) {
     return -1;
   }
+  /* This response bypasses the backend parser, which normally captures the
+   * status that completion/teardown audit relies on. Record the terminal
+   * failure even if the client cannot receive the whole local response.
+   * Keep the normal completion guard: a later teardown must not emit it a
+   * second time, and an already-started response must not be overwritten. */
+  if (pfe->odir == 0 && pfe->ai_gw_mode &&
+      !pfe->metric_ai_recorded && pfe->metric_response_status == 0) {
+    pfe->metric_response_status = 502;
+    proxy_ai_record_completion(pfe);
+  }
   return proxy_send_local_response(pfe, resp, (size_t)n);
 }
 
