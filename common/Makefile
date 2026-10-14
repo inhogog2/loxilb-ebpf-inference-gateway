@@ -570,8 +570,11 @@ test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
 test_admit_response: test_admit_response.c sockproxy_admit_response.h llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
 
-.PHONY: test_admit test_uc5
-test_uc5: test_admit test_stream test_uc3 test_l2_reflection
+.PHONY: test_admit test_uc5 test_backend_failure_audit
+test_backend_failure_audit:
+	python3 test_backend_failure_audit.py
+
+test_uc5: test_admit test_stream test_uc3 test_l2_reflection test_backend_failure_audit
 
 test_admit: test_admit_response
 	./test_admit_response

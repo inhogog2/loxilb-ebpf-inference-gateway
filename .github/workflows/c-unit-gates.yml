@@ -110,5 +110,8 @@ jobs:
       - name: UC-5 terminal admission framing (exact length, split input, overflow rejection)
         run: make -C common test_admit
 
+      - name: UC-5 backend failure completion Audit (production sender, identity and once-only guards)
+        run: make -C common test_backend_failure_audit
+
       - name: UC-5 unchanged L2 split horizon (all VLAN values, routing/NAT/tunnel exceptions)
         run: make -C common test_l2_reflection
