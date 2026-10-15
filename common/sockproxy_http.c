@@ -5948,8 +5948,11 @@ proxy_pdestroy(void *priv)
 
   /* A fatal HUP can bypass the read/EOF path. Refuse only this unfinished
    * bridge stream before entering PROXY_LOCK: framing and stream settling
-   * may re-enter control-plane locks through the client callbacks. */
+   * may re-enter control-plane locks through the client callbacks. An
+   * HTTP/2 leg answers the streams it carries here for the same reason;
+   * either way the leg is detached below and its client goes on. */
   proxy_h2_h1_backend_eof(pfe, 0);
+  proxy_h2_backend_leg_end(pfe);
 
   PROXY_LOCK();
   if (pfe) {
@@ -5975,7 +5978,7 @@ proxy_pdestroy(void *priv)
         }
       }
     }
-    proxy_h2_h1_backend_detach(pfe); /* isolate one bridge leg from its H2 client */
+    proxy_h2_h1_backend_detach(pfe); /* isolate one backend leg from its H2 client */
     ent = pfe->head;
     if (!ent) {
       assert(0);
@@ -12655,6 +12658,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       proxy_h2_h1_backend_eof(pfe,rc==0); /* reset is not a valid close delimiter */
       return -1;
     }
+    /* An HTTP/2 leg's end is answered for where it is seen, not only at the
+     * teardown that follows: from here no new stream is put on the leg. */
+    if (rc<=0 && pfe->backend_h2_session) {
+      proxy_h2_backend_leg_end(pfe);
+    }
 
     if (rc <= 0 && !pfe->odir && pfe->h2_session)
       proxy_h2_client_end_mark(pfe, rc == 0 ? SP_H2_END_CLIENT_EOF : SP_H2_END_CLIENT_ERROR,
@@ -13503,6 +13511,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // Process HTTP/2 frames from backend and forward to client
         if (proxy_h2_handle_backend_data(pfe) < 0) {
           log_error("[HTTP/2 Backend] fd=%d: Failed to handle backend response", fd);
+          proxy_h2_backend_leg_end(pfe);   /* the leg is done: answer for it now */
           return -1; // Restart
         }
 

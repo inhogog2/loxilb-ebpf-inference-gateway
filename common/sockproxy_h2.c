@@ -2293,7 +2293,7 @@ int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe,int clean_eof)
 void proxy_h2_h1_backend_detach(proxy_fd_ent_t *pfe)
 {
   backend_h2_session_t *bs=pfe?pfe->backend_h2_session:NULL;
-  if (!bs || !bs->bridge_h1) return;
+  if (!bs || !bs->client_session) return;
   proxy_fd_ent_t *client=bs->client_session?bs->client_session->pfe:NULL;
   if (client && bs->slot>=0 && bs->slot<MAX_PROXY_EP && client->rfd_ent[bs->slot]==pfe) {
     client->rfd_ent[bs->slot]=NULL;client->rfd[bs->slot]=-1;
@@ -3553,25 +3553,51 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
 {
   backend_h2_session_t *bs;
   stream_mapping_t *mapping, *tmp;
-  int32_t ids[64];
-  int n = 0, answered = 0;
+  int32_t *ids;
+  unsigned int n = 0, cap;
+  int answered = 0;
 
   if (!client || !backend || !client->h2_session || !client->h2_session->session) {
     return 0;
   }
   bs = (backend_h2_session_t *)backend->backend_h2_session;
-  if (!bs) {
+  if (!bs || bs->leg_ended) {
+    return 0;
+  }
+  bs->leg_ended = 1;
+  cap = HASH_COUNT(bs->stream_map);
+  if (cap == 0) {
+    return 0;
+  }
+  ids = calloc(cap, sizeof(*ids));
+  if (!ids) {
+    /* Unanswered, these streams would wait for a response that cannot
+     * come: end the client connection instead, the way it ended before. */
+    log_error("[HTTP/2] fd=%d: cannot answer the %u streams of an ended backend leg",
+              client->fd, cap);
+    shutdown(client->fd, SHUT_RDWR);
     return 0;
   }
   HASH_ITER(hh, bs->stream_map, mapping, tmp) {
-    if (n < (int)(sizeof(ids) / sizeof(ids[0]))) {
+    if (n < cap) {
       ids[n++] = mapping->client_stream_id;
     }
   }
-  for (int i = 0; i < n; i++) {
+  for (unsigned int i = 0; i < n; i++) {
     proxy_h2_stream_t *stream = find_stream(client->h2_session, ids[i]);
 
-    if (!stream) {
+    /* A response the backend already ended is queued whole on the relay,
+     * which ends the stream by itself. */
+    if (!stream || stream->resp.reset_submitted || stream->resp.eos_sent ||
+        stream->resp.eos_pending) {
+      continue;
+    }
+    /* Answered here means answered: the client read path must not forward
+     * the stream again while the answer waits for the client's window. */
+    stream->response_sent = 1;
+    if (stream->resp.final_headers_sent) {
+      h2_resp_relay_reset(client->h2_session, stream, NGHTTP2_INTERNAL_ERROR);
+      answered++;
       continue;
     }
     if (proxy_h2_send_ai_deny(client, stream, 503, 0, 0, "backend_unreachable",
@@ -3579,6 +3605,8 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
       answered++;
     }
   }
+  free(ids);
+  nghttp2_session_send(client->h2_session->session);
   return answered;
 }
 
@@ -3701,6 +3729,25 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
     log_warn(H2_END_FMT, H2_END_ARGS);
 #undef H2_END_FMT
 #undef H2_END_ARGS
+}
+
+/* See sockproxy_h2.h. */
+int
+proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe)
+{
+  backend_h2_session_t *bs = pfe ? pfe->backend_h2_session : NULL;
+  proxy_fd_ent_t *client;
+
+  if (!bs || bs->bridge_h1 || !bs->client_session) {
+    return 0;
+  }
+  client = bs->client_session->pfe;
+  if (!client || bs->slot < 0 || bs->slot >= MAX_PROXY_EP ||
+      client->rfd_ent[bs->slot] != pfe) {
+    return 0;
+  }
+  (void)proxy_h2_backend_leg_unanswered(client, pfe);
+  return 1;
 }
 
 /**
@@ -5052,8 +5099,12 @@ h2_have_tepval:
     /* A connection made under a backend TLS policy the listener has since
      * replaced takes no new stream: the streams on it finish there, this one
      * gets a connection made with the context in service. */
+    /* Nor does a leg whose end was seen and answered for: its teardown is
+     * still to come, and a stream mapped on it now would never be answered. */
     if (!bridge_h1 && bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
-        pfe->rfd[i] > 0 && !proxy_leg_tls_stale(ent, bpfe)) {
+        pfe->rfd[i] > 0 && !proxy_leg_tls_stale(ent, bpfe) &&
+        !(bpfe->backend_h2_session &&
+          ((backend_h2_session_t *)bpfe->backend_h2_session)->leg_ended)) {
       slot = i;
       backend_fd = pfe->rfd[i];
       break;

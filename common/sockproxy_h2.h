@@ -295,6 +295,7 @@ typedef struct backend_h2_session {
   int connected;                     // 1 = connected and ready
   int goaway_sent;                   // 1 = GOAWAY sent to backend
   int goaway_received;               // 1 = GOAWAY received from backend
+  uint8_t leg_ended;                 // 1 = its client streams were answered for its end
 
   // Backend endpoint info. The hash key is `slot`, the per-connection
   // backend-connection slot — NOT ep_idx: two model pools on one rule both
@@ -425,7 +426,14 @@ int proxy_h2_handle_client_data(proxy_fd_ent_t *pfe);
 int proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe);
 /* H1 bridge EOF/errors are isolated to their own H2 stream. */
 int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe, int clean_eof);
-/* Pure C detach; called under PROXY_LOCK before backend pair teardown. */
+/* An HTTP/2 backend leg's end reaches only the client streams it carries:
+ * they are answered (see proxy_h2_backend_leg_unanswered) and the client's
+ * other legs and streams go on. Call with nothing held, before the leg's
+ * teardown takes PROXY_LOCK. Returns 1 when pfe was such a leg. */
+int proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe);
+/* Pure C detach of one backend leg (bridge or HTTP/2) from its HTTP/2
+ * client, so the leg's teardown does not cascade to the client; called under
+ * PROXY_LOCK before backend pair teardown. */
 void proxy_h2_h1_backend_detach(proxy_fd_ent_t *pfe);
 
 /**
@@ -447,8 +455,10 @@ int proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream);
 void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
 
 /**
- * A backend leg ended before it answered: every client stream it carries
- * gets a 503. Call with nothing held, while the two entries are linked.
+ * A backend leg ended: every client stream it still carries is answered, once
+ * per leg. A stream with no response yet gets a 503; one whose response had
+ * started is reset, since the rest of it cannot come. Call with nothing held,
+ * while the two entries are linked.
  *
  * @param client  Client entry (owns the HTTP/2 session)
  * @param backend Backend entry whose leg ended

@@ -62,6 +62,9 @@ jobs:
       - name: The header deadline charges only the block of the connection that armed it (ASan + UBSan and TSan)
         run: make -C common test_hdrdl
 
+      - name: One HTTP/2 backend leg ending answers only its own streams (ASan + UBSan)
+        run: make -C common test_h2leg
+
       - name: An L7 FORWARD route selects within the listener's pool (ASan + UBSan and TSan)
         run: make -C common test_l7route
 
