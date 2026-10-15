@@ -64,6 +64,8 @@ int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
 
 /* FD context management */
 void proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe);
+/* The teardown of a deleted pool at its last release (sockproxy_pool.h). */
+void proxy_pool_finalize(proxy_epval_t *tepval);
 int proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
                          void **ssl_ctx, void **ssl_epctx);
 

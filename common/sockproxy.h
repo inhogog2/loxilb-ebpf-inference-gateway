@@ -140,6 +140,7 @@ void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 // can pin them without the proxy object graph.
 #include "sockproxy_hdr_deadline.h"
 #include "sockproxy_fc.h"  /* capacity admission: per-pool state and per-request permit */
+#include "sockproxy_pool.h"  /* pool lifetime: reference count and the workers' index */
 
 // ============================================================================
 // PROMETHEUS METRICS: Global Stats (Forward Declaration)
@@ -785,7 +786,11 @@ typedef struct proxy_val {
   uint32_t be_tls_gen;               /* +1 on every replacement */
   uint64_t be_tls_replaced_ms;       /* proxy_mono_ms() of the last one; 0: never */
   uint32_t nfds;
+  /* The listener's pools. The table is read and written only under the
+   * proxy lock; notify workers read the published index instead
+   * (sockproxy_pool.h), which is rebuilt after every change to the table. */
   struct proxy_epval *ephash;
+  sp_pool_index_t *_Atomic pools;
   struct proxy_fd_ent *fdlist;
   conversation_mapping_t *conv_map;  // Conversation tracking (P0.3)
   pthread_rwlock_t conv_lock;        // Lock for conv_map (P0.3)

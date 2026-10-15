@@ -312,6 +312,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
         snapshot.stream_abandon_age_count[r] = atomic_load(&global_stats.stream_abandon.age_count[r]);
     }
     snapshot.stream_stall_abort_sec = sp_sse_stall_abort_sec();
+    sp_pool_counts(&snapshot.pools_live, &snapshot.pools_freed_total);
 
     return snapshot;
 }

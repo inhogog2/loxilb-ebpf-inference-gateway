@@ -102,7 +102,8 @@ proxy_lookup_service_by_key(const char *service_key)
 
 /* Pick the P/D-enabled proxy_epval_t for the service. only syncs
  * P/D-enabled or session-stickiness-enabled services; non-P/D services have
- * no per-EP session table to sync. */
+ * no per-EP session table to sync.
+ * Under the proxy lock. */
 static proxy_epval_t *
 pick_tepval_for_sync(proxy_map_ent_t *ent)
 {
@@ -251,6 +252,7 @@ proxy_sync_apply_session_entry(const proxy_sync_event_t *ev)
   proxy_map_ent_t *ent;
   proxy_epval_t   *tepval;
   pd_session_mapping_t *m = NULL;
+  uint32_t          n_pools;
   int               outcome = SYNC_APPLY_ERROR;
 
   if (!ev || ev->conv_id[0] == '\0' || ev->service_key[0] == '\0')
@@ -260,7 +262,14 @@ proxy_sync_apply_session_entry(const proxy_sync_event_t *ev)
   if (!ent)
     return SYNC_APPLY_ERROR;
 
+  /* The pool is picked and taken under the read lock and used after it: a
+   * rule deleted meanwhile is freed only once this reference is given back
+   * (sockproxy_pool.h). */
+  pthread_rwlock_rdlock(&proxy_struct->lock);
   tepval = pick_tepval_for_sync(ent);
+  n_pools = HASH_COUNT(ent->val.ephash);
+  sp_pool_get(tepval);
+  pthread_rwlock_unlock(&proxy_struct->lock);
   if (!tepval)
     return SYNC_APPLY_ERROR;
 
@@ -285,25 +294,32 @@ proxy_sync_apply_session_entry(const proxy_sync_event_t *ev)
      * Carrying the pool on the wire needs a proxy_sync_event_t field and its
      * Go-side mirrors, and lands separately - at which point this refusal is
      * replaced by the real identity rather than relaxed. */
-    if (!conv_pool_sync_may_apply(HASH_COUNT(ent->val.ephash))) {
+    if (!conv_pool_sync_may_apply(n_pools)) {
       log_info("[XSYNC] conv entry for %s refused: %u pools on this service and "
                "the event names none; stickiness will be re-learned locally",
-               ev->service_key, HASH_COUNT(ent->val.ephash));
-      return SYNC_APPLY_ERROR;
+               ev->service_key, n_pools);
+      goto put;
     }
-    return apply_conv_sync_entry(ent, tepval, ev);
+    outcome = apply_conv_sync_entry(ent, tepval, ev);
+    goto put;
   }
 
   /* HEALTH GATE — SPEC A5. LAST step before wrlock acquire. */
   if (ev->prefill_ep_idx >= 0 &&
-      !is_endpoint_healthy(tepval, ev->prefill_ep_idx))
-    return SYNC_APPLY_HEALTH_REJECT;
+      !is_endpoint_healthy(tepval, ev->prefill_ep_idx)) {
+    outcome = SYNC_APPLY_HEALTH_REJECT;
+    goto put;
+  }
   if (ev->decode_ep_idx >= 0 &&
-      !is_endpoint_healthy(tepval, ev->decode_ep_idx))
-    return SYNC_APPLY_HEALTH_REJECT;
+      !is_endpoint_healthy(tepval, ev->decode_ep_idx)) {
+    outcome = SYNC_APPLY_HEALTH_REJECT;
+    goto put;
+  }
   if (ev->ep_idx >= 0 &&
-      !is_endpoint_healthy(tepval, ev->ep_idx))
-    return SYNC_APPLY_HEALTH_REJECT;
+      !is_endpoint_healthy(tepval, ev->ep_idx)) {
+    outcome = SYNC_APPLY_HEALTH_REJECT;
+    goto put;
+  }
 
   pthread_rwlock_wrlock(&tepval->pd_session_lock);
 
@@ -356,6 +372,8 @@ proxy_sync_apply_session_entry(const proxy_sync_event_t *ev)
 
 unlock_and_done:
   pthread_rwlock_unlock(&tepval->pd_session_lock);
+put:
+  sp_pool_put(tepval);
   return outcome;
 }
 

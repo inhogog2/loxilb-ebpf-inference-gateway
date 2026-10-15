@@ -231,12 +231,10 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
 #ifdef HAVE_DP_GPU_ROUTING
     // PRODUCTION: Validate CHWBL load counters after session cleanup
     // This helps detect and log any load tracking inconsistencies
-    if (ent->val.ephash) {
-      proxy_epval_t *tepval, *tmp_epval;
-      HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-        if (tepval->select == PROXY_SEL_CHWBL) {
-          chwbl_validate_load_counters(tepval);
-        }
+    const sp_pool_index_t *ix = sp_pool_index(ent);
+    for (uint32_t i = 0; ix && i < ix->n; i++) {
+      if (ix->order[i]->select == PROXY_SEL_CHWBL) {
+        chwbl_validate_load_counters(ix->order[i]);
       }
     }
 #endif /* HAVE_DP_GPU_ROUTING */
@@ -766,6 +764,14 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   /* Tier-1 shaper refill/wake sweep. Runs from every worker's poll loop and
    * rate-limits itself; with no shaper configured it is one atomic load. */
   cbs.tick = proxy_qos_tick;
+
+  /* Pools are counted and freed after a grace period (sockproxy_pool.h);
+   * a capacity permit is one of a pool's holders. */
+  sp_pool_init(proxy_pool_finalize);
+  fc_set_owner_hooks(sp_pool_fc_hold, sp_pool_fc_drop);
+  if (sp_qsbr_start() != 0) {
+    log_error("sockproxy: the reclaimer thread did not start; deleted pools are not freed");
+  }
 
   proxy_struct = calloc(sizeof(proxy_struct_t), 1);
   if (proxy_struct == NULL) {

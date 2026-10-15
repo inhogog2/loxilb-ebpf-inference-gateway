@@ -221,6 +221,13 @@ typedef struct proxy_metrics_snapshot {
     uint64_t stream_abandon_age_sum_s[3];
     uint64_t stream_abandon_age_count[3];
     uint64_t stream_stall_abort_sec;
+
+    /* Pools (proxy_epval_t) allocated and not yet freed, a deleted pool
+     * still held by its connections included, and pools freed since start
+     * (sockproxy_pool.h). TAIL-APPEND ONLY — same three-way lockstep
+     * contract as the blocks above. */
+    uint64_t pools_live;
+    uint64_t pools_freed_total;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

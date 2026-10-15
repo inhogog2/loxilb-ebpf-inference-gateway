@@ -1322,6 +1322,9 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   /* Every connection's shell comes back here, whichever path tore it down,
    * so a hold is counted here exactly once. */
   sp_hold_retire(pfe);
+  /* Likewise the pools the connection holds (sockproxy_pool.h): a pooled
+   * shell keeps no pool alive until its next use. */
+  sp_pool_release_conn(pfe);
   pfe_trace_op("rec", pfe->head, pfe);
   if (pfe->fdlist_rule) {
     /* Every release unlinks before it recycles; a shell that reaches the
@@ -1482,6 +1485,44 @@ proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe)
   proxy_free_fd_ctx(pfe);
 }
 
+static void
+proxy_pool_clear_sessions(proxy_epval_t *tepval)
+{
+  pd_session_mapping_t *sm, *sm_tmp;
+
+  pthread_rwlock_wrlock(&tepval->pd_session_lock);
+  HASH_ITER(hh, tepval->pd_session_map, sm, sm_tmp) {
+    HASH_DEL(tepval->pd_session_map, sm);
+    free(sm);
+  }
+  tepval->pd_session_map = NULL;
+  pthread_rwlock_unlock(&tepval->pd_session_lock);
+}
+
+/* The last release of a deleted pool, on the reclaimer (sockproxy_pool.h).
+ * Under the write lock: a thread that read a holder's pointer under the
+ * lock (the drain checker walks other workers' connections) is done with it
+ * before the pool goes. Nothing else can reach the pool any more. */
+void
+proxy_pool_finalize(proxy_epval_t *tepval)
+{
+  PROXY_LOCK();
+#ifdef HAVE_DP_GPU_ROUTING
+  chwbl_release_runtime(tepval);
+#endif
+  proxy_pool_clear_sessions(tepval);
+  pthread_rwlock_destroy(&tepval->pd_session_lock);
+  if (tepval->pd_trie) {
+    pd_trie_free(tepval->pd_trie);
+    tepval->pd_trie = NULL;
+    pthread_rwlock_destroy(&tepval->pd_trie_lock);
+  }
+  pthread_rwlock_destroy(&tepval->chwbl_state_lock);
+  pthread_mutex_destroy(&tepval->pd_parked_lock);
+  fc_state_destroy(&tepval->fc);
+  PROXY_UNLOCK();
+}
+
 int
 proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
                      void **ssl_ctx, void **ssl_epctx)
@@ -1531,34 +1572,25 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
     chwbl_release_runtime(&retired_chwbl);
 #endif /* HAVE_DP_GPU_ROUTING */
 
-    // P/D Session stickiness cleanup
-    {
-      pd_session_mapping_t *sm, *sm_tmp;
-      pthread_rwlock_wrlock(&tepval->pd_session_lock);
-      HASH_ITER(hh, tepval->pd_session_map, sm, sm_tmp) {
-        HASH_DEL(tepval->pd_session_map, sm);
-        free(sm);
-      }
-      tepval->pd_session_map = NULL;
-      pthread_rwlock_unlock(&tepval->pd_session_lock);
-      pthread_rwlock_destroy(&tepval->pd_session_lock);
-    }
-
-    /* cleanup radix trie */
-    if (tepval->pd_trie) {
-      pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-      pd_trie_free(tepval->pd_trie);
-      tepval->pd_trie = NULL;
-      pthread_rwlock_unlock(&tepval->pd_trie_lock);
-      pthread_rwlock_destroy(&tepval->pd_trie_lock);
-    }
+    /* The rule's sessions go with it. Requests still running on the pool
+     * may add to the map: the final free clears it again. */
+    proxy_pool_clear_sessions(tepval);
 
     /* Requests waiting in the pool's capacity queue are ended before the
      * pool goes: a wait for a unit that will never be released is not a
-     * wait. The ring goes with it. */
+     * wait. */
     sp_fc_drain_pool(tepval, SP_REAP_FC_DRAINED, 1);
-    fc_state_destroy(&tepval->fc);
     HASH_DEL(node->val.ephash, tepval);
+    /* New requests no longer find the pool. The ones that hold it keep it
+     * until their last release; its locks, capacity state and trie go then
+     * (proxy_pool_finalize). Should the index not be rebuilt, the pool
+     * stays reachable through the old one and is kept. */
+    if (sp_pool_index_publish(node) == 0) {
+      sp_pool_unlinked(tepval);
+    } else {
+      log_error("sockproxy: %s:%u (%s) unlinked but still in the readers' index: pool kept",
+                inet_ntoa(*(struct in_addr *)&ent->xip), ntohs(ent->xport), ephash_key);
+    }
 
     epcount = HASH_COUNT(node->val.ephash);
     if (epcount > 0) {
