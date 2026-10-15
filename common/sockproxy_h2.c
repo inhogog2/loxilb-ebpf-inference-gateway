@@ -656,7 +656,7 @@ proxy_h2_on_frame_recv_callback(nghttp2_session *session,
  * a pure no-op for the AI peer / un-configured listeners. */
       {
         proxy_map_ent_t *l7ent = (proxy_map_ent_t *)pfe->head;
-        if (l7ent && l7ent->has_l7_policy && l7ent->arg_ptr &&
+        if (l7ent && l7_policy_on(l7ent) && l7ent->arg_ptr &&
             l7ent->arg_ptr->timeout_member_data_ms > 0 && pfe->last_activity == 0) {
           pfe->last_activity = time(NULL);
         }
@@ -1752,7 +1752,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     if (client_session->pfe) {
       proxy_fd_ent_t *client_pfe = (proxy_fd_ent_t *)client_session->pfe;
       proxy_map_ent_t *node = (proxy_map_ent_t *)client_pfe->head;
-      if (node && node->has_l7_policy &&
+      if (node && l7_policy_on(node) &&
           l7_cookie_persist_active(client_pfe, node)) {
         /* The pool must be the one THIS backend session belongs to —
          * client_pfe->epv is connection-scoped and a concurrent stream
@@ -1799,7 +1799,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     if (client_session->pfe) {
       proxy_fd_ent_t *client_pfe = (proxy_fd_ent_t *)client_session->pfe;
       proxy_map_ent_t *node = (proxy_map_ent_t *)client_pfe->head;
-      if (node && node->has_l7_policy &&
+      if (node && l7_policy_on(node) &&
           node->arg_ptr && node->arg_ptr->hsts_max_age > 0) {
         if (!node->val.have_ssl) {
           log_debug("[HSTS][H2] skip: plain-HTTP listener (have_ssl=0), "
@@ -3528,8 +3528,10 @@ sp_fc_h2_gate_endpoint(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   sp_mcp_fc_scope mcp_scope={.pool=tepval,.request=pfe};
   ep = fc_ep_acquire_any(&tepval->fc, &stream->fc, FC_ROLE_NORMAL, ep_idx,
                          tepval->n_eps,
-                         tepval->mcp_stateless ? sp_mcp_fc_eligible : sp_fc_normal_eligible,
-                         tepval->mcp_stateless ? (void *)&mcp_scope : (void *)tepval, &v);
+                         tepval->mcp_stateless ? sp_mcp_fc_eligible :
+                         sp_route_subset(pfe, tepval) ? sp_fc_route_eligible : sp_fc_normal_eligible,
+                         tepval->mcp_stateless || sp_route_subset(pfe, tepval) ?
+                         (void *)&mcp_scope : (void *)tepval, &v);
   if (ep < 0) {
     sp_fc_h2_shed(pfe, stream, tepval, v, FC_ROLE_NORMAL);
     return -1;
@@ -4256,7 +4258,7 @@ static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     }
     if (!status && !sp_mcp_media_valid(&media)) status=400;
     if (!status) status=sp_mcp_validate(req,stream->method,(const char *)stream->data_buf,stream->data_len);
-    if (!status && ent->has_l7_policy) {
+    if (!status && l7_policy_on(ent)) {
       pfe->n_l7_headers=0;
       for (size_t i=0;i<stream->request_headers_count;i++) {
         const nghttp2_nv *h=&stream->request_headers[i];
@@ -4300,6 +4302,9 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   }
   
   ent = (proxy_map_ent_t *)pfe->head;
+  /* The streams of a connection share it: a route the last one's FORWARD
+   * named is not this one's. */
+  pfe->mcp_route_active = 0;
   proxy_epval_t *ent_pool0 = sp_pool_first(ent);  /* the listener's first pool, read once */
   if (ent_pool0 && ent_pool0->mcp_stateless &&
       sp_mcp_h2_gate(pfe,stream,ent)) return 0; /* this stream was refused */
@@ -4510,7 +4515,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   // live on the stream — so mirror them into pfe BEFORE dispatch (the contract
   // from -SUMMARY). The generic HEADER/COOKIE store (pfe->l7_headers) is
   // already H2-populated by Plan an earlier cycle's proxy_h2_on_header_callback.
-  if (ent && ent->has_l7_policy) {
+  if (ent && l7_policy_on(ent)) {
     proxy_epval_t *l7_tepval = NULL;
     int l7_rc;
 
@@ -4686,12 +4691,12 @@ h2_have_tepval:
   // returns L7_COOKIE_MISS and ep_idx stays -1 so the normal selection below runs
   // (: never an arbitrary backend). Nothing read/written on proxy_fd_ent
   // works identically on an HA peer that never saw the original request.
-  if (ent && ent->has_l7_policy && l7_cookie_persist_active(pfe, ent)) {
+  if (ent && l7_policy_on(ent) && l7_cookie_persist_active(pfe, ent)) {
     char presented[LB_COOKIE_TOKEN_MAX];
     if (l7_cookie_read_presented(pfe, presented, sizeof(presented)) == 0) {
       int cep = l7_cookie_node_match(ent, tepval, presented);
       if (cep != L7_COOKIE_MISS && cep >= 0 && cep < tepval->n_eps &&
-          is_endpoint_healthy(tepval, cep)) {
+          is_endpoint_healthy(tepval, cep) && sp_route_allows(pfe, cep)) {
         ep_idx = cep;
         log_debug("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
                  stream->stream_id, cep);
@@ -4713,8 +4718,8 @@ h2_have_tepval:
     if (conv_map) {
       ep_idx = conv_map->ep_idx;
       
-      // Validate endpoint is still healthy
-      if (is_endpoint_healthy(tepval, ep_idx)) {
+      // Validate endpoint is still healthy, and in the request's route
+      if (is_endpoint_healthy(tepval, ep_idx) && sp_route_allows(pfe, ep_idx)) {
         // Update conversation access time
         conv_map->last_access_ts = time(NULL);
         conv_map->request_count++;
@@ -4726,7 +4731,7 @@ h2_have_tepval:
   
 #ifdef HAVE_DP_GPU_ROUTING
   // CHWBL/WRR_HASH share the same configured hash identity and bounded-load selector.
-  if (ep_idx < 0 &&
+  if (ep_idx < 0 && !sp_route_subset(pfe, tepval) &&
       (tepval->select == PROXY_SEL_CHWBL || tepval->select == PROXY_SEL_WRR_HASH)) {
     llm_prefix_key_t empty_prefix = {0};
     llm_prefix_key_t *prefix_key = stream->prefix_key ?
@@ -4778,13 +4783,23 @@ h2_have_tepval:
         h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
         return 0;
       }
+    } else if (sp_route_subset(pfe, tepval)) {
+      /* A FORWARD route's members (l7_route_pool): healthy ones only. */
+      ep_idx = sp_mcp_request_select(tepval, pfe);
+      if (ep_idx < 0) {
+        fc_permit_release(&stream->fc);
+        proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "no_healthy_backend",
+                              "every endpoint of the route is down or circuit-broken");
+        return 0;
+      }
     } else {
       static int rr_counter = 0;
       int counter_val = rr_counter++;
       ep_idx = (counter_val % tepval->n_eps);
     }
   }
-  if (!(tepval->mcp_stateless))
+  /* A route's pick is healthy and its own; any other is checked here. */
+  if (!tepval->mcp_stateless && !(sp_route_subset(pfe, tepval) && sp_route_allows(pfe, ep_idx)))
     ep_idx = select_healthy_endpoint(tepval, ep_idx);
   if (ep_idx < 0) {
     log_error("[HTTP/2] stream %d: No healthy endpoint available", stream->stream_id);
@@ -4860,6 +4875,14 @@ h2_have_tepval:
     static const char body[]="{\"error\":\"mcp_backend_unavailable\"}";
     fc_permit_release(&stream->fc);
     h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
+    return 0;
+  }
+  /* A route's pick: the selector only looked at the breaker, the half-open
+   * probe is taken here. */
+  if (sp_route_subset(pfe, tepval) && !sp_mcp_reserve_probe(tepval, ep_idx)) {
+    fc_permit_release(&stream->fc);
+    proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "no_healthy_backend",
+                          "the route's endpoint is circuit-broken");
     return 0;
   }
   sp_pool_hold(&pfe->epv, tepval);
@@ -5178,7 +5201,7 @@ h2_have_tepval:
   nghttp2_nv *l7_headers_nv = NULL;
   l7h2_emit_ctx_t l7_hdr_ctx;
   int l7_hdr_built = 0;
-  if (ent && ent->has_l7_policy) {
+  if (ent && l7_policy_on(ent)) {
     size_t l7_n = 0;
     if (proxy_h2_build_l7_req_headers(pfe, ent, stream, headers, nheaders,
                                       pfe->fd, &l7_headers_nv, &l7_n,

@@ -268,6 +268,8 @@ int sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel);
 int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
                        int may_wait);
 int sp_fc_normal_eligible(void *ctx, int ep);
+/* ctx: sp_mcp_fc_scope (sockproxy_mcp_rr.h). */
+int sp_fc_route_eligible(void *ctx, int ep);
 /* End every request waiting in the pool's queue with a response of `kind`
  * (SP_REAP_FC_DRAINED): the pool is going away, or the process drains.
  * The caller holds PROXY_LOCK. */

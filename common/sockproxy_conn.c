@@ -754,7 +754,7 @@ proxy_ep_connect_deadline_ms(proxy_fd_ent_t *pfe)
   int connect_to_ms = 500;
   proxy_map_ent_t *cnode = pfe ? (proxy_map_ent_t *)pfe->head : NULL;
 
-  if (cnode && cnode->has_l7_policy && cnode->arg_ptr &&
+  if (cnode && l7_policy_on(cnode) && cnode->arg_ptr &&
       cnode->arg_ptr->timeout_member_connect_ms > 0) {
     connect_to_ms = (int)cnode->arg_ptr->timeout_member_connect_ms;
   }
@@ -1580,15 +1580,12 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
      * pool goes: a wait for a unit that will never be released is not a
      * wait. */
     sp_fc_drain_pool(tepval, SP_REAP_FC_DRAINED, 1);
-    HASH_DEL(node->val.ephash, tepval);
     /* New requests no longer find the pool. The ones that hold it keep it
      * until their last release; its locks, capacity state and trie go then
      * (proxy_pool_finalize). Should the index not be rebuilt, the pool
-     * stays reachable through the old one and is kept. */
-    if (sp_pool_index_publish(node) == 0) {
-      sp_pool_unlinked(tepval);
-    } else {
-      log_error("sockproxy: %s:%u (%s) unlinked but still in the readers' index: pool kept",
+     * stays reachable through the old one until the next index goes out. */
+    if (sp_pool_unlink(node, tepval) != 0) {
+      log_error("sockproxy: %s:%u (%s) out of the table, still in the readers' index until the next change",
                 inet_ntoa(*(struct in_addr *)&ent->xip), ntohs(ent->xport), ephash_key);
     }
 

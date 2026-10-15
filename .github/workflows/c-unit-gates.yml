@@ -56,6 +56,9 @@ jobs:
       - name: An HTTP/2 stream gives its pool back on the real stream free (ASan + UBSan)
         run: make -C common test_h2rref
 
+      - name: An L7 FORWARD route selects within the listener's pool (ASan + UBSan and TSan)
+        run: make -C common test_l7route
+
       - name: Modern MCP validation, framing, relay and selection (sanitizers)
         run: make -C common test_mcp
 

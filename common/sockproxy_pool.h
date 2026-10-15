@@ -28,9 +28,7 @@
  * under the proxy lock (the finalizer takes it), so that a thread reading a
  * holder's pointer under the lock cannot see it go.
  *
- * The count lives in a header in front of the pool, outside proxy_epval_t:
- * copying a pool's body (the L7 scratch pool) neither clones nor overwrites
- * it. The scratch pool has a header of its own marked not counted.
+ * The count lives in a header in front of the pool, outside proxy_epval_t.
  *
  * Notify workers read a listener's pools without a lock, through its
  * published index: an immutable snapshot rebuilt under the write lock after
@@ -60,15 +58,12 @@ typedef struct sp_pool_index {
 
 /* A new pool with one reference, the table's. NULL when out of memory. */
 struct proxy_epval *sp_pool_alloc(void);
-/* The L7 scratch pool: never counted, freed only by sp_pool_free_uncounted. */
-struct proxy_epval *sp_pool_alloc_uncounted(void);
-void sp_pool_free_uncounted(struct proxy_epval *p);
 
 /* A pool that was never linked (an add that failed before the table took
  * it): no reader can have it, so it goes now. */
 void sp_pool_discard(struct proxy_epval *p);
 
-/* NULL and the scratch pool are accepted and ignored. */
+/* NULL is accepted and ignored. */
 void sp_pool_get(struct proxy_epval *p);
 void sp_pool_put(struct proxy_epval *p);
 
@@ -91,7 +86,8 @@ struct proxy_fd_ent;
 void sp_pool_release_conn(struct proxy_fd_ent *pfe);
 
 /* The pool was taken out of its listener's table and a new index without it
- * published: the table's reference is given back after a grace period. */
+ * published, or was never in an index: the table's reference is given back
+ * after a grace period. */
 void sp_pool_unlinked(struct proxy_epval *p);
 
 /* Once at start, before the notify workers: fn is what the last release
@@ -107,12 +103,26 @@ void sp_pool_fc_drop(struct fc_state *fc);
 
 uint32_t sp_pool_refs(const struct proxy_epval *p);
 /* Pools allocated and not yet freed (deleted ones still held included), and
- * pools freed since start. The scratch pool is not counted. */
+ * pools freed since start. */
 void sp_pool_counts(uint64_t *live, uint64_t *freed);
 
 /* Rebuild and publish the listener's index from its table. Under the proxy
- * write lock. -1 when out of memory: the old index stays published. */
+ * write lock. -1 when out of memory: the old index stays published. A
+ * published index also lets go of the pools waiting on the listener
+ * (sp_pool_unlink). */
 int sp_pool_index_publish(struct proxy_map_ent *ent);
+
+/* Put p in the listener's table and publish an index with it. Under the
+ * proxy write lock. -1 when the index cannot be built: p is taken out of the
+ * table again, so the table and the readers' index agree, and p is the
+ * caller's (no reader has seen it). */
+int sp_pool_link(struct proxy_map_ent *ent, struct proxy_epval *p);
+
+/* Take p out of the listener's table and publish an index without it; the
+ * table's reference goes after a grace period. Under the proxy write lock.
+ * -1 when the index cannot be built: readers still find p through the old
+ * index, so p waits on the listener until the next index is published. */
+int sp_pool_unlink(struct proxy_map_ent *ent, struct proxy_epval *p);
 
 /* Reader side: the published index (NULL when the listener has no pool). */
 const sp_pool_index_t *sp_pool_index(const struct proxy_map_ent *ent);

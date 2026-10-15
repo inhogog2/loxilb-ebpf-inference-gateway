@@ -543,10 +543,10 @@ test_pfec: test_pfe_clear
 # (sockproxy_pool.h, sockproxy_qsbr.h). Run under ASan + UBSan and under TSan.
 POOL_REF_SRCS = test_pool_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
 test_pool_ref: $(POOL_REF_SRCS) sockproxy_pool.h sockproxy_qsbr.h sockproxy_fc.h sockproxy.h
-	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(POOL_REF_SRCS) -I. -lpthread
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wl,--wrap=calloc -o $@ $(POOL_REF_SRCS) -I. -lpthread
 
 test_pool_ref_tsan: $(POOL_REF_SRCS) sockproxy_pool.h sockproxy_qsbr.h sockproxy_fc.h sockproxy.h
-	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $(POOL_REF_SRCS) -I. -lpthread
+	$(CC) -Wall -Wextra -g -fsanitize=thread -Wl,--wrap=calloc -o $@ $(POOL_REF_SRCS) -I. -lpthread
 
 .PHONY: test_poolref
 test_poolref: test_pool_ref test_pool_ref_tsan
@@ -881,6 +881,23 @@ test_l7origin: test_l7origin.c sockproxy_l7policy.o sockproxy_pool.o sockproxy_q
 .PHONY: test_l7or
 test_l7or: test_l7origin
 	./test_l7origin
+
+# Where an L7 FORWARD sends a request: the listener's own pool with the
+# route's members marked, selection over live health and weights, and a
+# policy replaced under the dispatch. ASan + UBSan, then TSan, the policy unit
+# compiled into the test.
+L7_ROUTE_SRCS = test_l7_route.c sockproxy_l7policy.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c
+test_l7_route: $(L7_ROUTE_SRCS) sockproxy_l7policy.h sockproxy_mcp_rr.h sockproxy_pool.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(L7_ROUTE_SRCS) \
+		-I. -I../headers -lcrypto -lpthread
+
+test_l7_route_tsan: $(L7_ROUTE_SRCS) sockproxy_l7policy.h sockproxy_mcp_rr.h sockproxy_pool.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $(L7_ROUTE_SRCS) -I. -I../headers -lcrypto -lpthread
+
+.PHONY: test_l7route
+test_l7route: test_l7_route test_l7_route_tsan
+	./test_l7_route
+	./test_l7_route_tsan
 
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.

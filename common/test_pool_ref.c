@@ -11,9 +11,11 @@
  *     same pool twice changes nothing;
  *   - two threads that unbind one permit at the same instant (the queue
  *     drain and the owner's teardown) drop its reference once;
- *   - the L7 scratch pool is never counted, and copying a pool's body into it
- *     touches no count;
  *   - the index answers what the table holds after every publish;
+ *   - an index that cannot be built: an add leaves the table and the index
+ *     as they were and its pool goes the way of a deleted one; a delete
+ *     leaves the pool in the old index, kept, until the next index goes out,
+ *     which lets go of it;
  *   - a worker that found a pool before its delete may still take its
  *     reference in the same loop iteration: the count never reads zero in
  *     that window and the pool is not freed under it (ASan);
@@ -38,6 +40,18 @@
 #include "sockproxy_qsbr.h"
 
 static int checks, failures;
+
+/* calloc as the pool code sees it (-Wl,--wrap=calloc): fails while told to. */
+static int fail_alloc;
+void *__real_calloc(size_t n, size_t size);
+
+void *
+__wrap_calloc(size_t n, size_t size)
+{
+  if (fail_alloc)
+    return NULL;
+  return __real_calloc(n, size);
+}
 
 #define CHECK(cond, ...) do {                                        \
     checks++;                                                        \
@@ -333,37 +347,6 @@ test_peek_across_threads(void)
 }
 
 static void
-test_scratch_is_not_counted(void)
-{
-  proxy_map_ent_t ent = { 0 };
-  void *slot = NULL;
-  fc_permit_t permit;
-  uint64_t base = live();
-  proxy_epval_t *p = add_pool(&ent, "e.example");
-  proxy_epval_t *s = sp_pool_alloc_uncounted();
-
-  assert(s);
-  memset(&permit, 0, sizeof(permit));
-  CHECK(live() == base + 1, "the scratch pool is not a live pool");
-  sp_pool_hold(&slot, p);
-  memcpy(s, p, sizeof(*s));   /* what l7_resolve_pool does on every FORWARD */
-  CHECK(sp_pool_refs(p) == 2 && sp_pool_refs(s) == 0,
-        "copying a pool's body into the scratch copies no count");
-  sp_pool_hold(&slot, s);
-  CHECK(sp_pool_refs(p) == 1 && sp_pool_refs(s) == 0, "the scratch as a holder's pool is not counted");
-  fc_bypass(&s->fc, &permit);
-  CHECK(sp_pool_refs(s) == 0, "a permit on the scratch counts nothing");
-  fc_permit_init(&permit);
-  sp_pool_hold(&slot, NULL);
-  sp_pool_put(s);
-  CHECK(sp_pool_refs(s) == 0, "a release of the scratch is ignored");
-  sp_pool_free_uncounted(s);
-  del_pool(&ent, p);
-  drain();
-  CHECK(live() == base, "the counted pool is freed; the scratch never was a live pool");
-}
-
-static void
 test_index(void)
 {
   proxy_map_ent_t ent = { 0 };
@@ -389,6 +372,70 @@ test_index(void)
   CHECK(sp_pool_index(&ent) == NULL && sp_pool_first(&ent) == NULL, "no pool, no index");
   drain();
   CHECK(live() == base, "all freed");
+}
+
+static proxy_epval_t *
+new_pool(const char *key)
+{
+  proxy_epval_t *p = sp_pool_alloc();
+
+  assert(p);
+  snprintf(p->ephash_key, sizeof(p->ephash_key), "%s", key);
+  return p;
+}
+
+static void
+test_index_not_built(void)
+{
+  proxy_map_ent_t ent = { 0 };
+  uint64_t base = live();
+  int f0 = atomic_load(&finalized);
+  proxy_epval_t *a = new_pool("g.example|/a");
+  proxy_epval_t *c = new_pool("g.example|/c");
+  proxy_epval_t *b, *d;
+  const sp_pool_index_t *ix;
+  int rc;
+
+  assert(sp_pool_link(&ent, a) == 0 && sp_pool_link(&ent, c) == 0);
+  ix = sp_pool_index(&ent);
+
+  /* An add. */
+  b = new_pool("g.example|/b");
+  fail_alloc = 1;
+  rc = sp_pool_link(&ent, b);
+  fail_alloc = 0;
+  CHECK(rc == -1, "an add whose index cannot be built fails");
+  CHECK(HASH_COUNT(ent.val.ephash) == 2 && sp_pool_index(&ent) == ix &&
+        sp_pool_find(&ent, "g.example|/b") == NULL,
+        "the table and the published index are as before the add");
+  sp_pool_unlinked(b);
+  drain();
+  CHECK(live() == base + 2 && atomic_load(&finalized) == f0 + 1,
+        "the pool of the failed add is freed like a deleted one");
+
+  /* A delete. */
+  fail_alloc = 1;
+  rc = sp_pool_unlink(&ent, a);
+  fail_alloc = 0;
+  CHECK(rc == -1, "a delete whose index cannot be built says so");
+  CHECK(HASH_COUNT(ent.val.ephash) == 1 && sp_pool_find(&ent, "g.example|/a") == a,
+        "the pool is out of the table and still in the readers' index");
+  drain();
+  CHECK(live() == base + 2 && sp_pool_refs(a) == 1,
+        "a pool readers still find is not let go");
+
+  /* The next change publishes an index without it and lets it go. */
+  d = new_pool("g.example|/d");
+  CHECK(sp_pool_link(&ent, d) == 0, "the next add publishes");
+  CHECK(sp_pool_find(&ent, "g.example|/a") == NULL && sp_pool_find(&ent, "g.example|/d") == d &&
+        sp_pool_find(&ent, "g.example|/c") == c, "the new index has the table's pools only");
+  drain();
+  CHECK(live() == base + 2 && atomic_load(&finalized) == f0 + 2,
+        "the deleted pool goes after the index that lets go of it");
+
+  CHECK(sp_pool_unlink(&ent, c) == 0 && sp_pool_unlink(&ent, d) == 0, "the rest delete");
+  drain();
+  CHECK(live() == base && sp_pool_index(&ent) == NULL, "all freed");
 }
 
 /* ---- threads ------------------------------------------------------------ */
@@ -585,8 +632,8 @@ main(void)
   test_overwrite_and_rebind();
   test_unbind_once_across_threads();
   test_peek_across_threads();
-  test_scratch_is_not_counted();
   test_index();
+  test_index_not_built();
 
   /* From here the reclaimer runs the deferred work. */
   assert(sp_qsbr_start() == 0);

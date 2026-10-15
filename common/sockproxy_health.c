@@ -1051,7 +1051,7 @@ check_draining_endpoints(void)
        * finer than 1s here — documented). For the AI peer / un-configured listeners (has_l7_policy
  * ==0 or timeout_member_data_ms==0) behaviour is byte-for-byte unchanged. */
       uint32_t l7_data_to_s = 0;
-      if (ito_node->has_l7_policy && ito_node->arg_ptr &&
+      if (l7_policy_on(ito_node) && ito_node->arg_ptr &&
           ito_node->arg_ptr->timeout_member_data_ms > 0) {
         /* ms → seconds, rounded up so a sub-second deadline still expires after one tick */
         l7_data_to_s = (ito_node->arg_ptr->timeout_member_data_ms + 999) / 1000;

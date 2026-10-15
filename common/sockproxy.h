@@ -791,6 +791,9 @@ typedef struct proxy_val {
    * (sockproxy_pool.h), which is rebuilt after every change to the table. */
   struct proxy_epval *ephash;
   sp_pool_index_t *_Atomic pools;
+  /* Out of the table but still in the published index, whose rebuild
+   * failed: let go of by the next index published. Under the lock. */
+  struct proxy_epval *pools_waiting;
   struct proxy_fd_ent *fdlist;
   conversation_mapping_t *conv_map;  // Conversation tracking (P0.3)
   pthread_rwlock_t conv_lock;        // Lock for conv_map (P0.3)
@@ -872,20 +875,6 @@ typedef struct proxy_map_ent {
   uint8_t            l7_n_trusted_ranges;
   l7_trusted_range_t l7_trusted_ranges[L7_MAX_TRUSTED_RANGES];
 
-  // (gap-fix): scratch "resolved sub-pool" used by l7_resolve_pool to
-  // forward a matched L7 route to a SPECIFIC subset of the service's endpoints
-  // (the route's backendRefs[].ep, honoring weights) instead of the whole pool.
-  // It is a struct proxy_epval (allocated lazily at first FORWARD on this service)
-  // whose eps[]/n_eps are narrowed from the base pool (val.ephash) per FORWARD.
-  // The proxy hot path is single-threaded (one proxy_run event-loop thread), and
-  // each request fully consumes this scratch (connects to the chosen endpoint)
-  // synchronously before the next is routed, so a single reusable buffer is safe
-  // (mirrors the existing tepval->ep_sel single-threaded mutation in ep.c). It is
-  // an opaque void* here to keep sockproxy.h free of any forward dependency; the
-  // engine TU casts it to (proxy_epval_t *). Freed by proxy_detach_l7_policy and
-  // when the proxy_map_ent is torn down.
-  void   *l7_resolved_pool;         // struct proxy_epval * scratch (opaque here)
-
   // L7 (Tier-1) byte shaper. Config + runtime bucket live HERE on the heap
   // proxy_map_ent (per-service state), never on proxy_arg (the 4096-byte eBPF
   // map value). qos_cfg.cir_Bps == 0 means the shaper is off and the relay
@@ -898,6 +887,15 @@ typedef struct proxy_map_ent {
   struct proxy_qos_bucket qos_up;
   struct proxy_qos_bucket qos_down;
 } proxy_map_ent_t;
+
+/* Whether a policy is attached, read outside the proxy lock (a gate): the
+ * policy unit reads it again, with the routes, under the read lock. The two
+ * writers (attach, clear) store it atomically under the write lock. */
+static inline uint8_t
+l7_policy_on(const proxy_map_ent_t *ent)
+{
+  return __atomic_load_n(&ent->has_l7_policy, __ATOMIC_RELAXED);
+}
 
 // ============================================================================
 // SNI-Based Multi-Certificate Support (GLOBAL CERTIFICATE STORE)
@@ -1293,6 +1291,9 @@ struct proxy_fd_ent {
   _Atomic uint8_t mcp_inflight; /* H1 permits one request until its response is framed. */
   uint8_t mcp_retry_pending; /* Only a failed, not yet connected H1 backend leg. */
   uint32_t mcp_retry_excluded; /* Bounded to original pool endpoints per request. */
+  /* The members of the pool this request's L7 FORWARD route names, on any
+   * pool (l7_route_pool), with the route's weights and cursor; set at the
+   * dispatch, cleared at the next one. */
   uint8_t mcp_route_active;
   uint32_t mcp_route_mask;
   uint8_t mcp_route_weights[MAX_PROXY_EP];

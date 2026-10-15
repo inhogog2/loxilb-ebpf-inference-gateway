@@ -80,6 +80,19 @@ static inline int sp_mcp_reserve_probe(proxy_epval_t *pool, int ep)
   PROXY_UNLOCK();
   return healthy;
 }
+/* A FORWARD route restricts the request to its members (l7_route_pool):
+ * MCP's routes and every other pool's alike. */
+static inline int sp_route_allows(const proxy_fd_ent_t *pfe, int ep)
+{
+  return !pfe || !pfe->mcp_route_active ||
+         (ep >= 0 && ep < MAX_PROXY_EP && (pfe->mcp_route_mask & (UINT32_C(1) << ep)));
+}
+/* A route subset on a pool other than MCP's: selected by
+ * sp_mcp_request_select, outside the pool's own selection modes. */
+static inline int sp_route_subset(const proxy_fd_ent_t *pfe, const proxy_epval_t *pool)
+{
+  return pfe && pfe->mcp_route_active && pool && !pool->mcp_stateless;
+}
 typedef struct sp_mcp_fc_scope {
   proxy_epval_t *pool;
   proxy_fd_ent_t *request;
