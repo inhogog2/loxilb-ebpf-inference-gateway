@@ -840,8 +840,8 @@ sp_resp_strip_api_key(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen)
     return buflen;
   client->cresp_blk.hdr_block = 0;       /* once per read */
   node = (proxy_map_ent_t *)client->head;
-  if (!node || !node->val.ephash ||
-      !ai_security_should_strip_api_key(node->val.ephash->apikey_auth))
+  proxy_epval_t *pool0 = sp_pool_first(node);
+  if (!pool0 || !ai_security_should_strip_api_key(pool0->apikey_auth))
     return buflen;
   if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
     return buflen;
@@ -892,11 +892,12 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
   if (!pfe || !buf || pfe->odir)
     return buflen;
   node = (proxy_map_ent_t *)pfe->head;
-  if (!node || !node->val.ephash)
+  proxy_epval_t *pool0 = sp_pool_first(node);
+  if (!pool0)
     return buflen;
   /* Header ownership follows api_key_auth only. ai_gw_mode is accounting and
    * streaming state, not an authorization declaration. */
-  strip_key = ai_security_should_strip_api_key(node->val.ephash->apikey_auth);
+  strip_key = ai_security_should_strip_api_key(pool0->apikey_auth);
   /* A service with a network-identity binding that forwards identity owns
    * the whole X-Auth-* family, whatever its auth type and whether or not
    * this request's source matched a binding: its backend reads those names
@@ -986,18 +987,14 @@ proxy_sockmap_owned_dirs(proxy_map_ent_t *ent, proxy_epval_t *epv,
   if (!ent)
     return;
   in.has_l7_policy = ent->has_l7_policy ? 1 : 0;
+  if (!epv)
+    epv = sp_pool_first(ent);
   if (epv) {
     in.mcp_stateless = epv->mcp_stateless;
     in.sse_mode = epv->sse_mode;
     in.pd_disagg_mode = epv->pd_disagg_enabled;
     in.ai_gw_mode = epv->ai_gw_mode;
     apikey_auth = epv->apikey_auth;
-  } else if (ent->val.ephash) {
-    in.mcp_stateless = ent->val.ephash->mcp_stateless;
-    in.sse_mode = ent->val.ephash->sse_mode;
-    in.pd_disagg_mode = ent->val.ephash->pd_disagg_enabled;
-    in.ai_gw_mode = ent->val.ephash->ai_gw_mode;
-    apikey_auth = ent->val.ephash->apikey_auth;
   } else {
     apikey_auth = 0;
   }
@@ -3223,16 +3220,22 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * on every tick, so requests already waiting get the new value. */
         tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
+        /* An add whose index could not be built left the pool in the table
+         * only: the update publishes it. */
+        int ix_rc = sp_pool_find(ent, ephash_key) == tepval ? 0 : sp_pool_index_publish(ent);
         if (revive) {
           proxy_listener_revive(ent, arg, &takeover);
         }
         PROXY_UNLOCK();
+        if (ix_rc != 0) {
+          return -ENOMEM;
+        }
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
                  ntohs(new_ent->xport), ephash_key);
         return 0;
       } else {
-        tepval = calloc(1, sizeof(*tepval));
+        tepval = sp_pool_alloc();
         assert(tepval);
         tepval->n_eps = arg->n_eps;
         tepval->_id = arg->_id;
@@ -3243,7 +3246,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #ifdef HAVE_DP_GPU_ROUTING
         if (chwbl_prepare_runtime(tepval, arg, NULL) < 0) {
           pthread_rwlock_destroy(&tepval->chwbl_state_lock);
-          free(tepval);
+          sp_pool_discard(tepval);
           proxy_takeover_drop(&takeover);
           PROXY_UNLOCK();
           return -ENOMEM;
@@ -3504,12 +3507,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         HASH_ADD_KEYPTR(hh, ent->val.ephash,
                         tepval->ephash_key, strlen(tepval->ephash_key),
                         tepval);
+        /* Workers find the pool once the index is published. Should it not
+         * be built, the pool waits in the table for the next change of the
+         * rule, and the caller is told. */
+        int ix_rc = sp_pool_index_publish(ent);
 
         if (revive) {
           proxy_listener_revive(ent, arg, &takeover);
         }
         PROXY_UNLOCK();
-        return 0;
+        return ix_rc == 0 ? 0 : -ENOMEM;
       }
     }
     ent = ent->next;
@@ -3616,7 +3623,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   /* Build the complete selector generation before registering the listener.
    * A ring allocation/validation failure therefore cannot leave a closed fd
    * behind in the notifier. */
-  tepval = calloc(1, sizeof(*tepval));
+  tepval = sp_pool_alloc();
   assert(tepval);
   tepval->n_eps = arg->n_eps;
   tepval->_id = arg->_id;
@@ -3628,7 +3635,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #ifdef HAVE_DP_GPU_ROUTING
   if (chwbl_prepare_runtime(tepval, arg, NULL) < 0) {
     pthread_rwlock_destroy(&tepval->chwbl_state_lock);
-    free(tepval);
+    sp_pool_discard(tepval);
     close(lsd);
     pthread_rwlock_destroy(&node->val.conv_lock);
     proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
@@ -3665,7 +3672,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     chwbl_release_runtime(tepval);
 #endif
     pthread_rwlock_destroy(&tepval->chwbl_state_lock);
-    free(tepval);
+    sp_pool_discard(tepval);
     pfe_recycle(fd_ctx);
     pthread_rwlock_destroy(&node->val.conv_lock);
     proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
@@ -3928,6 +3935,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   HASH_ADD_KEYPTR(hh, node->val.ephash,
                   tepval->ephash_key, strlen(tepval->ephash_key),
                   tepval);
+  int ix_rc = sp_pool_index_publish(node);
 
   /* new service: attach any shaper config stored ahead of rule creation */
   qos_apply_stored_cfg(node);
@@ -3942,7 +3950,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   PROXY_UNLOCK();
 
-  return 0;
+  return ix_rc == 0 ? 0 : -ENOMEM;
 }
 
 int
@@ -4949,7 +4957,7 @@ sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
   }
   pfe->fc.state = FC_P_NONE;
   if (d->detach) {
-    pfe->fc.fc = NULL;
+    fc_permit_unbind(&pfe->fc);
   }
   pfe->pd_phase = PD_PHASE_ERROR;
   sp_reap_request(pfe, d->kind);
@@ -8394,7 +8402,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->pd_decode_ep_idx = -1;
     npfe2->odir = 1;
     npfe2->_id = rid;
-    npfe2->epv = NULL;  // P1.3: Backend FD should NOT have epv reference
+    sp_pool_hold(&npfe2->epv, NULL);  // P1.3: Backend FD should NOT have epv reference
     npfe2->n_rfd++;
 
 #ifdef HAVE_HTTP_TRACE
@@ -8439,7 +8447,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       /* ep_num alone cannot be bound: it indexes ONE pool's eps[] and every
        * model pool on this service starts at 0. Carry the pool that owns it
        * (epv stays NULL here by the P1.3 load-accounting rule above). */
-      npfe2->learn_epv = tepval;
+      sp_pool_hold(&npfe2->learn_epv, tepval);
       strncpy(npfe2->session_header_name, npfe1->session_header_name,
               sizeof(npfe2->session_header_name) - 1);
       npfe2->session_header_name[sizeof(npfe2->session_header_name) - 1] = '\0';
@@ -8484,7 +8492,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 
     npfe1->_id = rid;
     npfe1->ep_num = ep_num;  // P1.3: Store endpoint number for load decrement
-    npfe1->epv = tepval;     // P1.3: Store epv pointer for CHWBL config access
+    sp_pool_hold(&npfe1->epv, tepval);     // P1.3: Store epv pointer for CHWBL config access
     npfe1->rfd[npfe1->n_rfd] = ep_cfd;
     npfe1->rfd_ent[npfe1->n_rfd] = npfe2;
     npfe1->n_rfd++;
@@ -9318,9 +9326,9 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   pfe->auth_src = adm.auth_src;
   pfe->auth_strip_authz = (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
   pfe->auth_fwd_identity = (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
-  pfe->auth_jwt_capable =
-    (hent->val.ephash->apikey_auth == 3 ||
-     hent->val.ephash->apikey_auth == 4) ? 1 : 0;
+  proxy_epval_t *pool0 = sp_pool_first(hent);
+  pfe->auth_jwt_capable = pool0 &&
+    (pool0->apikey_auth == 3 || pool0->apikey_auth == 4) ? 1 : 0;
   pfe->auth_netid_fwd = adm.net_forward_identity ? 1 : 0;
   strncpy(pfe->effective_model, adm.effective_model,
           sizeof(pfe->effective_model) - 1);
@@ -9397,13 +9405,16 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->api_key = pfe->x_api_key_raw;
   req->bearer = pfe->bearer_raw;
   req->bearer_oversize = pfe->bearer_oversize;
-  req->jwt_profile = hent->val.ephash->jwt_auth_profile;
+  /* The listener's first pool, read once; a rule deleted under this
+   * request leaves a credential required (1), never none. */
+  const proxy_epval_t *pool0 = sp_pool_first(hent);
+  req->jwt_profile = pool0 ? pool0->jwt_auth_profile : "";
   req->prefix_model = pfe->prefix_key.model;
   req->hdr_model = pfe->x_model_header;
   req->class_on = ai_gw_class_on();
   req->objective_hint = pfe->obj_hint.name;
   req->objective_strict_of = sp_resv_objective_strict_of;
-  req->auth_mode = hent->val.ephash->apikey_auth;
+  req->auth_mode = pool0 ? pool0->apikey_auth : 1;
   /* The gate runs before the header splice, so a refused request normally
    * has no derived origin and proxy_origin_ip returns "" — which says "not
    * derived" and must not be read as the peer. The peer is known from
@@ -9419,7 +9430,8 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
 static inline int
 sp_h1_rule_enforces(const proxy_map_ent_t *hent)
 {
-  int mode = hent->val.ephash->apikey_auth;
+  const proxy_epval_t *pool0 = sp_pool_first(hent);
+  int mode = pool0 ? pool0->apikey_auth : 1;   /* none left: fail closed */
   return mode != 0 && mode != 2;
 }
 
@@ -9448,8 +9460,8 @@ sp_h1_pre_dispatch_admit(int fd, proxy_fd_ent_t *pfe)
   ai_gw_req_ctx_t req;
   sp_resv_route_t route;
 
-  if (pfe->odir != 0 || !hent || !hent->val.ephash ||
-      !hent->val.ephash->ai_gw_mode)
+  proxy_epval_t *pool0 = sp_pool_first(hent);
+  if (pfe->odir != 0 || !pool0 || !pool0->ai_gw_mode)
     return 0;
 
   sp_h1_admit_req_from_headers(pfe, hent, &req, &route);
@@ -9489,8 +9501,8 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
 {
   proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
 
-  if (pfe->odir == 0 && hent && hent->val.ephash &&
-      hent->val.ephash->ai_gw_mode && sp_h1_rule_enforces(hent)) {
+  proxy_epval_t *pool0 = sp_pool_first(hent);
+  if (pfe->odir == 0 && pool0 && pool0->ai_gw_mode && sp_h1_rule_enforces(hent)) {
     ai_gw_req_ctx_t req;
     sp_resv_route_t route;
     char msg[128];
@@ -9528,7 +9540,8 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
 static int sp_mcp_enabled(const proxy_fd_ent_t *pfe)
 {
   const proxy_map_ent_t *ent = pfe ? pfe->head : NULL;
-  return pfe && pfe->odir == 0 && ent && ent->val.ephash && ent->val.ephash->mcp_stateless;
+  const proxy_epval_t *pool0 = sp_pool_first(ent);
+  return pfe && pfe->odir == 0 && pool0 && pool0->mcp_stateless;
 }
 static int sp_mcp_h1_refuse(proxy_fd_ent_t *pfe, int status)
 {
@@ -9701,7 +9714,8 @@ handle_on_message_complete(llhttp_t* parser)
   // (i.e., when ai_gw_mode==1, set by SSEMode or PDDisaggMode on the service rule).
   if (pfe->odir == 0 && pfe->head) {
     proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
-    if (hent->val.ephash && hent->val.ephash->ai_gw_mode) {
+    proxy_epval_t *pool0 = sp_pool_first(hent);
+    if (pool0 && pool0->ai_gw_mode) {
       const char *gate_body = NULL;
       size_t gate_body_len = 0;
 
@@ -11334,6 +11348,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->pd_decode_ep_idx  = -1;  // Must be -1 so pd_select_decode falls through to min-load
   npfe1->pd_prefill_ep_idx = -1;  // Bug4-fix: prevent spurious active_conns decrement on early cleanup
   npfe1->head = ent;
+  proxy_epval_t *ent_pool0 = sp_pool_first(ent);  /* the listener's first pool, read once */
   npfe1->ssl = ssl;
   npfe1->odir = 0;  // Client-facing connection
   npfe1->fe_counted = fe_counted;  // the fe_conns unit now belongs to this leg
@@ -11433,16 +11448,16 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 
   // Link to service entry and copy session header config
   npfe1->head = ent;
-  if (ent && ent->val.ephash && ent->val.ephash->session_header_enabled) {
-    strncpy(npfe1->session_header_name, ent->val.ephash->session_header_name,
+  if (ent && ent_pool0 && ent_pool0->session_header_enabled) {
+    strncpy(npfe1->session_header_name, ent_pool0->session_header_name,
             sizeof(npfe1->session_header_name) - 1);
     npfe1->session_header_name[sizeof(npfe1->session_header_name) - 1] = '\0';
     log_debug("[NS_CONN_INIT] fd=%d session_header_name='%s' (sticky enabled)",
              new_sd, npfe1->session_header_name);
   } else {
     log_debug("[NS_CONN_INIT] fd=%d no session header (ent=%p ephash=%p enabled=%d)",
-             new_sd, (void*)ent, ent ? (void*)ent->val.ephash : NULL,
-             (ent && ent->val.ephash) ? ent->val.ephash->session_header_enabled : 0);
+             new_sd, (void*)ent, ent ? (void*)ent_pool0 : NULL,
+             (ent && ent_pool0) ? ent_pool0->session_header_enabled : 0);
   }
 
   // Copy SSE rule configuration to per-connection state (A-7)
@@ -11462,13 +11477,13 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->stream_end_ts = 0;
   memset(npfe1->sse_tail, 0, sizeof(npfe1->sse_tail));
   npfe1->sse_tail_len = 0;
-  if (ent && ent->val.ephash) {
-    npfe1->sse_mode = ent->val.ephash->sse_mode;
-    npfe1->ai_gw_mode = ent->val.ephash->ai_gw_mode;
-    npfe1->apikey_auth = ent->val.ephash->apikey_auth;
-    npfe1->max_stream_duration_sec = ent->val.ephash->max_stream_duration_sec;
-    npfe1->backend_keepalive_sec = ent->val.ephash->backend_keepalive_sec;
-    npfe1->inactive_timeout_sec = ent->val.ephash->inactive_timeout_sec;
+  if (ent && ent_pool0) {
+    npfe1->sse_mode = ent_pool0->sse_mode;
+    npfe1->ai_gw_mode = ent_pool0->ai_gw_mode;
+    npfe1->apikey_auth = ent_pool0->apikey_auth;
+    npfe1->max_stream_duration_sec = ent_pool0->max_stream_duration_sec;
+    npfe1->backend_keepalive_sec = ent_pool0->backend_keepalive_sec;
+    npfe1->inactive_timeout_sec = ent_pool0->inactive_timeout_sec;
   }
 
   // Initialize vLLM request ID state for new connection
@@ -11645,7 +11660,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
             chwbl_dec_runtime(ka_epv, pfe->ep_num);
           }
           pfe->ep_num = -1;
-          pfe->epv = NULL;
+          sp_pool_hold(&pfe->epv, NULL);
         }
 #endif
         sp_fc_h1_park(pfe);
@@ -12755,7 +12770,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         return sp_mcp_h1_refuse(pfe, 400);
       if (pfe->head) {
         proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
-        if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode) {
+        proxy_epval_t *ka_pool0 = sp_pool_first(ka_hent);
+        if (ka_pool0 && ka_pool0->ai_gw_mode) {
           ai_gw_conn = 1;
           if (pfe->sse_active == 0)
             ai_gw_boundary = 1;
@@ -13260,7 +13276,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 #endif
               }
               pfe->ep_num = -1;
-              pfe->epv    = NULL;
+              sp_pool_hold(&pfe->epv, NULL);
             }
 #endif
 
@@ -13292,8 +13308,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                * contract of the service; a bare reset made it look like a
                * network fault. Non-AI listeners keep the raw reset. */
               proxy_map_ent_t *ovf_head = (proxy_map_ent_t *)pfe->head;
-              if (pfe->odir == 0 && ovf_head && ovf_head->val.ephash &&
-                  ovf_head->val.ephash->ai_gw_mode) {
+              proxy_epval_t *ovf_pool0 = sp_pool_first(ovf_head);
+              if (pfe->odir == 0 && ovf_pool0 && ovf_pool0->ai_gw_mode) {
                 sp_h1_send_admit_deny(pfe, 413, 0, 0, "request_body_too_large",
                                       "request body exceeds the gateway's "
                                       "buffered maximum; send a Content-Length");
@@ -13351,8 +13367,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // non-AI L7/L4 passthrough keeps the raw-relay fallback.
           {
             proxy_map_ent_t *perr_head = (proxy_map_ent_t *)pfe->head;
-            if (pfe->odir == 0 && perr_head && perr_head->val.ephash &&
-                (perr_head->val.ephash->ai_gw_mode || perr_head->val.ephash->mcp_stateless)) {
+            proxy_epval_t *perr_pool0 = sp_pool_first(perr_head);
+            if (pfe->odir == 0 && perr_pool0 &&
+                (perr_pool0->ai_gw_mode || perr_pool0->mcp_stateless)) {
               if (sp_mcp_enabled(pfe)) return sp_mcp_h1_refuse(pfe, 400);
               static const char smuggle_400[] =
                 "HTTP/1.1 400 Bad Request\r\n"

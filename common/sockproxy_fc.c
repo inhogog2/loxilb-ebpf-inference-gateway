@@ -512,11 +512,9 @@ fc_state_destroy(fc_state_t *fc)
   pthread_mutex_unlock(&fc->queue.lock);
 }
 
-void
-fc_permit_init(fc_permit_t *p)
+static void
+fc_permit_reset(fc_permit_t *p)
 {
-  if (!p)
-    return;
   p->fc = NULL;
   p->state = FC_P_NONE;
   p->svc_held = 0;
@@ -531,6 +529,57 @@ fc_permit_init(fc_permit_t *p)
   p->admit_ns = 0;
   p->tkey = 0;
   p->tslot = -1;
+}
+
+static void (*fc_owner_hold)(fc_state_t *fc);
+static void (*fc_owner_drop)(fc_state_t *fc);
+
+void
+fc_set_owner_hooks(void (*hold)(fc_state_t *fc), void (*drop)(fc_state_t *fc))
+{
+  fc_owner_hold = hold;
+  fc_owner_drop = drop;
+}
+
+void
+fc_permit_unbind(fc_permit_t *p)
+{
+  fc_state_t *old;
+
+  if (!p || !fc_owner_drop)
+    return;
+  /* The queue drain (another thread, under PROXY_LOCK) and the owner's
+   * teardown can both unbind one permit: the exchange gives the old state to
+   * exactly one of them, so its reference is dropped once. */
+  old = __atomic_exchange_n(&p->fc, NULL, __ATOMIC_ACQ_REL);
+  if (old)
+    fc_owner_drop(old);
+}
+
+void
+fc_permit_init(fc_permit_t *p)
+{
+  if (!p)
+    return;
+  fc_permit_unbind(p);
+  fc_permit_reset(p);
+}
+
+/* A fresh permit bound to fc. The new state's reference is taken before the
+ * old one is given back, so a rebind to the same state never drops its
+ * count to zero on the way. Without owner hooks the permit's earlier
+ * content is not read (it may be uninitialised). */
+static void
+fc_permit_bind(fc_permit_t *p, fc_state_t *fc)
+{
+  fc_state_t *old = fc_owner_drop ? p->fc : NULL;
+
+  if (fc && fc_owner_hold)
+    fc_owner_hold(fc);
+  fc_permit_reset(p);
+  p->fc = fc;
+  if (old)
+    fc_owner_drop(old);
 }
 
 /* ---- tenant share ----------------------------------------------------------- */
@@ -1002,8 +1051,7 @@ fc_unit_give(_Atomic uint32_t *ctr)
 void
 fc_bypass(fc_state_t *fc, fc_permit_t *p)
 {
-  fc_permit_init(p);
-  p->fc = fc;
+  fc_permit_bind(p, fc);
   p->state = FC_P_BYPASS;
   if (fc_active(fc))
     fc_count(fc, FC_R_BYPASS_NON_INFERENCE);
@@ -1081,8 +1129,7 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
   uint64_t enq = woken ? p->q_enqueue_ns : 0;
   uint64_t deadline = woken ? p->q_deadline_ns : 0;
 
-  fc_permit_init(p);
-  p->fc = fc;
+  fc_permit_bind(p, fc);
   /* A woken request keeps the wait it was first given, should it go back. */
   p->q_enqueue_ns = enq;
   p->q_deadline_ns = deadline;
@@ -1449,8 +1496,7 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   /* The permit is QUEUED before the entry is published: a drain or a
    * deadline on another thread that pops the entry the moment the lock is
    * dropped must find a waiting permit, not the one it replaces. */
-  fc_permit_init(p);
-  p->fc = fc;
+  fc_permit_bind(p, fc);
   p->state = FC_P_QUEUED;
   p->q_fd = fd;
   p->q_gen = gen;
@@ -1490,8 +1536,7 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   pthread_mutex_unlock(&fc->queue.lock);
 
   if (rc != 0) {
-    fc_permit_init(p);
-    p->fc = fc;
+    fc_permit_bind(p, fc);
     p->tkey = tkey;
     fc_count(fc, rc == -2 ? FC_R_TENANT_SHARE : FC_R_QUEUE_FULL);
     return rc == -2 ? -2 : -1;

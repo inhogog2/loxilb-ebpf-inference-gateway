@@ -539,7 +539,7 @@ l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
   if (!ent)
     return NULL;
 
-  base = ent->val.ephash;
+  base = sp_pool_first(ent);
   if (!base)
     return NULL;
 
@@ -549,7 +549,7 @@ l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
 
   /* Lazily allocate the single reusable scratch resolved-pool on the map_ent. */
   if (!ent->l7_resolved_pool) {
-    ent->l7_resolved_pool = calloc(1, sizeof(proxy_epval_t));
+    ent->l7_resolved_pool = sp_pool_alloc_uncounted();
     if (!ent->l7_resolved_pool)
       return base;                  /* allocation failed -> degrade to base pool */
   }
@@ -738,7 +738,8 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
 {
   l7_decision_t d;
   const l7_route_t *routes;
-  int mcp_locked=ent && ent->val.ephash && ent->val.ephash->mcp_stateless;
+  proxy_epval_t *pool0 = sp_pool_first(ent);  /* the listener's first pool, read once */
+  int mcp_locked=pool0 && pool0->mcp_stateless;
   /* Readers previously raced regfree/free at policy replacement. Hold the
    * generation only while evaluating/copying; response callbacks run unlocked. */
   if (mcp_locked) PROXY_RDLOCK();
@@ -773,7 +774,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
       l7_send_redirect(pfe, d.u.redir.status_code, d.location);
       return L7_DISPATCH_TERMINATED;
     case L7A_FORWARD:
-      if (ent->val.ephash && ent->val.ephash->mcp_stateless) {
+      if (mcp_locked) {
         /* Keep original endpoint indices and base-pool lifetime. A narrowed
          * shared scratch would reset RR and be retained by backend legs. */
         if (d.route_index < 0 || d.route_index >= 256) {
@@ -785,7 +786,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
         memset(pfe->mcp_route_weights,0,sizeof(pfe->mcp_route_weights));
         for (int ri=0; ri<d.u.fwd.n_refs && ri<MAX_PROXY_EP; ri++) {
           uint32_t ei=d.u.fwd.refs[ri].ep;
-          if (ei >= (uint32_t)ent->val.ephash->n_eps || ei>=MAX_PROXY_EP) continue;
+          if (ei >= (uint32_t)pool0->n_eps || ei>=MAX_PROXY_EP) continue;
           pfe->mcp_route_mask |= UINT32_C(1)<<ei;
           pfe->mcp_route_weights[ei]=d.u.fwd.refs[ri].weight;
         }
@@ -795,14 +796,14 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
           return L7_DISPATCH_TERMINATED;
         }
         if (!d.u.fwd.n_refs) {
-          for (int ei=0; ei<ent->val.ephash->n_eps && ei<MAX_PROXY_EP; ei++)
+          for (int ei=0; ei<pool0->n_eps && ei<MAX_PROXY_EP; ei++)
             pfe->mcp_route_mask |= UINT32_C(1)<<ei;
         }
         pfe->mcp_selector_state=&ent->mcp_l7_selector[d.route_index];
         pfe->mcp_route_active=1;
         pfe->mcp_route_ticket=atomic_fetch_add_explicit(
             &ent->mcp_l7_rr_ticket[d.route_index],1,memory_order_relaxed);
-        if (tepval_out) *tepval_out=ent->val.ephash;
+        if (tepval_out) *tepval_out=pool0;
       } else if (tepval_out) {
         *tepval_out = l7_resolve_pool(ent, &d.u.fwd);
       }
@@ -1009,7 +1010,8 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
     emit(ctx, L7HDR_SET, "X-Forwarded-Proto", xfproto);
 
   /* (4) The matched route's bounded insertHeaders ops. */
-  modern=ent->val.ephash && ent->val.ephash->mcp_stateless;
+  const proxy_epval_t *pool0=sp_pool_first((proxy_map_ent_t *)ent);
+  modern=pool0 && pool0->mcp_stateless;
   if (modern) PROXY_RDLOCK();
   route = l7_first_matching_route(pfe, (proxy_map_ent_t *)ent);
   n=route ? route->n_hdr_filters : 0;
@@ -1113,7 +1115,8 @@ l7_cookie_node_match(const struct proxy_map_ent *node,
 int
 l7_cookie_persist_active(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent)
 {
-  if (ent && ent->val.ephash && ent->val.ephash->mcp_stateless) return 0;
+  const proxy_epval_t *pool0 = sp_pool_first(ent);
+  if (pool0 && pool0->mcp_stateless) return 0;
   const l7_route_t *route;
   if (!pfe || !ent || !ent->has_l7_policy)
     return 0;
@@ -1221,7 +1224,7 @@ l7_clear_attached(proxy_map_ent_t *ent)
    * hash_ring/chwbl_config/pd_trie/session maps — before use), so a plain free
    * of the buffer itself is correct and leak-free. */
   if (ent->l7_resolved_pool) {
-    free(ent->l7_resolved_pool);
+    sp_pool_free_uncounted(ent->l7_resolved_pool);
     ent->l7_resolved_pool = NULL;
   }
 }

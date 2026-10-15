@@ -35,6 +35,7 @@
 #include <linux/tcp.h>
 #include "log.h"
 #include "notify.h"
+#include "sockproxy_qsbr.h"
 
 #define MAX_NOTIFY_FDS 65535
 /* Per-worker registration bound. It was the size of the pollfd array a
@@ -47,6 +48,7 @@
 /* Relay shards plus the listener shard (NOTIFY_MAX_RELAY_SHARDS, notify.h). */
 #define MAX_NOTIFY_THREADS (NOTIFY_MAX_RELAY_SHARDS + 1)
 #define MAX_NOTIFY_POLL_TIMEO (10)
+_Static_assert(MAX_NOTIFY_THREADS <= SP_QSBR_MAX_THREADS, "every notify thread has a reader slot");
 
 /* (R1): bound on the per-worker resume-pending MPSC ring. A parked conn
  * occupies one slot from wake-enqueue until the owner worker drains it (sub-ms). The
@@ -1013,7 +1015,12 @@ notify_run(void *ctx, int thread)
     nproc = 0;
     /* Only the ready fds come back: the cost of a wakeup no longer grows
      * with the number of idle connections the shard owns. */
+    /* Offline while waiting: an idle worker holds back no grace period
+     * (sockproxy_qsbr.h). Coming back online is this worker's quiescent
+     * point: nothing it read before the wait is carried past it. */
+    sp_qsbr_offline();
     rc = epoll_wait(pctx->epfd, evs, MAX_NOTIFY_EVENTS, MAX_NOTIFY_POLL_TIMEO);
+    sp_qsbr_online();
     if (rc < 0) {
       if (errno == EINTR) {
         continue;
@@ -1150,7 +1157,9 @@ notify_run_worker(void *arg)
   }
 #endif
   
+  sp_qsbr_register(targ->thrid);
   notify_run(targ->ctx, targ->thrid);
+  sp_qsbr_unregister();
   return NULL;
 }
 

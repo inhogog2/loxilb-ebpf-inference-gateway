@@ -80,14 +80,14 @@ build_ephash_key(char *key_buf, size_t buf_size,
  *   5. Would try "host|/" if all prefix matches failed
  *   6. Fallback to "host" (hostname-only, backward compat)
  *
- * @param ent Proxy map entry containing ephash table
+ * @param ix The listener's published pool index, read once per lookup
  * @param host Hostname without port (e.g., "api.example.com")
  * @param request_path Full request path (e.g., "/v1/users/profile/settings")
  * @param model_name AI model name or NULL/empty for wildcard
  * @return Endpoint value or NULL if not found
  */
 static proxy_epval_t*
-find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
+find_endpoint_for_host(const sp_pool_index_t *ix, const char *host,
                        const char *request_path, const char *model_name)
 {
   proxy_epval_t *best_match = NULL;
@@ -96,7 +96,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
   char path_copy[256];
   int best_match_len = -1;  /* Used for debug logging and path matching */
 
-  if (!ent || !host) {
+  if (!ix || !host) {
     return NULL;
   }
 
@@ -119,7 +119,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
     build_ephash_key(search_key, sizeof(search_key), host, path_copy, model_name);
 
     /* Try to find this prefix */
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
 
     if (tepval && (tepval->path_match_mode != 2 ||
                    strlen(path_copy) == path_len)) {
@@ -144,7 +144,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
        * When path_copy is already "/" this is a harmless re-check (already tried
        * in loop body); when path_copy is "/v1" etc., "/" hasn't been tried yet. */
       build_ephash_key(search_key, sizeof(search_key), host, "/", model_name);
-      HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+      tepval = sp_pool_index_find(ix, search_key);
       if (tepval && (tepval->path_match_mode != 2 || path_len == 1)) {
         best_match = tepval;
         best_match_len = 1;
@@ -167,7 +167,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
    * this missing branch. */
   if (!best_match && model_name && model_name[0] != '\0') {
     build_ephash_key(search_key, sizeof(search_key), host, "", model_name);
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
     if (tepval) {
       return tepval;
     }
@@ -183,7 +183,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
 
     while (strlen(path_copy) > 0) {
       build_ephash_key(search_key, sizeof(search_key), host, path_copy, "");
-      HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+      tepval = sp_pool_index_find(ix, search_key);
       if (tepval && (tepval->path_match_mode != 2 ||
                      strlen(path_copy) == path_len)) {
         return tepval;  /* Wildcard pool found */
@@ -192,7 +192,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
       if (last_slash == path_copy) {
         /* Try root "/" as final prefix (harmless re-check when path_copy is "/") */
         build_ephash_key(search_key, sizeof(search_key), host, "/", "");
-        HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+        tepval = sp_pool_index_find(ix, search_key);
         if (tepval && (tepval->path_match_mode != 2 || path_len == 1))
           return tepval;
         break;
@@ -210,7 +210,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
  * Use empty model — IP-based VIPs have no model in their key. */
   if (!best_match) {
     build_ephash_key(search_key, sizeof(search_key), host, "", "");
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
     if (tepval) {
       best_match = tepval;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -230,7 +230,10 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     return NULL;
   }
 
-  proxy_epval_t *best_match = find_endpoint_for_host(ent, host, request_path,
+  /* One index for the whole lookup: every fallback below is answered from
+   * the same snapshot of the listener's pools (sockproxy_pool.h). */
+  const sp_pool_index_t *ix = sp_pool_index(ent);
+  proxy_epval_t *best_match = find_endpoint_for_host(ix, host, request_path,
                                                    model_name);
   if (best_match) {
     return best_match;
@@ -255,7 +258,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
       /* A no-host rule can carry the same model/path constraints as a
        * host rule. Reuse the complete lookup instead of checking only
        * pathless keys, preserving exact and longest-prefix semantics. */
-      best_match = find_endpoint_for_host(ent, self_host, request_path,
+      best_match = find_endpoint_for_host(ix, self_host, request_path,
                                          model_name);
       if (best_match) {
         return best_match;
@@ -268,7 +271,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
    * (e.g., "loxicmd create lb 10.10.10.254 --tcp=2020:8080 --endpoints=...") */
   if (!best_match) {
     build_ephash_key(search_key, sizeof(search_key), "", "", "");
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
     if (tepval) {
       best_match = tepval;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -293,7 +296,7 @@ sp_resv_default_tokens_route(proxy_map_ent_t *ent, const char *host,
   if (!ent)
     return 0;
   if (!host)
-    ep = ent->val.ephash;
+    ep = sp_pool_first(ent);
   else
     ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
   return ep ? (int)ep->ai_default_tokens : 0;
@@ -310,7 +313,7 @@ sp_resv_objective_strict_route(proxy_map_ent_t *ent, const char *host,
   if (!ent)
     return 0;
   if (!host)
-    ep = ent->val.ephash;
+    ep = sp_pool_first(ent);
   else
     ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
   return ep ? (int)ep->ai_objective_strict : 0;

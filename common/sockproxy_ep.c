@@ -544,7 +544,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 #endif
 #endif
         if (host_str == NULL) {
-          tepval = node->val.ephash;
+          tepval = sp_pool_first(node);
         } else {
           // Strip port from hostname before lookup (e.g., "example.com:9090" → "example.com")
           char host_only[256];
@@ -649,7 +649,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
               return -1;
             }
             // Non-HTTP path (raw TCP, no pfe): keep backward-compat fallback
-            tepval = node->val.ephash;
+            tepval = sp_pool_first(node);
             if (!tepval) {
               /* Production fix: all rules deleted for this VIP:port but listener
                * kept open.  Return HTTP 503 so callers get a clean error instead
@@ -891,7 +891,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           if (pf_rc == PD_PREFILL_PARKED) {
             /* The enqueue + park_start_ts stamp already happened in the selector;
              * mark epv so a later teardown ( max-park reap) can find the EP. */
-            if (pfe && !pfe->epv) pfe->epv = tepval;
+            if (pfe && !pfe->epv) sp_pool_hold(&pfe->epv, tepval);
             return PD_SETUP_PARKED;
           }
           if (pf_rc == PD_PREFILL_NO_CAPACITY) {
@@ -970,7 +970,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             pfe->pd_decode_ep_idx = pd_decode;
             /* Bug1-fix: set epv now so pd_cleanup() can decrement active_conns
              * if the prefill TCP connect fails before epv is set at line ~9102 */
-            if (!pfe->epv) pfe->epv = tepval;
+            if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
           }
 
           /* INTG-04: Store session AFTER both EPs known.
@@ -1048,7 +1048,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             /* Bug1-fix idiom (P/D block above): set epv now so pd_cleanup()
              * can decrement even if the backend TCP connect fails before epv
              * is normally set. */
-            if (!pfe->epv) pfe->epv = tepval;
+            if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
             log_debug("[KV_SR] fd=%d single-role Tier-1.5 HIT -> EP%d",
                      pfe->fd, kv_sr_ep);
           }
@@ -1491,7 +1491,7 @@ pd_fallback_normal:
                 atomic_fetch_add(&tepval->pd_ep_loads[nx_sel].active_conns, 1);
                 pfe->kv_sr_load_held = 1;
                 pfe->kv_sr_ep_idx = nx_sel;
-                if (!pfe->epv) pfe->epv = tepval;
+                if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
               }
               ep_sel->ep_cfds[0].ep_cfd = nx_fd;
               sel = nx_sel;
@@ -1568,7 +1568,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         return 0;
       } else if (node->val.proxy_mode == PROXY_MODE_ALL) {
         int ep = 0;
-        tepval = node->val.ephash;
+        tepval = sp_pool_first(node);
         if (tepval == NULL) break;
 
         /* PROXY_MODE_ALL is dedicated to N2 / non-L7 protocols only and is never
@@ -2056,16 +2056,10 @@ proxy_conversation_cleanup_thread(void *arg)
      * POSIX rwlock recursion is undefined behaviour — so we MUST release
      * PROXY_LOCK() before calling pd_session_evict().
      *
-     * Safety of victim pointer stability across PROXY_UNLOCK() is the
-     * load-bearing property — RESEARCH Pitfall 8 / Assumption A2. All HASH_DEL
-     * of node->val.ephash must be performed under PROXY_LOCK() so that the
-     * cleanup thread is the only writer between gather and the post-unlock
-     * evict loop. Audit grep:
-     *   grep -n "HASH_DEL.*ephash\|free.*proxy_epval_t" loxilb-ebpf/common/sockproxy*.c
-     * The result must show every site is reached only under PROXY_LOCK() by
-     * its caller (today: proxy_delete_entry() in sockproxy_conn.c). When you
-     * add a new ephash mutator, you MUST verify this invariant — otherwise
-     * the two-pass refactor below is UAF-vulnerable. */
+     * The victims are used after PROXY_UNLOCK(): each is gathered with a
+     * reference taken under the lock (sockproxy_pool.h), so a rule deleted
+     * between the gather and the evict keeps its pool until the reference
+     * is given back after the evict. */
     #define PROXY_PD_EVICT_GATHER_N 64
     proxy_epval_t *victims_stack[PROXY_PD_EVICT_GATHER_N];
     proxy_epval_t **victims = victims_stack;
@@ -2169,6 +2163,7 @@ proxy_conversation_cleanup_thread(void *arg)
                 victims = heap;
               }
             }
+            sp_pool_get(tepval);
             victims[n_v++] = tepval;
           }
           skip_pd_gather:
@@ -2191,10 +2186,10 @@ proxy_conversation_cleanup_thread(void *arg)
     /* Pri-1 fully released — pd_session_evict() can safely re-acquire Pri-1
      * rdlock via pd_session_resolve_service_key(). Pri-1 alone is never a
      * hierarchy violation per sockproxy_internal.h:89-100. The gathered
-     * tepval pointers remain stable because all ephash mutators take
-     * PROXY_LOCK() (RESEARCH Assumption A2 / Pitfall 8). */
+     * pools are held by the references taken at the gather. */
     for (size_t i = 0; i < n_v; i++) {
       pd_session_evict(victims[i]);
+      sp_pool_put(victims[i]);
     }
     if (victims != victims_stack) free(victims);
     #undef PROXY_PD_EVICT_GATHER_N

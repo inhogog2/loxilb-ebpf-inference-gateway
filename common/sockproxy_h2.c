@@ -466,6 +466,7 @@ h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
    * (response complete, client reset, session teardown), so this is the
    * release that always runs. Idempotent with the refusal path. */
   fc_permit_release(&stream->fc);
+  fc_permit_unbind(&stream->fc);
   backend_h2_session_t *bridge, *bridge_tmp;
   HASH_ITER(hh,session->backend_sessions,bridge,bridge_tmp) {
     if (!bridge->bridge_h1) continue;
@@ -510,6 +511,10 @@ h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   // Remove from hash table
   HASH_DEL(session->streams, stream);
   session->active_stream_count--;
+
+  /* After every settle read of it (destroy_stream settles before this, and a
+   * teardown collects its settles before freeing the streams). */
+  sp_pool_hold(&stream->route_epv, NULL);
 
   // Free stream structure
   free(stream);
@@ -727,8 +732,8 @@ proxy_h2_on_header_callback(nghttp2_session *session,
     }
   }
   
-  proxy_map_ent_t *mcp_head = pfe->head;
-  if (mcp_head && mcp_head->val.ephash && mcp_head->val.ephash->mcp_stateless) {
+  proxy_epval_t *mcp_pool0 = sp_pool_first(pfe->head);
+  if (mcp_pool0 && mcp_pool0->mcp_stateless) {
     if (stream->response_sent) return 0;
     /* These operands are used for selection, while the original HPACK fields
      * are forwarded. Never select from a truncated prefix of the request. */
@@ -905,8 +910,8 @@ proxy_h2_on_data_chunk_recv_callback(nghttp2_session *session,
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   
-  proxy_map_ent_t *mcp_head = pfe->head;
-  if (mcp_head && mcp_head->val.ephash && mcp_head->val.ephash->mcp_stateless) {
+  proxy_epval_t *mcp_pool0 = sp_pool_first(pfe->head);
+  if (mcp_pool0 && mcp_pool0->mcp_stateless) {
     if (stream->response_sent) return 0;
     if (len > SP_MCP_PROXY_BODY_MAX - stream->data_len) {
       proxy_h2_send_ai_deny(pfe, stream, 413, 0, 0, "mcp_body_too_large",
@@ -2241,7 +2246,7 @@ static backend_h2_session_t *h2_h1_session_new(proxy_h2_session_t *client,int sl
 {
   backend_h2_session_t *bs=calloc(1,sizeof(*bs));if (!bs) return NULL;
   bs->bridge_h1=1;bs->backend_fd=fd;bs->slot=slot;bs->ep_idx=ep;
-  bs->epv=epv;bs->client_session=client;bs->ssl=ssl;bs->connected=1;
+  sp_pool_hold(&bs->epv,epv);bs->client_session=client;bs->ssl=ssl;bs->connected=1;
   pthread_mutex_init(&bs->send_lock,NULL);
   llhttp_settings_init(&bs->bridge_settings);
   bs->bridge_settings.on_message_begin=h2_h1_begin;
@@ -2388,7 +2393,7 @@ proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
   backend_session->backend_fd = backend_fd;
   backend_session->slot = slot;
   backend_session->ep_idx = ep_idx;
-  backend_session->epv = epv;
+  sp_pool_hold(&backend_session->epv, epv);
   backend_session->client_session = client_session;
   backend_session->ssl = ssl;
   backend_session->connected = 1;
@@ -2399,6 +2404,7 @@ proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
   if (rv != 0) {
     log_error("[HTTP/2 Backend] ep[%d]: nghttp2_session_callbacks_new failed: %s",
               ep_idx, nghttp2_strerror(rv));
+    sp_pool_hold(&backend_session->epv, NULL);
     free(backend_session);
     return NULL;
   }
@@ -2421,6 +2427,7 @@ proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
     log_error("[HTTP/2 Backend] ep[%d]: nghttp2_session_client_new failed: %s",
               ep_idx, nghttp2_strerror(rv));
     pthread_mutex_destroy(&backend_session->send_lock);
+    sp_pool_hold(&backend_session->epv, NULL);
     free(backend_session);
     return NULL;
   }
@@ -2811,6 +2818,7 @@ proxy_h2_backend_session_destroy(backend_h2_session_t *backend_session)
    * failure paths in proxy_h2_forward_to_backend are the only places where no
    * pfe ever took ownership, and each closes the fd itself. */
   pthread_mutex_destroy(&backend_session->send_lock);
+  sp_pool_hold(&backend_session->epv, NULL);
   free(backend_session);
 }
 
@@ -3359,9 +3367,8 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   char body[512];
   int blen;
 
-  proxy_map_ent_t *mcp_ent=pfe ? pfe->head:NULL;
-  if (mcp_ent && mcp_ent->val.ephash &&
-      mcp_ent->val.ephash->mcp_stateless && error_code &&
+  proxy_epval_t *mcp_pool0=pfe ? sp_pool_first(pfe->head):NULL;
+  if (mcp_pool0 && mcp_pool0->mcp_stateless && error_code &&
       !strncmp(error_code,"mcp_",4)) {
     size_t len=0;
     char *denial=sp_mcp_error_json(NULL,status_code,(const char *)stream->data_buf,stream->data_len,&len);
@@ -4293,7 +4300,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   }
   
   ent = (proxy_map_ent_t *)pfe->head;
-  if (ent->val.ephash && ent->val.ephash->mcp_stateless &&
+  proxy_epval_t *ent_pool0 = sp_pool_first(ent);  /* the listener's first pool, read once */
+  if (ent_pool0 && ent_pool0->mcp_stateless &&
       sp_mcp_h2_gate(pfe,stream,ent)) return 0; /* this stream was refused */
 
   /* Mandatory security admission is the first service-dependent decision on
@@ -4314,14 +4322,14 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     extract_model_field((const char *)stream->data_buf, stream->data_len,
                         body_model, sizeof(body_model));
 
-  if (ent->val.ephash) {
+  if (ent_pool0) {
     /* The service identity feeds the QoS ladder (rule-scope defaults and
      * the keyless per-VIP bucket) — an AI-gateway concern. Withhold it on
      * non-AI rules so a plain H2 service with an undeclared policy never
      * pays a per-request ladder probe it paid nothing for before (H1 runs
      * its whole gate only on ai_gw_mode connections). */
     char adm_svc_ident[64] = "";
-    if (ent->val.ephash->ai_gw_mode)
+    if (ent_pool0->ai_gw_mode)
       ai_gw_svc_ident(ent->key.xip, ent->key.xport,
                       adm_svc_ident, sizeof(adm_svc_ident));
 
@@ -4342,7 +4350,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .api_key = stream->x_api_key_raw,
       .bearer = stream->bearer_raw,
       .bearer_oversize = stream->bearer_oversize,
-      .jwt_profile = ent->val.ephash->jwt_auth_profile,
+      .jwt_profile = ent_pool0->jwt_auth_profile,
       .body = (const char *)stream->data_buf,
       .body_len = stream->data_len,
       .prefix_model = body_model,
@@ -4350,7 +4358,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .class_on = ai_gw_class_on(),
       .objective_hint = stream->obj_hint.name,
       .objective_strict_of = sp_resv_objective_strict_of,
-      .auth_mode = ent->val.ephash->apikey_auth,
+      .auth_mode = ent_pool0->apikey_auth,
       .default_tokens_of = sp_resv_default_tokens_of,
       .default_tokens_arg = &adm_route,
       .svc_ident = adm_svc_ident,
@@ -4379,7 +4387,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       /* Served, but neither authenticated nor attributable to a tenant —
        * report it exactly as the H1 gate does, and only for AI-gateway
        * rules (H1 runs its gate only on ai_gw_mode connections). */
-      if (ent->val.ephash->ai_gw_mode) {
+      if (ent_pool0->ai_gw_mode) {
         char um_vip[INET6_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &ent->key.xip, um_vip, sizeof(um_vip));
         llb_ai_record_unmetered(um_vip);
@@ -4436,8 +4444,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       stream->auth_fwd_identity =
         (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
       stream->auth_jwt_capable =
-        (ent->val.ephash->apikey_auth == 3 ||
-         ent->val.ephash->apikey_auth == 4) ? 1 : 0;
+        (ent_pool0->apikey_auth == 3 ||
+         ent_pool0->apikey_auth == 4) ? 1 : 0;
       stream->auth_netid_fwd = adm.net_forward_identity ? 1 : 0;
       if (adm.res_epoch != 0) {
         stream->usage_reserved_toks = adm.reserved_toks;
@@ -4854,9 +4862,11 @@ h2_have_tepval:
     h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
     return 0;
   }
-  pfe->epv = tepval;
+  sp_pool_hold(&pfe->epv, tepval);
   pfe->ep_num = ep_idx;
-  stream->route_epv = tepval;
+  /* The stream's own reference: pfe->epv moves to the next stream's pool,
+   * and the settle reads this one when the stream ends. */
+  sp_pool_hold(&stream->route_epv, tepval);
 
   // Store conversation mapping if this is first request
   if (stream->has_conv_id && stream->conversation_id[0] != '\0') {
@@ -4883,7 +4893,7 @@ h2_have_tepval:
    * pool A. rfd[]/rfd_ent[] therefore hold SLOTS: reuse requires the
    * registered backend pfe to match BOTH the pool (epv) and the
    * pool-relative endpoint index; a miss allocates the first free slot. */
-  int bridge_h1=ent->val.ephash && ent->val.ephash->mcp_stateless && ent->val.backend_protocol_cap==0;
+  int bridge_h1=ent_pool0 && ent_pool0->mcp_stateless && ent->val.backend_protocol_cap==0;
   int slot = -1;
   for (int i = 0; i < pfe->n_rfd && i < MAX_PROXY_EP; i++) {
     proxy_fd_ent_t *bpfe = pfe->rfd_ent[i];
@@ -5092,7 +5102,7 @@ h2_have_tepval:
     backend_pfe->head = ent;                  // Link to proxy_map_ent_t
     backend_pfe->protocol_version = 2;        // HTTP/2
     backend_pfe->ep_num = ep_idx;             // Endpoint index INSIDE its pool —
-    backend_pfe->epv = tepval;                // with epv this pair IS the slot's
+    sp_pool_hold(&backend_pfe->epv, tepval);  // with epv this pair IS the slot's
                                               // reuse identity (see slot search)
     backend_pfe->load_units_per_stream = 1;   // units live on the mappings, not here
     backend_pfe->stype = PROXY_SOCK_ACTIVE;   // Active connection
@@ -5195,7 +5205,7 @@ h2_have_tepval:
    * forwarding the secret is never an acceptable fallback. */
   nghttp2_nv *security_headers_nv = NULL;
   int security_headers_built = 0;
-  uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
+  uint8_t security_policy = ent_pool0 ? ent_pool0->apikey_auth : 0;
   int hygiene_jwt = stream->ai_admitted && stream->auth_jwt_capable;
   /* The same declaration closes the response direction: see the final
    * response in proxy_h2_backend_on_frame_recv_callback. */

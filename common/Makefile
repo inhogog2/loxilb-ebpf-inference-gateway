@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -176,7 +176,13 @@ sockproxy_hold.o: sockproxy_hold.c sockproxy_hold.h sockproxy_hold_core.h sockpr
 sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-notify.o: notify.c notify.h
+notify.o: notify.c notify.h sockproxy_qsbr.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_qsbr.o: sockproxy_qsbr.c sockproxy_qsbr.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_pool.o: sockproxy_pool.c sockproxy_pool.h sockproxy_qsbr.h sockproxy.h sockproxy_fc.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 picohttpparser.o: picohttpparser.c picohttpparser.h
@@ -533,6 +539,33 @@ test_pfe_clear: test_pfe_clear.c sockproxy_pfe_clear.h sockproxy.h
 test_pfec: test_pfe_clear
 	./test_pfe_clear
 
+# The lifetime of a pool and the grace period it is freed after
+# (sockproxy_pool.h, sockproxy_qsbr.h). Run under ASan + UBSan and under TSan.
+POOL_REF_SRCS = test_pool_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+test_pool_ref: $(POOL_REF_SRCS) sockproxy_pool.h sockproxy_qsbr.h sockproxy_fc.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(POOL_REF_SRCS) -I. -lpthread
+
+test_pool_ref_tsan: $(POOL_REF_SRCS) sockproxy_pool.h sockproxy_qsbr.h sockproxy_fc.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $(POOL_REF_SRCS) -I. -lpthread
+
+.PHONY: test_poolref
+test_poolref: test_pool_ref test_pool_ref_tsan
+	./test_pool_ref
+	./test_pool_ref_tsan
+
+# An HTTP/2 stream holds the pool it was routed to until the REAL stream free
+# (sockproxy_h2.c, through proxy_h2_cleanup_session) gives it back. Linked like
+# test_h2_inject: --gc-sections keeps only what that teardown reaches.
+H2RREF_SRCS = test_h2_route_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+test_h2_route_ref: $(H2RREF_SRCS) sockproxy_h2_gc.o sockproxy_pool.h sockproxy_h2.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ $(H2RREF_SRCS) sockproxy_h2_gc.o -I. \
+		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2rref
+test_h2rref: test_h2_route_ref
+	./test_h2_route_ref
+
 # Phase 87-01 (FIX-1/2/3/4): P/D streaming-completion connection-leak unit.
 # Standalone — includes only the pure sockproxy_pd_leak.h helpers (no sockproxy.c
 # machinery). -fsanitize=address detects over-reads in the bounded detector and
@@ -645,8 +678,8 @@ test_pd_cache: test_pd_cache_aware
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
 	$(CC) -Wall -Wextra -DTEST_KV_EXACT -o $@ $< -I. -lssl -lcrypto
 
-test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h
-	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c -I.
+test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c
+	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c -I. -lpthread
 
 # Conversation stickiness may not cross model pools on one VIP:port -- the
 # (pool, endpoint-in-pool) identity rule for ent->val.conv_map. Header-only.
@@ -841,8 +874,8 @@ test_l7tr: test_l7trust
 # What a listener puts on the wire and what it attributes: the emitted header
 # ops, the origin recorded on the request, and the entry point an operator's
 # trusted ranges arrive through. Links the policy unit and stubs its callouts.
-test_l7origin: test_l7origin.c sockproxy_l7policy.o sockproxy_l7trust.h
-	$(CC) -Wall -Wextra -o $@ test_l7origin.c sockproxy_l7policy.o \
+test_l7origin: test_l7origin.c sockproxy_l7policy.o sockproxy_pool.o sockproxy_qsbr.o sockproxy_fc.o sockproxy_l7trust.h
+	$(CC) -Wall -Wextra -o $@ test_l7origin.c sockproxy_l7policy.o sockproxy_pool.o sockproxy_qsbr.o sockproxy_fc.o \
 		-I. -I../headers -lcrypto -lpthread
 
 .PHONY: test_l7or
@@ -851,16 +884,16 @@ test_l7or: test_l7origin
 
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.
-test_notify_shard: test_notify_shard.c notify.c log.c notify.h
-	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c log.c -I. -lpthread
+test_notify_shard: test_notify_shard.c notify.c sockproxy_qsbr.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c sockproxy_qsbr.c log.c -I. -lpthread
 
 # The relay shards wait with epoll: dispatch contract + per-event cost vs idle fds.
-test_notify_epoll: test_notify_epoll.c notify.c log.c notify.h
-	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c log.c -I. -lpthread
+test_notify_epoll: test_notify_epoll.c notify.c sockproxy_qsbr.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c sockproxy_qsbr.c log.c -I. -lpthread
 
 # Notifier throughput vs relay worker count (sizing LLB_PROXY_WORKERS); not a test.
-bench_notify_scale: bench_notify_scale.c notify.c log.c notify.h
-	$(CC) -O2 -Wall -Wextra -Werror -o $@ bench_notify_scale.c notify.c log.c -I. -lpthread
+bench_notify_scale: bench_notify_scale.c notify.c sockproxy_qsbr.c log.c notify.h
+	$(CC) -O2 -Wall -Wextra -Werror -o $@ bench_notify_scale.c notify.c sockproxy_qsbr.c log.c -I. -lpthread
 
 .PHONY: test_shard
 test_shard: test_notify_shard test_notify_epoll
@@ -908,7 +941,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

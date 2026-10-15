@@ -462,6 +462,15 @@ fc_has_room(const fc_state_t *fc)
 }
 
 void fc_permit_init(fc_permit_t *p);
+/* The owner's reference for each permit that points at a state: taken when a
+ * permit is bound to it, given back when the permit is unbound (the sockproxy
+ * counts its pool this way; a released permit stays bound, it is read after
+ * its release). Set once at start. While set, a permit must start from
+ * zeroed memory: a bind reads the state the permit pointed at before. */
+void fc_set_owner_hooks(void (*hold)(fc_state_t *fc), void (*drop)(fc_state_t *fc));
+/* Unbind the permit from its state without touching its units: what the
+ * permit's owner runs before the permit's memory goes or is reused. */
+void fc_permit_unbind(fc_permit_t *p);
 
 /* ---- tenant share ----------------------------------------------------------- */
 
