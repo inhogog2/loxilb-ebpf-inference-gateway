@@ -76,6 +76,15 @@ void sp_pool_put(struct proxy_epval *p);
  * Nothing when the field already points at p. p NULL clears the field. */
 void sp_pool_hold(void **holder, struct proxy_epval *p);
 
+/* A holder slot read by a thread that does not own it (the drain checker,
+ * under PROXY_LOCK): one relaxed load, and only that value is used. The
+ * owner stores the slot through sp_pool_hold. */
+static inline struct proxy_epval *
+sp_pool_holder_peek(void *const *holder)
+{
+  return (struct proxy_epval *)__atomic_load_n(holder, __ATOMIC_RELAXED);
+}
+
 /* What a connection's shell gives back when it is recycled: its epv, its
  * learn_epv and its capacity permit's pool. */
 struct proxy_fd_ent;

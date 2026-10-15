@@ -1112,8 +1112,8 @@ check_draining_endpoints(void)
             pfe->pd_phase_start_ts > 0) {
           time_t elapsed = now - pfe->pd_phase_start_ts;
           uint32_t timeout = pd_prefill_timeout_default(); /* 30s, env-overridable */
-          if (pfe->epv) {
-            proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+          if (epv) {
             if (epv->pd_prefill_timeout_sec > 0) {
               timeout = epv->pd_prefill_timeout_sec;
             }
@@ -1179,8 +1179,8 @@ check_draining_endpoints(void)
                  pfe->pd_decode_content_length == 0) {
           time_t dec_elapsed = now - pfe->pd_phase_start_ts;
           uint32_t dec_timeout = pd_prefill_timeout_default();
-          if (pfe->epv) {
-            proxy_epval_t *dec_epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *dec_epv = sp_pool_holder_peek(&pfe->epv);
+          if (dec_epv) {
             if (dec_epv->pd_prefill_timeout_sec > 0) {
               dec_timeout = dec_epv->pd_prefill_timeout_sec;
             }
@@ -1311,8 +1311,8 @@ check_draining_endpoints(void)
              * pd_parked_lock; pd_parked_remove_fd is FIFO-order-safe. The fd may have
              * already been popped by a dequeue whose wake then failed — remove_fd then
              * simply returns "not found", which is fine. */
-            if (pfe->epv && pfe->park_ep_idx >= 0) {
-              proxy_epval_t *pev = (proxy_epval_t *)pfe->epv;
+            proxy_epval_t *pev = sp_pool_holder_peek(&pfe->epv);
+            if (pev && pfe->park_ep_idx >= 0) {
               if (pfe->park_ep_idx < pev->n_eps) {
                 pthread_mutex_lock(&pev->pd_parked_lock);
                 pd_parked_remove_fd(&pev->pd_parked[pfe->park_ep_idx], pfe->fd,
@@ -1443,8 +1443,8 @@ check_draining_endpoints(void)
         proxy_fd_ent_t *pfe_next = pfe->next;
 
         uint32_t decode_idle_cap = PROXY_PD_DECODE_IDLE_CAP_SEC;
-        if (pfe->epv) {
-          proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+        proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+        if (epv) {
           if (epv->pd_decode_idle_cap_sec > 0) {
             decode_idle_cap = epv->pd_decode_idle_cap_sec;
           }
@@ -1529,8 +1529,8 @@ check_draining_endpoints(void)
           }
           time_t elapsed = now - basis;
           uint32_t timeout = 120; /* default 120s decode-stream SILENCE */
-          if (pfe->epv) {
-            proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+          if (epv) {
             if (epv->pd_decode_timeout_sec > 0) {
               timeout = epv->pd_decode_timeout_sec;
             }
@@ -1575,8 +1575,8 @@ check_draining_endpoints(void)
           uint32_t prefill_to = 30;  /* mirrors default */
           uint32_t decode_to = 120;  /* mirrors default */
           uint32_t idle_cap = 0;
-          if (pfe->epv) {
-            proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+          if (epv) {
             if (epv->pd_prefill_timeout_sec > 0) {
               prefill_to = epv->pd_prefill_timeout_sec;
             }

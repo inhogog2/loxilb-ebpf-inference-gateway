@@ -193,7 +193,9 @@ sp_pool_hold(void **holder, proxy_epval_t *p)
   if (old == p)
     return;
   sp_pool_get(p);
-  *holder = p;
+  /* Relaxed: the drain checker reads the slot from its own thread
+   * (sp_pool_holder_peek); the put below orders this store. */
+  __atomic_store_n(holder, (void *)p, __ATOMIC_RELAXED);
   sp_pool_put(old);
 }
 
