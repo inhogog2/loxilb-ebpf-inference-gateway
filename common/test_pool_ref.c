@@ -285,6 +285,53 @@ test_unbind_once_across_threads(void)
   CHECK(live() == base, "and the pool is freed once");
 }
 
+/* The drain checker reads a connection's holder slot from its own thread
+ * while the owner re-holds it. Under TSan a plain store into the slot is a
+ * reported race: this test fails the TSan build when sp_pool_hold or the
+ * reader stops using atomic accesses. */
+static void *peek_slot;
+static _Atomic int peek_stop;
+static proxy_epval_t *peek_pools[2];
+
+static void *
+peek_reader(void *arg)
+{
+  long *odd = arg;
+
+  while (!atomic_load_explicit(&peek_stop, memory_order_acquire)) {
+    proxy_epval_t *seen = sp_pool_holder_peek(&peek_slot);
+
+    if (seen && seen != peek_pools[0] && seen != peek_pools[1])
+      (*odd)++;
+  }
+  return NULL;
+}
+
+static void
+test_peek_across_threads(void)
+{
+  proxy_map_ent_t ent = { 0 };
+  uint64_t base = live();
+  pthread_t r;
+  long odd = 0;
+  int i;
+
+  peek_pools[0] = add_pool(&ent, "k0.example");
+  peek_pools[1] = add_pool(&ent, "k1.example");
+  atomic_store(&peek_stop, 0);
+  pthread_create(&r, NULL, peek_reader, &odd);
+  for (i = 0; i < 200000; i++)
+    sp_pool_hold(&peek_slot, i % 3 == 2 ? NULL : peek_pools[i & 1]);
+  atomic_store_explicit(&peek_stop, 1, memory_order_release);
+  pthread_join(r, NULL);
+  CHECK(odd == 0, "a peek of a slot being re-held sees one of its pools or nothing (%ld odd)", odd);
+  sp_pool_hold(&peek_slot, NULL);
+  del_pool(&ent, peek_pools[0]);
+  del_pool(&ent, peek_pools[1]);
+  drain();
+  CHECK(live() == base, "both pools freed after the peeks");
+}
+
 static void
 test_scratch_is_not_counted(void)
 {
@@ -537,6 +584,7 @@ main(void)
   test_each_holder_alone();
   test_overwrite_and_rebind();
   test_unbind_once_across_threads();
+  test_peek_across_threads();
   test_scratch_is_not_counted();
   test_index();
 
