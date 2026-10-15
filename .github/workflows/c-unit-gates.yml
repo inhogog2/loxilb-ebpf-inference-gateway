@@ -42,8 +42,19 @@ jobs:
           ./common/test_model_routing
           gcc -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer \
             -o /tmp/test_model_routing_sanitized common/test_model_routing.c \
-            common/sockproxy_routing.c -Icommon
+            common/sockproxy_routing.c common/sockproxy_pool.c common/sockproxy_qsbr.c \
+            common/sockproxy_fc.c common/log.c -Icommon -lpthread
           ASAN_OPTIONS=detect_leaks=1 /tmp/test_model_routing_sanitized
+
+      # The runner kernel's 32-bit mmap randomisation leaves no room for
+      # ThreadSanitizer's shadow layout ("unexpected memory mapping").
+      - name: Pool lifetime (holders, grace period, index, permits; ASan + UBSan and TSan)
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          make -C common test_poolref
+
+      - name: An HTTP/2 stream gives its pool back on the real stream free (ASan + UBSan)
+        run: make -C common test_h2rref
 
       - name: Modern MCP validation, framing, relay and selection (sanitizers)
         run: make -C common test_mcp

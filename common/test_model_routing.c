@@ -225,6 +225,8 @@ test_default_reservation_is_the_routed_pools(void)
   assert(sp_resv_default_tokens_route(NULL, "inference.example", "/", "model-on") == 0);
 
   HASH_CLEAR(hh, service.val.ephash);
+  /* As the last delete does: an empty index retires the published one. */
+  assert(sp_pool_index_publish(&service) == 0);
 }
 
 int
