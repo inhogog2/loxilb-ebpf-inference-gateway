@@ -5043,7 +5043,7 @@ h2_have_tepval:
       }
     } else {
       static int rr_counter = 0;
-      int counter_val = rr_counter++;
+      int counter_val = __atomic_fetch_add(&rr_counter, 1, __ATOMIC_RELAXED);
       ep_idx = (counter_val % tepval->n_eps);
     }
   }
