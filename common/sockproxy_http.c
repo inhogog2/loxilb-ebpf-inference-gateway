@@ -55,6 +55,7 @@
 #include "sockproxy_in_ifindex.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
+#include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
@@ -10336,10 +10337,6 @@ handle_resp_message_complete(llhttp_t *parser)
  * still owed one. Observation only: nothing here changes what is relayed, and
  * no caller consults the counters yet.
  * ------------------------------------------------------------------------- */
-static llhttp_settings_t cresp_settings;   /* one for every connection */
-static int cresp_settings_inited;
-static llhttp_settings_t creq_settings;
-static int creq_settings_inited;
 
 /* The HEAD queue, written by both of a connection's workers: the client's when a
  * request is framed, the backend's when the matching response's headers are.
@@ -10476,20 +10473,24 @@ creq_on_headers_complete(llhttp_t *parser)
 }
 
 static void
+creq_settings_fill(llhttp_settings_t *s)
+{
+  s->on_message_begin = creq_on_message_begin;
+  s->on_header_field = creq_on_header_field;
+  s->on_header_field_complete = creq_on_header_field_complete;
+  s->on_header_value = creq_on_header_value;
+  s->on_header_value_complete = creq_on_header_value_complete;
+  s->on_headers_complete = creq_on_headers_complete;
+  s->on_message_complete = creq_on_message_complete;
+}
+
+/* One for every connection, filled once before the first parser uses it. */
+SP_PARSER_SETTINGS_ONCE(creq, creq_settings_fill)
+
+static void
 creq_parser_init(proxy_fd_ent_t *pfe)
 {
-  if (!creq_settings_inited) {
-    llhttp_settings_init(&creq_settings);
-    creq_settings.on_message_begin = creq_on_message_begin;
-    creq_settings.on_header_field = creq_on_header_field;
-    creq_settings.on_header_field_complete = creq_on_header_field_complete;
-    creq_settings.on_header_value = creq_on_header_value;
-    creq_settings.on_header_value_complete = creq_on_header_value_complete;
-    creq_settings.on_headers_complete = creq_on_headers_complete;
-    creq_settings.on_message_complete = creq_on_message_complete;
-    creq_settings_inited = 1;
-  }
-  llhttp_init(&pfe->creq_parser, HTTP_REQUEST, &creq_settings);
+  llhttp_init(&pfe->creq_parser, HTTP_REQUEST, creq_settings_get());
   pfe->creq_parser.data = pfe;
   pfe->creq_parser_inited = 1;
   creq_block_reset(&pfe->creq_blk);
@@ -10685,22 +10686,28 @@ cresp_note_local_answer(proxy_fd_ent_t *client)
   atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
 }
 
+static void
+cresp_settings_fill(llhttp_settings_t *s)
+{
+  s->on_message_begin = cresp_on_message_begin;
+  s->on_header_field = cresp_on_field;
+  s->on_header_value = cresp_on_value;
+  s->on_header_value_complete = cresp_on_value_done;
+  s->on_body = cresp_on_body;
+  s->on_headers_complete = cresp_on_headers_complete;
+  s->on_message_complete = cresp_on_message_complete;
+}
+
+/* One for every connection, filled once before the first parser uses it: the
+ * entry lock held here is per connection and does not order two workers'
+ * first connections. */
+SP_PARSER_SETTINGS_ONCE(cresp, cresp_settings_fill)
+
 /* Initialises the client entry's response framer. Called with the entry locked. */
 static void
 cresp_parser_init(proxy_fd_ent_t *pfe)
 {
-  if (!cresp_settings_inited) {
-    llhttp_settings_init(&cresp_settings);
-    cresp_settings.on_message_begin = cresp_on_message_begin;
-    cresp_settings.on_header_field = cresp_on_field;
-    cresp_settings.on_header_value = cresp_on_value;
-    cresp_settings.on_header_value_complete = cresp_on_value_done;
-    cresp_settings.on_body = cresp_on_body;
-    cresp_settings.on_headers_complete = cresp_on_headers_complete;
-    cresp_settings.on_message_complete = cresp_on_message_complete;
-    cresp_settings_inited = 1;
-  }
-  llhttp_init(&pfe->cresp_parser, HTTP_RESPONSE, &cresp_settings);
+  llhttp_init(&pfe->cresp_parser, HTTP_RESPONSE, cresp_settings_get());
   creq_block_reset(&pfe->cresp_blk);
   pfe->cresp_parser.data = pfe;
   pfe->cresp_parser_inited = 1;

@@ -517,6 +517,22 @@ test_hdrdl: test_hdr_deadline test_hdr_deadline_tsan
 	./test_hdr_deadline
 	./test_hdr_deadline_tsan
 
+# llhttp settings shared by every connection are filled once: two threads
+# first-use them together and each parses a complete response and request
+# (ASan + UBSan), and the shared settings are not a data race (TSan).
+PONCE_SRCS = test_parser_once.c llhttp.c httpapi.c http.c
+test_parser_once: $(PONCE_SRCS) sockproxy_parser_once.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-o $@ $(PONCE_SRCS) -I. -pthread
+
+test_parser_once_tsan: $(PONCE_SRCS) sockproxy_parser_once.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $(PONCE_SRCS) -I. -pthread
+
+.PHONY: test_ponce
+test_ponce: test_parser_once test_parser_once_tsan
+	./test_parser_once
+	./test_parser_once_tsan
+
 # connectionLimit on a fullproxy listener: the accept-time ceiling. Standalone
 # — includes only the pure sockproxy_fe_limit.h.
 test_fe_limit: sockproxy_fe_limit_test.c sockproxy_fe_limit.h
@@ -1044,7 +1060,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
