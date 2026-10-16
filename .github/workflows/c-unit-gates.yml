@@ -65,6 +65,9 @@ jobs:
       - name: One HTTP/2 backend leg ending answers only its own streams (ASan + UBSan)
         run: make -C common test_h2leg
 
+      - name: Nothing reads an HTTP/2 stream after an answer that may have freed it (ASan + UBSan, gateway object included)
+        run: make -C common test_h2deny
+
       - name: A half-closed HTTP/2 client is never held (ASan + UBSan)
         run: make -C common test_h2hold
 

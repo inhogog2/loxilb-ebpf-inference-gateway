@@ -3469,8 +3469,6 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     fc_count(&tepval->fc, FC_R_DRAINING);
   else if (v == FC_TENANT_SHARE)
     fc_count(&tepval->fc, FC_R_TENANT_SHARE);
-  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
-                              limit, v == FC_DRAINING ? 5 : 1);
   ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
                              stream->svc_ident, stream->effective_model,
                              stream->tenant_id, stream->auth_key_id,
@@ -3489,6 +3487,10 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
            stream->stream_id, status, code, role, inflight, limit,
            stream->tenant_id, stream->effective_model);
   fc_permit_release(&stream->fc);
+  /* Last: with the request complete, the answer ends the stream and frees
+   * it before the send returns, so everything above reads it first. */
+  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
+                              limit, v == FC_DRAINING ? 5 : 1);
 }
 
 /* 0 = proceed; -1 = refused, terminal response framed on the stream. */
@@ -4503,6 +4505,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     return -1;
   }
   pfe->h2_last_req_ms = proxy_mono_ms();   /* for the connection's end line */
+
+  /* An answer sent from here (a deny, an L7 reject or redirect) can end the
+   * stream at once when the client has already sent all of its request:
+   * nghttp2's close callback frees it before the send returns. Whatever is
+   * logged after such an answer reads the id from here, never the stream. */
+  const int32_t stream_id = stream->stream_id;
   
   ent = (proxy_map_ent_t *)pfe->head;
   /* The streams of a connection share it: a route the last one's FORWARD
@@ -4620,12 +4628,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       if (adm.net_identity[0])
         log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s net_identity=%s",
-                 stream->stream_id, adm.http_status, adm.stage,
+                 stream_id, adm.http_status, adm.stage,
                  adm.error_code, adm.key_id, adm.tenant_id, adm.net_identity);
       else
         log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s",
-                 stream->stream_id, adm.http_status, adm.stage,
+                 stream_id, adm.http_status, adm.stage,
                  adm.error_code, adm.key_id, adm.tenant_id);
       return 0;
     } else {
@@ -4752,7 +4760,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     // diagnostic ( H1/H2 parity): make the H2 L7 decision visible
     // in loxilbdp.log so a FORWARD-with-no-pool vs a no-match-REJECT is debuggable.
     log_debug("[HTTP/2][L7] stream=%d host='%s' path='%s' rc=%d tepval=%p",
-              stream->stream_id, pfe->host_url, pfe->request_path,
+              stream_id, pfe->host_url, pfe->request_path,
               l7_rc, (void *)l7_tepval);
 
     pfe->h2_session->l7_active_stream_id = 0;  // clear after dispatch
@@ -4808,11 +4816,12 @@ h2_have_tepval:
      * for which no pool exists gets a clean 503, not a bare RST — the
      * client can tell "model unavailable" from a transport failure. */
     if (lookup_model[0] && pfe && pfe->h2_session && pfe->h2_session->session) {
+      /* Logged first: lookup_model may point into the stream. */
+      log_info("[MODEL_ROUTING][HTTP/2] 503 for model='%s' stream=%d",
+               lookup_model, stream_id);
       proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0,
                             "model_unavailable",
                             "no backend pool for this model");
-      log_info("[MODEL_ROUTING][HTTP/2] 503 sent for model='%s' stream=%d",
-               lookup_model, stream->stream_id);
       return 0;
     }
 
