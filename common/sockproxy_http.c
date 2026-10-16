@@ -8606,6 +8606,10 @@ handle_on_message_begin(llhttp_t* parser)
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
     pfe->http_hdrs_done = 0;   /* request N+1's header block starts here */
+    /* ... and so does its header clock. On request 1 the read path armed
+     * it at the first byte already. */
+    if (!sp_hdr_armed(&pfe->l7_hdr))
+      proxy_hdr_arm(pfe, time(NULL), -1);
     pfe->mcp_retry_pending = 0;
     pfe->mcp_retry_excluded = 0;
     /* Request N may have left an unsettled claim (no countable usage came
@@ -9703,6 +9707,8 @@ handle_on_headers_complete(llhttp_t* parser)
    * it. http_hok cannot stand in for it: it flips on the first "Host:" name,
    * which is the first line every HTTP/1.1 client -- and every slowloris --
    * sends. */
+  if (pfe->odir == 0)
+    sp_hdr_disarm(&pfe->l7_hdr);   /* the block is complete, whatever the parse returns */
   pfe->http_hdrs_done = 1;
   if (sp_mcp_enabled(pfe)) return sp_mcp_h1_headers(pfe, parser);
   return 0;                          /* 0: parse the body that follows */
@@ -12839,7 +12845,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         pfe->rcv_off += rc;
 
         /* Header-completion deadline (slowloris guard), every listener.
-         * Anchor at the first byte of the in-progress request, then drop the
+         * Anchor at the first byte of the in-progress request (never on a
+         * body read: the block is complete; request N+1's clock starts in
+         * handle_on_message_begin), then drop the
          * connection if the listener's deadline elapses before http_hok
          * flips. The \r\n\r\n terminator is reflected by pfe->http_hok after
          * llhttp_execute below; the deadline is evaluated here, before
@@ -12850,7 +12858,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
           int64_t hdr_age;
           if (!sp_hdr_armed(&pfe->l7_hdr)) {
-            proxy_hdr_arm(pfe, time(NULL), -1);  /* at the first partial-header byte */
+            if (!pfe->http_hdrs_done)
+              proxy_hdr_arm(pfe, time(NULL), -1);  /* at the first partial-header byte */
           } else if (!pfe->http_hdrs_done &&
                      proxy_hdr_deadline_expired(hent, pfe, time(NULL), &hdr_age)) {
             sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; teardown follows */

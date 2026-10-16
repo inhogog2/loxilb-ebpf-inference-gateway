@@ -1022,7 +1022,10 @@ check_draining_endpoints(void)
    * path evaluates the deadline only when a byte arrives, so a connection
    * that opened, sent part of its request headers and went silent would keep
    * its fd, epoll slot and buffers until the idle deadline, which only counts
-   * from an armed last_activity. Same deadline, evaluated on the clock. */
+   * from an armed last_activity. Same deadline, evaluated on the clock.
+   * The clock is armed only while a header block is open, on HTTP/1.1 and
+   * HTTP/2 alike, and it is published for this thread: it is all this pass
+   * reads of the connection's protocol state. */
   {
     proxy_map_ent_t *hd_node = proxy_struct->head;
     while (hd_node) {
@@ -1032,7 +1035,6 @@ check_draining_endpoints(void)
         proxy_fd_ent_t *pfe_next = pfe->next;
         int64_t hdr_age;
         if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
-            (pfe->h2_session || !pfe->http_hdrs_done) &&
             proxy_hdr_deadline_expired(hd_node, pfe, now, &hdr_age)) {
           atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
           log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
