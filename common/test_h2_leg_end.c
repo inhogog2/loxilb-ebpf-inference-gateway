@@ -22,6 +22,7 @@
  *
  * Build: make test_h2leg (ASan + UBSan).
  */
+#include <arpa/inet.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -329,7 +330,12 @@ main(void)
     proxy_epval_t *pool = sp_pool_alloc();
 
     assert(leg && bs && pool);
+    pool->n_eps = 3;
+    pool->eps[2].xip = htonl(0x0a000205);   /* 10.0.2.5 */
+    pool->eps[2].xport = htons(8002);
     proxy_h2_backend_leg_init(leg, 77, NULL, &ent, 2, pool, bs);
+    CHECK(leg->leg_ep_xip == htonl(0x0a000205) && leg->leg_ep_xport == htons(8002),
+          "and keeps its endpoint's address from creation, for the client's end line");
     CHECK(leg->pd_decode_ep_idx == -1,
           "a new leg holds no decode unit (pd_decode_ep_idx %d)", leg->pd_decode_ep_idx);
     CHECK(leg->pd_prefill_ep_idx == -1,

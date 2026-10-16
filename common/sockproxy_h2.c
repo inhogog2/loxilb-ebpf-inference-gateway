@@ -3660,9 +3660,13 @@ h2_client_end_claim(proxy_fd_ent_t *pfe, int reason, int err,
 
     pfe->h2_end_leg_fd = leg->fd;
     pfe->h2_end_leg_ep = leg->ep_num;
-    /* The leg's socket is still open here: name its endpoint now. */
-    if (leg->fd > 0 && getpeername(leg->fd, (struct sockaddr *)&sa, &sl) == 0 &&
-        sa.sin_family == AF_INET) {
+    /* An HTTP/2 leg kept its endpoint from creation; any other leg is named
+     * from its socket, while that is still connected. */
+    if (leg->leg_ep_xip) {
+      pfe->h2_end_leg_ip = leg->leg_ep_xip;
+      pfe->h2_end_leg_port = ntohs(leg->leg_ep_xport);
+    } else if (leg->fd > 0 && getpeername(leg->fd, (struct sockaddr *)&sa, &sl) == 0 &&
+               sa.sin_family == AF_INET) {
       pfe->h2_end_leg_ip = sa.sin_addr.s_addr;
       pfe->h2_end_leg_port = ntohs(sa.sin_port);
     }
@@ -3758,6 +3762,10 @@ proxy_h2_backend_leg_init(proxy_fd_ent_t *bpfe, int fd, void *ssl,
   bpfe->stype = PROXY_SOCK_ACTIVE;    // Active connection
   bpfe->used = 1;                     // Mark as in use
   bpfe->backend_h2_session = bs;      // For event handler lookup
+  if (tepval && ep_idx >= 0 && ep_idx < tepval->n_eps) {
+    bpfe->leg_ep_xip = tepval->eps[ep_idx].xip;      // the endpoint, for the
+    bpfe->leg_ep_xport = tepval->eps[ep_idx].xport;  // client's end line
+  }
 }
 
 /* See sockproxy_h2.h. */

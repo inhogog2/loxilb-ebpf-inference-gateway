@@ -185,6 +185,23 @@ main(void)
   CHECK(has("xff=extended trusted_ranges=1"), "the last request's X-Forwarded-For decision");
   drop(c);
 
+  /* An HTTP/2 leg names its endpoint from creation, even once its socket
+   * is gone (a reset leg: getpeername fails). */
+  {
+    proxy_fd_ent_t gone = { 0 };
+    c = h2_client(cfds[0]);
+    gone.fd = -1;
+    gone.odir = 1;
+    gone.ep_num = 1;
+    gone.leg_ep_xip = htonl(0x0a000105);   /* 10.0.1.5 */
+    gone.leg_ep_xport = htons(8001);
+    proxy_h2_client_end_mark(c, SP_H2_END_LEG, 0, &gone);
+    proxy_h2_client_end_log(c);
+    CHECK(has("leg_fd=-1 leg_ep=1 leg_endpoint=10.0.1.5:8001"),
+          "a leg whose socket is gone is still named by its endpoint: %s", last_line);
+    drop(c);
+  }
+
   /* Nothing is recorded for a backend leg (even one carrying an HTTP/2
    * session) or an HTTP/1.1 connection. */
   {

@@ -1286,6 +1286,11 @@ struct proxy_fd_ent {
   uint32_t h2_end_leg_ip;          // the leg's endpoint, network order
   uint16_t h2_end_leg_port;        // host order
   uint64_t h2_last_req_ms;         // monotonic ms the last stream was forwarded
+  /* An HTTP/2 backend leg's endpoint as it was connected (network order),
+   * kept from creation so a client's end line can name it after the leg's
+   * socket has gone (getpeername fails on a reset or closed socket). */
+  uint32_t leg_ep_xip;
+  uint16_t leg_ep_xport;
   /* SP_H2_END_HDR_DEADLINE only: which check fired (SP_HDR_CHECK_*), the
    * header block's age, the deadline it outlived and the stream that armed
    * it (the end line adds the session's last processed stream). */
