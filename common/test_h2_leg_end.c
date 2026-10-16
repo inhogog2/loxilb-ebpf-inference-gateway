@@ -33,6 +33,7 @@
 #include "sockproxy.h"
 #include "sockproxy_h2.h"
 #include "sockproxy_pool.h"
+#include "sockproxy_qsbr.h"
 
 static int checks, failures;
 
@@ -318,6 +319,31 @@ main(void)
 
   /* A leg whose client has gone is not answered from. */
   CHECK(proxy_h2_backend_leg_end(legA) == 0, "a detached leg is no HTTP/2 leg any more");
+
+  /* A new leg takes its pool and no P/D unit: from the allocator's zeroed
+   * shell, both P/D indices must be cleared, or its teardown (pd_cleanup,
+   * which runs for any entry holding a pool) releases endpoint 0's units. */
+  {
+    proxy_fd_ent_t *leg = calloc(1, sizeof(*leg));
+    backend_h2_session_t *bs = calloc(1, sizeof(*bs));
+    proxy_epval_t *pool = sp_pool_alloc();
+
+    assert(leg && bs && pool);
+    proxy_h2_backend_leg_init(leg, 77, NULL, &ent, 2, pool, bs);
+    CHECK(leg->pd_decode_ep_idx == -1,
+          "a new leg holds no decode unit (pd_decode_ep_idx %d)", leg->pd_decode_ep_idx);
+    CHECK(leg->pd_prefill_ep_idx == -1,
+          "a new leg holds no prefill unit (pd_prefill_ep_idx %d)", leg->pd_prefill_ep_idx);
+    CHECK(leg->epv == pool && leg->ep_num == 2 && leg->odir == 1 &&
+          leg->backend_h2_session == bs,
+          "and keeps its pool and endpoint as its slot identity");
+    sp_pool_hold(&leg->epv, NULL);
+    sp_pool_unlinked(pool);   /* never linked: the allocation's own reference */
+    for (int i = 0; i < 16 && sp_qsbr_pending(); i++)
+      sp_qsbr_run_ready();
+    free(bs);
+    free(leg);
+  }
 
   proxy_h2_cleanup_session(client);   /* frees sess and its server session */
   nghttp2_session_del(cl);

@@ -3732,6 +3732,33 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
 }
 
 /* See sockproxy_h2.h. */
+void
+proxy_h2_backend_leg_init(proxy_fd_ent_t *bpfe, int fd, void *ssl,
+                          proxy_map_ent_t *ent, int ep_idx,
+                          proxy_epval_t *tepval, backend_h2_session_t *bs)
+{
+  bpfe->fd = fd;
+  bpfe->ssl = ssl;
+  bpfe->odir = 1;                     // Backend direction (outbound from proxy)
+  bpfe->head = ent;                   // Link to proxy_map_ent_t
+  bpfe->protocol_version = 2;         // HTTP/2
+  bpfe->ep_num = ep_idx;              // Endpoint index INSIDE its pool —
+  sp_pool_hold(&bpfe->epv, tepval);   // with epv this pair IS the slot's
+                                      // reuse identity (see slot search)
+  /* The leg takes no P/D unit of its own. It holds a pool, so its teardown
+   * runs the P/D release (pd_cleanup), which releases on any index >= 0:
+   * left at the allocator's 0 it handed back endpoint 0's prefill and decode
+   * units and woke a request parked on it. The HTTP/1.1 leg clears the same
+   * index (and holds no pool). */
+  bpfe->pd_prefill_ep_idx = -1;
+  bpfe->pd_decode_ep_idx = -1;
+  bpfe->load_units_per_stream = 1;    // units live on the mappings, not here
+  bpfe->stype = PROXY_SOCK_ACTIVE;    // Active connection
+  bpfe->used = 1;                     // Mark as in use
+  bpfe->backend_h2_session = bs;      // For event handler lookup
+}
+
+/* See sockproxy_h2.h. */
 int
 proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe)
 {
@@ -5298,19 +5325,8 @@ h2_have_tepval:
       return -1;
     }
     
-    // Setup backend pfe metadata (same pattern as HTTP/1.1)
-    backend_pfe->fd = backend_fd;
-    backend_pfe->ssl = backend_ssl;
-    backend_pfe->odir = 1;                    // Backend direction (outbound from proxy)
-    backend_pfe->head = ent;                  // Link to proxy_map_ent_t
-    backend_pfe->protocol_version = 2;        // HTTP/2
-    backend_pfe->ep_num = ep_idx;             // Endpoint index INSIDE its pool —
-    sp_pool_hold(&backend_pfe->epv, tepval);  // with epv this pair IS the slot's
-                                              // reuse identity (see slot search)
-    backend_pfe->load_units_per_stream = 1;   // units live on the mappings, not here
-    backend_pfe->stype = PROXY_SOCK_ACTIVE;   // Active connection
-    backend_pfe->used = 1;                    // Mark as in use
-    backend_pfe->backend_h2_session = backend_session;  // For event handler lookup
+    proxy_h2_backend_leg_init(backend_pfe, backend_fd, backend_ssl, ent, ep_idx,
+                              tepval, backend_session);
     
     // Link backend pfe to client pfe (bidirectional)
     pfe->rfd_ent[slot] = backend_pfe;

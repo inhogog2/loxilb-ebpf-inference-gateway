@@ -26,6 +26,8 @@
 // Forward declarations
 struct proxy_fd_ent;
 typedef struct proxy_fd_ent proxy_fd_ent_t;
+struct proxy_map_ent;
+struct proxy_epval;
 
 struct proxy_h2_session;
 typedef struct proxy_h2_session proxy_h2_session_t;
@@ -431,6 +433,11 @@ int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe, int clean_eof);
  * other legs and streams go on. Call with nothing held, before the leg's
  * teardown takes PROXY_LOCK. Returns 1 when pfe was such a leg. */
 int proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe);
+/* A new HTTP/2 backend leg's own fields, before it is linked to its client.
+ * It takes the pool (the slot's reuse identity) and no P/D unit. */
+void proxy_h2_backend_leg_init(proxy_fd_ent_t *bpfe, int fd, void *ssl,
+                               struct proxy_map_ent *ent, int ep_idx,
+                               struct proxy_epval *tepval, backend_h2_session_t *bs);
 /* Pure C detach of one backend leg (bridge or HTTP/2) from its HTTP/2
  * client, so the leg's teardown does not cascade to the client; called under
  * PROXY_LOCK before backend pair teardown. */
