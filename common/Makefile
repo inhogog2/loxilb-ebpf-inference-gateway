@@ -596,6 +596,30 @@ test_h2_leg_end: $(H2LEG_SRCS) sockproxy_h2_gc.o sockproxy_pool.h sockproxy_h2.h
 test_h2leg: test_h2_leg_end
 	./test_h2_leg_end
 
+# A half-closed HTTP/2 client is never held, and one of its legs ending leaves
+# no mark on it (sockproxy_hold.c). Linked with --gc-sections and the event
+# loop stubbed in the test.
+test_h2_hold: test_h2_hold.c sockproxy_hold.c sockproxy_hold.h sockproxy_hold_core.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ test_h2_hold.c sockproxy_hold.c log.c -I. \
+		-Wl,--gc-sections -lpthread
+
+.PHONY: test_h2hold
+test_h2hold: test_h2_hold
+	./test_h2_hold
+
+# An endpoint's force-close frees HTTP/1.1 pairs and hands every HTTP/2 entry
+# to its own worker (sockproxy_health.c). Linked with --gc-sections, the
+# teardown primitives recorded in the test.
+test_force_close: test_force_close.c sockproxy_health.c sockproxy_health.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ test_force_close.c log.c -I. \
+		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_forceclose
+test_forceclose: test_force_close
+	./test_force_close
+
 # Phase 87-01 (FIX-1/2/3/4): P/D streaming-completion connection-leak unit.
 # Standalone — includes only the pure sockproxy_pd_leak.h helpers (no sockproxy.c
 # machinery). -fsanitize=address detects over-reads in the bounded detector and
@@ -988,7 +1012,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

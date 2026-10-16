@@ -5992,7 +5992,18 @@ proxy_pdestroy(void *priv)
       is_listener = 1;
       fd_ent = ent->val.fdlist;
       while (fd_ent) {
-        if (fd_ent->odir == 0) {
+        if (fd_ent->odir == 0 && fd_ent->h2_session &&
+            fd_ent->fd != ent->val.main_fd) {
+          /* An HTTP/2 client is ended by its own worker, which walks its
+           * session with no lock held: the hangup hands it its full teardown
+           * (settles, session, legs) there. sched_free keeps the rule until
+           * the last connection is gone. Recorded first: the owner sees only
+           * the hangup. */
+          proxy_h2_client_end_mark(fd_ent, SP_H2_END_LISTENER, 0, NULL);
+          if (fd_ent->fd > 0) {
+            shutdown(fd_ent->fd, SHUT_RDWR);
+          }
+        } else if (fd_ent->odir == 0) {
           /* Settle this connection's claims BEFORE anything frees them. The
            * rule is going away and it does take the endpoint pools with it —
            * but the token bucket is per-TENANT and outlives the rule, so a

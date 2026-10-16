@@ -65,6 +65,12 @@ jobs:
       - name: One HTTP/2 backend leg ending answers only its own streams (ASan + UBSan)
         run: make -C common test_h2leg
 
+      - name: A half-closed HTTP/2 client is never held (ASan + UBSan)
+        run: make -C common test_h2hold
+
+      - name: An endpoint force-close hands HTTP/2 connections to their worker (ASan + UBSan)
+        run: make -C common test_forceclose
+
       - name: An L7 FORWARD route selects within the listener's pool (ASan + UBSan and TSan)
         run: make -C common test_l7route
 
