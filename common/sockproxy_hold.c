@@ -151,7 +151,11 @@ sp_client_eof_keep(proxy_fd_ent_t *pfe)
   proxy_epval_t *epv;
   uint64_t now;
 
-  if (!pfe || pfe->odir != 0) {
+  /* The hold follows HTTP/1.1 framing: one answer owed on one leg. An
+   * HTTP/2 client carries its streams on several legs at once, and a
+   * connection that switched to HTTP/2 after an HTTP/1.1 request still
+   * carries that request's counts, so it is never held. */
+  if (!pfe || pfe->odir != 0 || pfe->h2_session) {
     return 0;
   }
 
@@ -326,7 +330,8 @@ sp_hold_leg_ended(proxy_fd_ent_t *c, proxy_fd_ent_t *be)
    * makes it stale (sp_hold_leg_ended_now) - whichever path attaches the leg
    * that serves it. Only a leg the client still links leaves a mark: one it
    * let go earlier and torn down late does not speak for its successor. */
-  if (!c || c->odir != 0 || !be) {
+  /* One of an HTTP/2 client's legs ending says nothing about the others. */
+  if (!c || c->odir != 0 || !be || c->h2_session) {
     return;
   }
   for (i = 0; i < MAX_PROXY_EP; i++) {
