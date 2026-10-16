@@ -5624,6 +5624,9 @@ proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
       if (abandon_leg_wants_reset(pfe->odir, fd_ent->odir, fd_ent->read_paused)) {
         abandon_leg_arm_reset(fd_ent->fd);
       }
+      /* A leg's teardown takes its client with it: say which leg. */
+      if (pfe->odir)
+        proxy_h2_client_end_mark(fd_ent, SP_H2_END_LEG, 0, pfe);
       proxy_release_fd_ctx(fd_ent, 0);
       notify_delete_ent(proxy_struct->ns, fd_ent->fd, 1);
       pfe->rfd_ent[i] = NULL;
@@ -5927,7 +5930,15 @@ proxy_pdestroy(void *priv)
 
   /* A client reset that arrived while its reads were paused or disarmed is
    * visible only here, as the socket's pending error. */
-  sp_hold_peer_error(pfe, hc_client_reset_check(pfe));
+  {
+    int peer_err = hc_client_reset_check(pfe);
+
+    sp_hold_peer_error(pfe, peer_err);
+    /* Reading the pending error clears it: it is the HTTP/2 end's cause
+     * when nothing else recorded one. */
+    if (peer_err)
+      proxy_h2_client_end_mark(pfe, SP_H2_END_CLIENT_ERROR, peer_err, NULL);
+  }
 
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
@@ -5988,6 +5999,8 @@ proxy_pdestroy(void *priv)
            * the streams the collector reads. */
           proxy_collect_conn_settles(fd_ent, &settles, TEARDOWN_LISTENER);
           if (fd_ent->h2_session) {
+            proxy_h2_client_end_mark(fd_ent, SP_H2_END_LISTENER, 0, NULL);
+            proxy_h2_client_end_log(fd_ent);
             proxy_h2_cleanup_session(fd_ent);
           }
           proxy_release_rfd_ctx(fd_ent);
@@ -6414,6 +6427,7 @@ proxy_pdestroy(void *priv)
      * backend pfes and are closed exactly once, by each pfe's own teardown.
      * The streams it frees were settled by the collector above. */
     if (!is_listener && pfe->odir == 0 && pfe->h2_session) {
+      proxy_h2_client_end_log(pfe);
       proxy_h2_cleanup_session(pfe);
     }
 
@@ -12636,6 +12650,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       return -1;
     }
 
+    if (rc <= 0 && !pfe->odir && pfe->h2_session)
+      proxy_h2_client_end_mark(pfe, rc == 0 ? SP_H2_END_CLIENT_EOF : SP_H2_END_CLIENT_ERROR,
+                               rc == 0 ? 0 : saved_errno, NULL);
     errno = saved_errno;  // Restore errno before error checking
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -12678,6 +12695,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL))) {
             pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            proxy_h2_client_end_mark(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL);
             log_debug("[TCP_INSPECT] fd=%d (h2): header-completion deadline %ums exceeded "
                      "(slowloris guard) — dropping connection", fd,
                      proxy_hdr_deadline_ms(h2ent));
@@ -12686,6 +12704,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
 
         if (proxy_h2_handle_client_data(pfe) < 0) {
+          proxy_h2_client_end_mark(pfe, SP_H2_END_SESSION_ERROR, 0, NULL);
           log_error("[HTTP/2] fd=%d: Failed to handle client data", fd);
           return -1; // Restart
         }
@@ -12833,6 +12852,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                      proxy_hdr_deadline_expired(hent, pfe, time(NULL))) {
             pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            proxy_h2_client_end_mark(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL);
             log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
                      "(slowloris guard) — dropping connection", fd,
                      proxy_hdr_deadline_ms(hent));
@@ -12866,6 +12886,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               pfe->parsed_off = 0;
               llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
               if (proxy_h2_handle_client_data(pfe) < 0) {
+                proxy_h2_client_end_mark(pfe, SP_H2_END_SESSION_ERROR, 0, NULL);
                 log_error("[HTTP/2] fd=%d: Failed to handle client data", fd);
                 return -1; // Restart
               }

@@ -26,6 +26,28 @@
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
+
+/* Why an HTTP/2 client connection ended (proxy_fd_ent.h2_end_reason). */
+enum {
+  SP_H2_END_UNRECORDED = 0,  /* no site recorded one: the log adds SO_ERROR */
+  SP_H2_END_CLIENT_EOF,      /* the client closed its side */
+  SP_H2_END_CLIENT_ERROR,    /* reading from the client failed (errno) */
+  SP_H2_END_SESSION_ERROR,   /* the HTTP/2 session failed (frames, send) */
+  SP_H2_END_HDR_DEADLINE,    /* a header block outlived the header deadline */
+  SP_H2_END_IDLE,            /* idle timeout */
+  SP_H2_END_LEG,             /* a backend leg's teardown took the client */
+  SP_H2_END_LISTENER,        /* the rule's listener was deleted */
+  SP_H2_END_TEARDOWN,        /* an endpoint teardown or force-close */
+  SP_H2_END_DEFERRED,        /* a deferred close finished */
+  SP_H2_END_REAPER,          /* the P/D reaper ended an unanswered request */
+};
+
+/* The last request's X-Forwarded-For (proxy_fd_ent.l7_xff_verdict). */
+enum {
+  SP_XFF_NONE = 0,           /* no L7 policy, or no valid peer address */
+  SP_XFF_REPLACED,           /* the inbound chain replaced with the peer */
+  SP_XFF_EXTENDED,           /* the inbound chain extended with the peer */
+};
 typedef struct proxy_h2_session proxy_h2_session_t;
 
 // Forward declaration for proxy_arg (defined later, needed for proxy_map_ent)
@@ -1242,6 +1264,20 @@ struct proxy_fd_ent {
   void *learn_epv;
   proxy_h2_session_t *h2_session;  // HTTP/2 session context (NULL for HTTP/1.1)
   void *backend_h2_session;        // Backend HTTP/2 session (for backend connections only)
+  /* Why an HTTP/2 client connection ended, for the one line its teardown
+   * logs (proxy_h2_client_end_log): the first cause recorded wins. The leg
+   * fields name the backend connection that caused it, for SP_H2_END_LEG.
+   * The last request's time and its X-Forwarded-For decision are kept for
+   * the same line. Stores only; nothing is logged per request. */
+  uint8_t h2_end_reason;           // SP_H2_END_*
+  uint8_t l7_xff_verdict;          // SP_XFF_*: the last request's X-Forwarded-For
+  uint8_t l7_xff_ntrusted;         // trusted ranges the listener had for it
+  int h2_end_leg_fd;
+  int h2_end_leg_ep;
+  int h2_end_errno;
+  uint32_t h2_end_leg_ip;          // the leg's endpoint, network order
+  uint16_t h2_end_leg_port;        // host order
+  uint64_t h2_last_req_ms;         // monotonic ms the last stream was forwarded
   uint64_t nrb;
   uint64_t nrp;
   uint64_t ntb;
@@ -2310,6 +2346,18 @@ int proxy_sockmap_drop_accel(struct proxy_ent *key);
 
 /* Deferred teardown bookkeeping (see proxy_fd_ent_t.defer_close_ms). */
 uint64_t proxy_mono_ms(void);
+
+/* Record why an HTTP/2 client connection is ending (sockproxy_h2.c): the
+ * first cause wins; `err` is an errno or 0; `leg` is the backend connection
+ * that caused it, or NULL. A no-op for anything but an HTTP/2 client. */
+void proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
+                              const proxy_fd_ent_t *leg);
+/* The one line an HTTP/2 client connection's teardown logs (sockproxy_h2.c):
+ * the recorded cause, the leg and its endpoint, the time since the last
+ * request, the open streams and the last request's X-Forwarded-For. Info
+ * when the client left, at the idle timeout, or when a leg ended with no
+ * request in flight; a warning otherwise. */
+void proxy_h2_client_end_log(proxy_fd_ent_t *pfe);
 void proxy_defer_close_mark(proxy_fd_ent_t *pfe);
 void proxy_defer_close_clear(proxy_fd_ent_t *pfe);
 int proxy_defer_close_pending(void);

@@ -3575,6 +3575,89 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
   return answered;
 }
 
+void
+proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
+                         const proxy_fd_ent_t *leg)
+{
+  uint8_t none = SP_H2_END_UNRECORDED;
+
+  if (!pfe || pfe->odir != 0 || !pfe->h2_session)
+    return;
+  /* Workers and the health thread both record causes, under no common
+   * lock: the first to claim the reason writes the rest. */
+  if (!__atomic_compare_exchange_n(&pfe->h2_end_reason, &none, (uint8_t)reason, 0,
+                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+    return;
+  pfe->h2_end_errno = err;
+  pfe->h2_end_leg_fd = -1;
+  pfe->h2_end_leg_ep = -1;
+  if (leg) {
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof(sa);
+
+    pfe->h2_end_leg_fd = leg->fd;
+    pfe->h2_end_leg_ep = leg->ep_num;
+    /* The leg's socket is still open here: name its endpoint now. */
+    if (leg->fd > 0 && getpeername(leg->fd, (struct sockaddr *)&sa, &sl) == 0 &&
+        sa.sin_family == AF_INET) {
+      pfe->h2_end_leg_ip = sa.sin_addr.s_addr;
+      pfe->h2_end_leg_port = ntohs(sa.sin_port);
+    }
+  }
+}
+
+void
+proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
+{
+  static const char *const reasons[] = {
+    "unrecorded", "client_eof", "client_error", "session_error",
+    "header_deadline", "idle_timeout", "backend_leg_ended",
+    "listener_deleted", "endpoint_teardown", "deferred_close", "reaper",
+  };
+  static const char *const xff[] = { "none", "replaced", "extended" };
+  proxy_h2_session_t *s;
+  unsigned int r;
+  int err;
+  char leg_ip[INET_ADDRSTRLEN] = "-";
+  long long ago_ms = -1;
+
+  if (!pfe || pfe->odir != 0 || !(s = pfe->h2_session))
+    return;
+  r = __atomic_load_n(&pfe->h2_end_reason, __ATOMIC_RELAXED);
+  if (r >= sizeof(reasons) / sizeof(reasons[0]))
+    r = 0;
+  err = pfe->h2_end_errno;
+  if (r == SP_H2_END_UNRECORDED && pfe->fd > 0) {
+    socklen_t el = sizeof(err);
+    if (getsockopt(pfe->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0)
+      err = errno;
+  }
+  if (pfe->h2_end_leg_ip)
+    inet_ntop(AF_INET, &pfe->h2_end_leg_ip, leg_ip, sizeof(leg_ip));
+  if (pfe->h2_last_req_ms)
+    ago_ms = (long long)(proxy_mono_ms() - pfe->h2_last_req_ms);
+
+#define H2_END_FMT "[HTTP/2] client connection ended: reason=%s fd=%d peer=%s " \
+  "open_streams=%d last_request_ms_ago=%lld leg_fd=%d leg_ep=%d leg_endpoint=%s:%u " \
+  "errno=%d xff=%s trusted_ranges=%u"
+#define H2_END_ARGS reasons[r], pfe->fd, pfe->l7_peer_ip[0] ? pfe->l7_peer_ip : "-", \
+  s->active_stream_count, ago_ms, \
+  r == SP_H2_END_LEG ? pfe->h2_end_leg_fd : -1, r == SP_H2_END_LEG ? pfe->h2_end_leg_ep : -1, \
+  leg_ip, (unsigned)pfe->h2_end_leg_port, err, \
+  xff[pfe->l7_xff_verdict <= SP_XFF_EXTENDED ? pfe->l7_xff_verdict : 0], \
+  (unsigned)pfe->l7_xff_ntrusted
+  /* The client leaving, and an end the gateway chose on schedule, are
+   * ordinary: info. An end that took requests with it, or came from an
+   * error, is a warning. */
+  if (r == SP_H2_END_CLIENT_EOF || r == SP_H2_END_IDLE ||
+      (r == SP_H2_END_LEG && s->active_stream_count == 0))
+    log_info(H2_END_FMT, H2_END_ARGS);
+  else
+    log_warn(H2_END_FMT, H2_END_ARGS);
+#undef H2_END_FMT
+#undef H2_END_ARGS
+}
+
 /**
  * Cleanup HTTP/2 session and all streams
  *
@@ -4300,6 +4383,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     log_error("[HTTP/2] Invalid parameters for forward_to_backend");
     return -1;
   }
+  pfe->h2_last_req_ms = proxy_mono_ms();   /* for the connection's end line */
   
   ent = (proxy_map_ent_t *)pfe->head;
   /* The streams of a connection share it: a route the last one's FORWARD

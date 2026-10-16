@@ -901,6 +901,8 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
    * Each value is validated (the peer IP / scheme are loxilb-derived and
    * well-formed, but validate anyway as defence-in-depth — a malformed one is
    * dropped, never spliced). */
+  pfe->l7_xff_verdict = SP_XFF_NONE;
+  pfe->l7_xff_ntrusted = 0;
   if (xff_ip && l7_hdr_value_valid(xff_ip)) {
     char chain[L7_HDR_VALUE_MAX];
     uint8_t n_trusted;
@@ -913,13 +915,17 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
     n_trusted = ent->l7_n_trusted_ranges;
     PROXY_UNLOCK();
 
+    pfe->l7_xff_ntrusted = n_trusted;
     if (n_trusted > 0 &&
         l7_chain_append_peer(scope ? scope->hops : NULL, xff_ip,
                              chain, sizeof(chain)) > 0 &&
-        l7_hdr_value_valid(chain))
+        l7_hdr_value_valid(chain)) {
+      pfe->l7_xff_verdict = SP_XFF_EXTENDED;
       emit(ctx, L7HDR_SET, "X-Forwarded-For", chain);
-    else
+    } else {
+      pfe->l7_xff_verdict = SP_XFF_REPLACED;
       emit(ctx, L7HDR_SET, "X-Forwarded-For", xff_ip);
+    }
   }
 
   snprintf(port_str, sizeof(port_str), "%u", (unsigned)listener_port);
