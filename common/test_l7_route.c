@@ -11,8 +11,10 @@
  *   - the selection over a route follows the pool's health as it is NOW, and
  *     the route's weights;
  *   - a policy replaced and detached while requests are dispatched on the
- *     listener, and while they read the route's cookie marker: no request
- *     reads a freed route (ASan, TSan).
+ *     listener, and while they read the route's cookie marker and run the
+ *     header filters (which read the listener's trusted ranges, rewritten
+ *     with the policy): no request reads a freed route or a range being
+ *     rewritten (ASan, TSan).
  *
  * Build (wired into `make test_l7route`): links the policy translation unit
  * and stubs what it calls out to, as test_l7origin does.
@@ -252,6 +254,12 @@ test_selection_follows_the_pool(void)
 
 static _Atomic int stop;
 
+static void
+emit_none(void *ctx, int op, const char *name, const char *value)
+{
+  (void)ctx; (void)op; (void)name; (void)value;
+}
+
 static void *
 dispatcher(void *arg)
 {
@@ -264,6 +272,16 @@ dispatcher(void *arg)
     /* The policy may change between the two reads: the marker is read for
      * the sanitizers, its value is either. */
     cookies += l7_cookie_persist_active(&pfe, &ent);
+    {
+      l7_hop_list_t hops;
+      char origin[L7_HOP_TEXT_MAX];
+      uint8_t skipped = 0;
+      l7_origin_scope_t scope = { &hops, origin, sizeof(origin), &skipped };
+
+      memset(&hops, 0, sizeof(hops));
+      l7_hop_list_from_xff("10.9.9.9, 10.1.2.3", &hops);
+      l7_apply_req_filters(&pfe, &ent, &scope, "10.1.2.3", 80, "http", emit_none, NULL);
+    }
     if (rc == L7_DISPATCH_FORWARD && out == pool && pfe.mcp_route_mask == 0x6)
       n[0]++;
     else if (rc == L7_DISPATCH_FALLTHROUGH)
@@ -290,7 +308,10 @@ test_replace_under_dispatch(void)
   for (int i = 0; i < 2; i++)
     pthread_create(&t[i], NULL, dispatcher, n[i]);
   for (int k = 0; k < 4000; k++) {
+    l7_trusted_range_t tr[2] = { { 0x0a010000u, 16 }, { 0x0a090000u, 16 } };
+
     proxy_attach_l7_policy(&ent.key, r, 8);
+    proxy_attach_l7_trusted_ranges(&ent.key, tr, 1 + (k & 1));
     if (k % 3 == 0)
       proxy_detach_l7_policy(&ent.key);
   }
@@ -298,7 +319,8 @@ test_replace_under_dispatch(void)
   for (int i = 0; i < 2; i++)
     pthread_join(t[i], NULL);
   CHECK(n[0][2] + n[1][2] == 0 && n[0][0] + n[1][0] > 0,
-        "4000 replaces and 1334 detaches under two dispatching threads: every "
+        "4000 replaces (trusted ranges rewritten with each) and 1334 detaches under two "
+        "dispatching threads: every "
         "decision is the policy's or no policy's (%ld forwards, %ld no policy)",
         n[0][0] + n[1][0], n[0][1] + n[1][1]);
   CHECK(n[0][3] + n[1][3] > 0, "and the route's cookie marker was read %ld times with it on",

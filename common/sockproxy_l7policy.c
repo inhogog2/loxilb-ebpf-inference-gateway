@@ -903,10 +903,17 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
    * dropped, never spliced). */
   if (xff_ip && l7_hdr_value_valid(xff_ip)) {
     char chain[L7_HDR_VALUE_MAX];
+    uint8_t n_trusted;
 
+    /* The trusted ranges ride the policy: an attach rewrites them and a
+     * detach clears them under the write lock, so they are read under the
+     * read lock, and nothing below it emits. */
+    PROXY_RDLOCK();
     l7_derive_origin(scope, ent, xff_ip);
+    n_trusted = ent->l7_n_trusted_ranges;
+    PROXY_UNLOCK();
 
-    if (ent->l7_n_trusted_ranges > 0 &&
+    if (n_trusted > 0 &&
         l7_chain_append_peer(scope ? scope->hops : NULL, xff_ip,
                              chain, sizeof(chain)) > 0 &&
         l7_hdr_value_valid(chain))
