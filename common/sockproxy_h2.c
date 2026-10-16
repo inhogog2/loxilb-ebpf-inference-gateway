@@ -610,10 +610,11 @@ proxy_h2_on_begin_headers_callback(nghttp2_session *session,
   proxy_fd_ent_t *pfe = (proxy_fd_ent_t *)user_data;
 
   (void)session;
-  (void)frame;
-  if (pfe && pfe->l7_hdr_accum_start == 0) {
-    pfe->l7_hdr_accum_start = time(NULL);
-  }
+  /* Header blocks are contiguous on a connection: one beginning means the
+   * last one ended, completed or reset. So every block starts its own clock,
+   * never inheriting the start of one that never reached END_HEADERS. */
+  if (pfe)
+    proxy_hdr_arm(pfe, time(NULL), frame->hd.stream_id);
   return 0;
 }
 
@@ -646,7 +647,7 @@ proxy_h2_on_frame_recv_callback(nghttp2_session *session,
       /* (H2 parity): a complete HEADERS frame arrived — clear the connection-level
        * header-accumulation anchor so the tcp_inspect deadline (checked in the H2 client-data
        * branch of proxy_run) no longer fires once real request headers have been received. */
-      pfe->l7_hdr_accum_start = 0;
+      sp_hdr_disarm(&pfe->l7_hdr);
       /* (H2 parity): arm the member-data idle baseline now that the request HEADERS are
        * complete and the request is about to be relayed to the member. Mirrors the H1 site in
        * sockproxy_http.c: the idle pass (sockproxy_health.c) only evaluates when last_activity>0, but
@@ -947,6 +948,12 @@ proxy_h2_on_stream_close_callback(nghttp2_session *session,
   }
   
   proxy_h2_session_t *h2_sess = pfe->h2_session;  
+
+  /* A stream reset inside its header block never reaches END_HEADERS: its
+   * clock stops with it, or it would charge the live requests after it. */
+  if (sp_hdr_armed(&pfe->l7_hdr) &&
+      __atomic_load_n(&pfe->l7_hdr.stream, __ATOMIC_RELAXED) == stream_id)
+    sp_hdr_disarm(&pfe->l7_hdr);
   
   // Find and destroy stream
   proxy_h2_stream_t *stream = find_stream(h2_sess, stream_id);
@@ -2884,8 +2891,8 @@ proxy_setup_h2_session(proxy_fd_ent_t *pfe, int is_client)
   pfe->h2_session->created_ts = time(NULL);
   /* A client session owes its first HEADERS within the header-completion
    * deadline, counted from the preface. Cleared on END_HEADERS. */
-  if (!is_client && pfe->l7_hdr_accum_start == 0) {
-    pfe->l7_hdr_accum_start = pfe->h2_session->created_ts;
+  if (!is_client && !sp_hdr_armed(&pfe->l7_hdr)) {
+    proxy_hdr_arm(pfe, pfe->h2_session->created_ts, 0);
   }
 
   // METRICS: Track HTTP/2 session creation (TIER 1, Metric #4)
@@ -3575,19 +3582,45 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
   return answered;
 }
 
+static int h2_client_end_claim(proxy_fd_ent_t *pfe, int reason, int err,
+                               const proxy_fd_ent_t *leg);
+
 void
 proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
                          const proxy_fd_ent_t *leg)
 {
+  (void)h2_client_end_claim(pfe, reason, err, leg);
+}
+
+void
+proxy_h2_client_end_mark_deadline(proxy_fd_ent_t *pfe, int check,
+                                  int64_t age_s, uint32_t deadline_ms)
+{
+  if (!h2_client_end_claim(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL))
+    return;
+  pfe->h2_end_hdr_check = (uint8_t)check;
+  pfe->h2_end_hdr_age_s = age_s;
+  pfe->h2_end_hdr_ms = deadline_ms;
+  /* The stream whose header block armed the clock (0: the preface). The
+   * session's last stream is read by the end line, on the connection's own
+   * worker: this may run on the health thread. */
+  pfe->h2_end_hdr_stream = __atomic_load_n(&pfe->l7_hdr.stream, __ATOMIC_RELAXED);
+}
+
+/* 1 when this call recorded the cause (and wrote the fields with it). */
+static int
+h2_client_end_claim(proxy_fd_ent_t *pfe, int reason, int err,
+                    const proxy_fd_ent_t *leg)
+{
   uint8_t none = SP_H2_END_UNRECORDED;
 
   if (!pfe || pfe->odir != 0 || !pfe->h2_session)
-    return;
+    return 0;
   /* Workers and the health thread both record causes, under no common
    * lock: the first to claim the reason writes the rest. */
   if (!__atomic_compare_exchange_n(&pfe->h2_end_reason, &none, (uint8_t)reason, 0,
                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-    return;
+    return 0;
   pfe->h2_end_errno = err;
   pfe->h2_end_leg_fd = -1;
   pfe->h2_end_leg_ep = -1;
@@ -3604,6 +3637,7 @@ proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
       pfe->h2_end_leg_port = ntohs(sa.sin_port);
     }
   }
+  return 1;
 }
 
 void
@@ -3615,7 +3649,10 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
     "listener_deleted", "endpoint_teardown", "deferred_close", "reaper",
   };
   static const char *const xff[] = { "none", "replaced", "extended" };
+  static const char *const hdr_checks[] = { "-", "h2_read", "h1_read", "clock" };
   proxy_h2_session_t *s;
+  unsigned int hc;
+  long long conn_age_s;
   unsigned int r;
   int err;
   char leg_ip[INET_ADDRSTRLEN] = "-";
@@ -3636,16 +3673,24 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
     inet_ntop(AF_INET, &pfe->h2_end_leg_ip, leg_ip, sizeof(leg_ip));
   if (pfe->h2_last_req_ms)
     ago_ms = (long long)(proxy_mono_ms() - pfe->h2_last_req_ms);
+  hc = r == SP_H2_END_HDR_DEADLINE ? pfe->h2_end_hdr_check : 0;
+  if (hc >= sizeof(hdr_checks) / sizeof(hdr_checks[0]))
+    hc = 0;
+  conn_age_s = s->created_ts ? (long long)(time(NULL) - s->created_ts) : -1;
 
 #define H2_END_FMT "[HTTP/2] client connection ended: reason=%s fd=%d peer=%s " \
   "open_streams=%d last_request_ms_ago=%lld leg_fd=%d leg_ep=%d leg_endpoint=%s:%u " \
-  "errno=%d xff=%s trusted_ranges=%u"
+  "errno=%d xff=%s trusted_ranges=%u conn_age_s=%lld hdr_check=%s hdr_age_s=%lld " \
+  "hdr_deadline_ms=%u hdr_stream=%d last_stream=%d"
 #define H2_END_ARGS reasons[r], pfe->fd, pfe->l7_peer_ip[0] ? pfe->l7_peer_ip : "-", \
   s->active_stream_count, ago_ms, \
   r == SP_H2_END_LEG ? pfe->h2_end_leg_fd : -1, r == SP_H2_END_LEG ? pfe->h2_end_leg_ep : -1, \
   leg_ip, (unsigned)pfe->h2_end_leg_port, err, \
   xff[pfe->l7_xff_verdict <= SP_XFF_EXTENDED ? pfe->l7_xff_verdict : 0], \
-  (unsigned)pfe->l7_xff_ntrusted
+  (unsigned)pfe->l7_xff_ntrusted, conn_age_s, hdr_checks[hc], \
+  hc ? (long long)pfe->h2_end_hdr_age_s : -1LL, hc ? pfe->h2_end_hdr_ms : 0u, \
+  hc ? pfe->h2_end_hdr_stream : -1, hc && s->session ? \
+  nghttp2_session_get_last_proc_stream_id(s->session) : -1
   /* The client leaving, and an end the gateway chose on schedule, are
    * ordinary: info. An end that took requests with it, or came from an
    * error, is a warning. */

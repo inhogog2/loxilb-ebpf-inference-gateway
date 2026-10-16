@@ -42,6 +42,14 @@ enum {
   SP_H2_END_REAPER,          /* the P/D reaper ended an unanswered request */
 };
 
+/* Which header-deadline check ended a connection (h2_end_hdr_check). */
+enum {
+  SP_HDR_CHECK_NONE = 0,
+  SP_HDR_CHECK_H2_READ,      /* the worker, reading an HTTP/2 connection */
+  SP_HDR_CHECK_H1_READ,      /* the worker, reading HTTP/1.1 headers */
+  SP_HDR_CHECK_CLOCK,        /* the 1 Hz health pass */
+};
+
 /* The last request's X-Forwarded-For (proxy_fd_ent.l7_xff_verdict). */
 enum {
   SP_XFF_NONE = 0,           /* no L7 policy, or no valid peer address */
@@ -1278,6 +1286,13 @@ struct proxy_fd_ent {
   uint32_t h2_end_leg_ip;          // the leg's endpoint, network order
   uint16_t h2_end_leg_port;        // host order
   uint64_t h2_last_req_ms;         // monotonic ms the last stream was forwarded
+  /* SP_H2_END_HDR_DEADLINE only: which check fired (SP_HDR_CHECK_*), the
+   * header block's age, the deadline it outlived and the stream that armed
+   * it (the end line adds the session's last processed stream). */
+  uint8_t h2_end_hdr_check;
+  int64_t h2_end_hdr_age_s;
+  uint32_t h2_end_hdr_ms;
+  int32_t h2_end_hdr_stream;       // the stream that armed it (0: the preface)
   uint64_t nrb;
   uint64_t nrp;
   uint64_t ntb;
@@ -1400,15 +1415,20 @@ struct proxy_fd_ent {
   // With l7_peer_ip it is the pair a binding is resolved against.
   int32_t  l7_in_ifindex;
 
-  // Header-completion deadline anchor (slowloris guard), every listener.
-  // HTTP/1.1: set on the first byte of a request's headers, cleared once
-  // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2: set
-  // when the session is created and when a header block begins, cleared on
-  // END_HEADERS, so it never bounds DATA, PING or WINDOW_UPDATE traffic on a
-  // live stream. While set, the read path and the 1 Hz health pass drop the
-  // connection once (now - anchor) exceeds the listener's deadline; the
-  // health pass is what catches a client that simply stops sending.
-  time_t l7_hdr_accum_start;    // anchor of the in-progress request headers (0=unset)
+  // Header-completion deadline clock (slowloris guard), every listener.
+  // HTTP/1.1: armed on the first byte of a request's headers, disarmed once
+  // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2:
+  // armed when the session is created (the first HEADERS is owed from the
+  // preface) and re-armed by every header block as it begins (a block is
+  // contiguous on the connection, so a new one means the last one ended);
+  // disarmed on END_HEADERS and when the stream that armed it closes, so it
+  // never bounds a request in flight, DATA, PING or the idle time between
+  // requests. While armed, the read path and the 1 Hz health pass end the
+  // connection once the block outlives the listener's deadline; the health
+  // pass is what catches a client that simply stops sending. Written by the
+  // connection's worker and read by the health pass: see sp_hdr_clock_t for
+  // how a start is published.
+  sp_hdr_clock_t l7_hdr;
 
   llm_prefix_key_t prefix_key;  // LLM prefix extraction (P0.2)
 
@@ -2268,19 +2288,23 @@ proxy_hdr_deadline_ms(const proxy_map_ent_t *ent)
   return sp_hdr_deadline_resolve_ms(configured);
 }
 
-/* True once a client connection has been accumulating request headers for
- * longer than its listener's deadline. The deadline is rounded up to whole
- * seconds, the resolution of the anchor and of the health pass. */
+/* True once a client connection's armed header block has outlived its
+ * listener's deadline. *age (when given) is the block's age in seconds, or
+ * -1 when nothing of this connection's is armed. */
 static inline int
 proxy_hdr_deadline_expired(const proxy_map_ent_t *ent,
-                           const proxy_fd_ent_t *pfe, time_t now)
+                           const proxy_fd_ent_t *pfe, time_t now, int64_t *age)
 {
-  uint32_t ms = proxy_hdr_deadline_ms(ent);
+  return sp_hdr_expired(&pfe->l7_hdr, (const uint64_t *)&pfe->gen, now,
+                        proxy_hdr_deadline_ms(ent), age);
+}
 
-  if (ms == 0 || pfe->l7_hdr_accum_start == 0) {
-    return 0;
-  }
-  return (now - pfe->l7_hdr_accum_start) > (time_t)((ms + 999) / 1000);
+/* Arm the header clock for this connection's generation; see sp_hdr_arm. */
+static inline void
+proxy_hdr_arm(proxy_fd_ent_t *pfe, time_t now, int32_t stream)
+{
+  sp_hdr_arm(&pfe->l7_hdr, now,
+             atomic_load_explicit(&pfe->gen, memory_order_relaxed), stream);
 }
 
 // Ensure structure doesn't exceed eBPF map limits (critical for kernel compatibility)
@@ -2352,6 +2376,10 @@ uint64_t proxy_mono_ms(void);
  * that caused it, or NULL. A no-op for anything but an HTTP/2 client. */
 void proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
                               const proxy_fd_ent_t *leg);
+/* proxy_h2_client_end_mark for the header deadline: also records which
+ * check fired, the header block's age and the deadline (SP_HDR_CHECK_*). */
+void proxy_h2_client_end_mark_deadline(proxy_fd_ent_t *pfe, int check,
+                                       int64_t age_s, uint32_t deadline_ms);
 /* The one line an HTTP/2 client connection's teardown logs (sockproxy_h2.c):
  * the recorded cause, the leg and its endpoint, the time since the last
  * request, the open streams and the last request's X-Forwarded-For. Info

@@ -15,7 +15,9 @@
  *   - the client leaving, the idle timeout and a leg that ended with no
  *     request in flight are info; every other end is a warning;
  *   - with no recorded cause the line carries the socket's pending error;
- *   - the last request's X-Forwarded-For decision and its age are in it.
+ *   - the last request's X-Forwarded-For decision and its age are in it;
+ *   - a header-deadline end names the check that fired, the header block's
+ *     age, the deadline and the connection's age.
  * Putting back any part of the old behaviour turns it red (mutation twins).
  *
  * Build: make test_h2end (ASan + UBSan).
@@ -32,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "uthash.h"
@@ -260,6 +263,27 @@ main(void)
     }
     CHECK(ok, "each gateway decision is a warning under its own name");
   }
+
+  /* The header deadline names the check that fired, the block's age, the
+   * deadline and the connection's age; other ends name none of it. */
+  c = h2_client(cfds[0]);
+  c->h2_session->created_ts = time(NULL) - 30;
+  c->l7_hdr.stream = 7;
+  proxy_h2_client_end_mark_deadline(c, SP_HDR_CHECK_CLOCK, 12, 10000);
+  proxy_h2_client_end_mark(c, SP_H2_END_CLIENT_EOF, 0, NULL);
+  proxy_h2_client_end_log(c);
+  CHECK(last_level == LOG_WARN && has("reason=header_deadline") &&
+        has("hdr_check=clock hdr_age_s=12 hdr_deadline_ms=10000 hdr_stream=7 last_stream=-1"),
+        "the deadline's check, block age and deadline: %s", last_line);
+  CHECK(has("conn_age_s=30 ") || has("conn_age_s=31 "), "and the connection's age");
+  drop(c);
+  c = h2_client(cfds[0]);
+  proxy_h2_client_end_mark(c, SP_H2_END_CLIENT_EOF, 0, NULL);
+  proxy_h2_client_end_mark_deadline(c, SP_HDR_CHECK_H2_READ, 12, 10000);
+  proxy_h2_client_end_log(c);
+  CHECK(has("reason=client_eof") && has("hdr_check=- hdr_age_s=-1 hdr_deadline_ms=0 hdr_stream=-1 last_stream=-1"),
+        "a deadline after another cause records nothing: %s", last_line);
+  drop(c);
 
   /* No recorded cause: the line says so and carries the socket's error. */
   {

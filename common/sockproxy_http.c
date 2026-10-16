@@ -12692,10 +12692,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
          * blocks, never the frames of a live stream. */
         {
           proxy_map_ent_t *h2ent = (proxy_map_ent_t *)pfe->head;
-          if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL))) {
-            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+          int64_t hdr_age;
+          if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL), &hdr_age)) {
+            sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
-            proxy_h2_client_end_mark(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL);
+            proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_H2_READ, hdr_age,
+                                              proxy_hdr_deadline_ms(h2ent));
             log_debug("[TCP_INSPECT] fd=%d (h2): header-completion deadline %ums exceeded "
                      "(slowloris guard) — dropping connection", fd,
                      proxy_hdr_deadline_ms(h2ent));
@@ -12846,13 +12848,15 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
          * stops sending altogether. */
         {
           proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
-          if (pfe->l7_hdr_accum_start == 0) {
-            pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
+          int64_t hdr_age;
+          if (!sp_hdr_armed(&pfe->l7_hdr)) {
+            proxy_hdr_arm(pfe, time(NULL), -1);  /* at the first partial-header byte */
           } else if (!pfe->http_hdrs_done &&
-                     proxy_hdr_deadline_expired(hent, pfe, time(NULL))) {
-            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+                     proxy_hdr_deadline_expired(hent, pfe, time(NULL), &hdr_age)) {
+            sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
-            proxy_h2_client_end_mark(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL);
+            proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_H1_READ, hdr_age,
+                                              proxy_hdr_deadline_ms(hent));
             log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
                      "(slowloris guard) — dropping connection", fd,
                      proxy_hdr_deadline_ms(hent));
@@ -12965,7 +12969,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
            * flips on the first "Host:" name, so a slowloris that sends "Host:" first
            * had its anchor cleared on its first partial read and was never dropped. */
           if (pfe->http_hdrs_done) {
-            pfe->l7_hdr_accum_start = 0;
+            sp_hdr_disarm(&pfe->l7_hdr);
             /* arm the member-data idle baseline. The request is now fully received and
              * about to be relayed to the member, so the timeoutMemberData deadline must start counting
              * "time waiting for the member to send data". The idle pass (sockproxy_health.c) only

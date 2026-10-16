@@ -1030,16 +1030,17 @@ check_draining_endpoints(void)
       proxy_fd_ent_t *pfe = hd_ms ? hd_node->val.fdlist : NULL;
       while (pfe) {
         proxy_fd_ent_t *pfe_next = pfe->next;
+        int64_t hdr_age;
         if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
-            pfe->l7_hdr_accum_start > 0 &&
             (pfe->h2_session || !pfe->http_hdrs_done) &&
-            proxy_hdr_deadline_expired(hd_node, pfe, now)) {
+            proxy_hdr_deadline_expired(hd_node, pfe, now, &hdr_age)) {
           atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
           log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
                    "with no further client bytes — dropping connection", pfe->fd, hd_ms);
-          proxy_h2_client_end_mark(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL);
+          /* Recorded before the hangup the worker will see. */
+          proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_CLOCK, hdr_age, hd_ms);
+          sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; the close event tears it down */
           shutdown(pfe->fd, SHUT_RDWR);
-          pfe->l7_hdr_accum_start = 0;   /* counted once; the close event tears it down */
         }
         pfe = pfe_next;
       }
