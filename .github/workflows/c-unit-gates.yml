@@ -68,6 +68,9 @@ jobs:
       - name: Nothing reads an HTTP/2 stream after an answer that may have freed it (ASan + UBSan, gateway object included)
         run: make -C common test_h2deny
 
+      - name: HTTP/2 request body outlives its client stream (ASan)
+        run: make -C common test_h2body
+
       - name: A half-closed HTTP/2 client is never held (ASan + UBSan)
         run: make -C common test_h2hold
 

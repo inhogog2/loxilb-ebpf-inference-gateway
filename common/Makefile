@@ -603,15 +603,30 @@ sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
 	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
 		-ffunction-sections -fdata-sections -c -o $@ $<
 
-H2DENY_SRCS = test_h2_deny_free.c test_h2_deny_stubs.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
-test_h2_deny_free: $(H2DENY_SRCS) sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h
-	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
-		-ffunction-sections -fdata-sections -o $@ $(H2DENY_SRCS) sockproxy_h2_asan.o -I. \
-		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+# The shared HTTP/2 fixture (test_h2_fixture.h): the gateway object with ASan,
+# working fakes for the forward path, fake backends, link stand-ins for the
+# rest. It wraps calloc (allocation failure injection).
+H2FX_SRCS = test_h2_fixture.c test_h2_fixture_links.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h
+H2FX_LINK = $(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -I. -Wl,--wrap=calloc -Wl,--gc-sections
+
+test_h2_deny_free: test_h2_deny_free.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_deny_free.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
 
 .PHONY: test_h2deny
 test_h2deny: test_h2_deny_free
 	./test_h2_deny_free
+
+# A request body forwarded to an HTTP/2 backend outlives its client stream.
+test_h2_body_source: test_h2_body_source.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_body_source.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2body
+test_h2body: test_h2_body_source
+	./test_h2_body_source
 
 # A half-closed HTTP/2 client is never held, and one of its legs ending leaves
 # no mark on it (sockproxy_hold.c). Linked with --gc-sections and the event

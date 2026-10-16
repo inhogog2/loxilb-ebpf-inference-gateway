@@ -3877,27 +3877,41 @@ proxy_h2_handle_client_data(proxy_fd_ent_t *pfe)
     }
   }
   
-  // Check if we have complete requests to forward
+  /* Forward the complete requests. A forward can send: any frames queued
+   * go out with it, and another stream whose answer was waiting for the
+   * client's window can end and be freed there. So nothing holds a stream
+   * across a forward, not even the walk's next pointer: the ready streams
+   * are listed by id first, and each is found again before it goes. */
   proxy_h2_stream_t *stream, *tmp;
-  int total_streams = 0;
-  int ready_streams = 0;
-  HASH_ITER(hh, pfe->h2_session->streams, stream, tmp) {
-    total_streams++;
+  int32_t ready_local[64], *ready = ready_local;
+  unsigned int n_streams = HASH_COUNT(pfe->h2_session->streams), n_ready = 0;
 
-    if (stream->headers_complete && stream->data_complete && !stream->response_sent) {
-      ready_streams++;
-      
-      int32_t forwarded_id=stream->stream_id;
-      rv = proxy_h2_forward_to_backend(pfe, stream);
-      if (rv == 0) {
-        // A local terminal answer may have closed and freed this stream.
-        proxy_h2_stream_t *live=find_stream(pfe->h2_session,forwarded_id);
-        if (live) live->response_sent = 1;
-      } else {
-        log_error("[HTTP/2] ✗ Failed to forward stream %d to backend", forwarded_id);
-      }
+  if (n_streams > sizeof(ready_local) / sizeof(ready_local[0])) {
+    ready = malloc(n_streams * sizeof(*ready));
+    if (!ready) {
+      log_error("[HTTP/2] fd=%d: no memory to list %u streams", pfe->fd, n_streams);
+      return -1;
     }
   }
+  HASH_ITER(hh, pfe->h2_session->streams, stream, tmp) {
+    if (stream->headers_complete && stream->data_complete && !stream->response_sent)
+      ready[n_ready++] = stream->stream_id;
+  }
+  for (unsigned int i = 0; i < n_ready; i++) {
+    stream = find_stream(pfe->h2_session, ready[i]);
+    if (!stream || stream->response_sent)
+      continue;   /* ended or answered by an earlier forward's send */
+    rv = proxy_h2_forward_to_backend(pfe, stream);
+    if (rv == 0) {
+      // A local terminal answer may have closed and freed this stream.
+      proxy_h2_stream_t *live=find_stream(pfe->h2_session,ready[i]);
+      if (live) live->response_sent = 1;
+    } else {
+      log_error("[HTTP/2] ✗ Failed to forward stream %d to backend", ready[i]);
+    }
+  }
+  if (ready != ready_local)
+    free(ready);
   
   // Send any pending frames to client
   // ⚠️ CRITICAL FIX for gRPC streaming: Handle client disconnection gracefully
@@ -4183,11 +4197,20 @@ proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe)
  * Data source for buffered request body
  * Used when forwarding client request data to backend
  */
-typedef struct {
-  uint8_t *data;      // Buffered request body
-  size_t len;         // Total length
-  size_t offset;      // Current read position
-} h2_data_source_t;
+/* See sockproxy_h2.h. */
+h2_data_source_t *
+proxy_h2_body_source_new(const uint8_t *body, size_t len)
+{
+  h2_data_source_t *src = malloc(sizeof(*src) + len);
+
+  if (!src)
+    return NULL;
+  src->data = (uint8_t *)(src + 1);
+  memcpy(src->data, body, len);
+  src->len = len;
+  src->offset = 0;
+  return src;
+}
 
 /**
  * nghttp2 data read callback for forwarding buffered request body
@@ -4958,8 +4981,14 @@ h2_have_tepval:
         (llm_prefix_key_t *)stream->prefix_key : &empty_prefix;
     int policy_rc = chwbl_hash_and_select_runtime(tepval, prefix_key, &ep_idx);
     if (policy_rc == -2) {
-      proxy_h2_send_l7_synthetic(pfe, 400, NULL, NULL);
-      return -1;
+      /* The request's cache_salt is unusable: answered 400 on its own
+       * stream. The L7 responder used here before answers only during an
+       * L7 dispatch, so this stream was left unanswered. The permit goes
+       * first: the answer can free the stream. */
+      fc_permit_release(&stream->fc);
+      proxy_h2_send_ai_deny(pfe, stream, 400, 0, 0, "invalid_cache_salt",
+                            "cache_salt must be a non-empty JSON string of at most 63 bytes");
+      return 0;
     }
     if (policy_rc != 0) {
       ep_idx = -1;
@@ -5492,25 +5521,36 @@ h2_have_tepval:
     return 0;
   }
 
+  /* The stream mapping owns the body source once the request is submitted,
+   * and nothing may fail between the submit and that hand-over: nghttp2
+   * would keep reading a source nobody frees. So it is taken first. */
+  stream_mapping_t *mapping = calloc(1, sizeof(stream_mapping_t));
+  if (!mapping) {
+    log_error("[HTTP/2] stream %d: Failed to allocate stream mapping", stream->stream_id);
+    free(security_headers_nv);
+    if (l7_hdr_built)
+      proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
+    return -1;
+  }
+
   // Prepare data provider for request body (if present)
   nghttp2_data_provider data_prd;
   nghttp2_data_provider *data_prd_ptr = NULL;
   h2_data_source_t *data_src = NULL;
 
   if (stream->data_len > 0 && stream->data_buf) {
-    // Allocate data source wrapper (will be freed when stream closes)
-    data_src = malloc(sizeof(h2_data_source_t));
+    /* The backend reads the body on its own schedule (flow control), after
+     * the client stream may have been reset and freed: the source carries
+     * its own copy, freed with the mapping. */
+    data_src = proxy_h2_body_source_new(stream->data_buf, stream->data_len);
     if (!data_src) {
       log_error("[HTTP/2] stream %d: Failed to allocate data source", stream->stream_id);
+      free(mapping);
       free(security_headers_nv);
       if (l7_hdr_built)
         proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
       return -1;
     }
-
-    data_src->data = stream->data_buf;
-    data_src->len = stream->data_len;
-    data_src->offset = 0;
 
     data_prd.source.ptr = data_src;
     data_prd.read_callback = proxy_h2_data_read_callback;
@@ -5547,6 +5587,8 @@ h2_have_tepval:
   if (backend_stream_id < 0) {
     log_error("[HTTP/2] stream %d: nghttp2_submit_request failed: %s",
               stream->stream_id, nghttp2_strerror(backend_stream_id));
+    free(data_src);   /* nghttp2 took no reference to it */
+    free(mapping);
     
     // P2 Task 2.3: Record circuit breaker failure
     circuit_breaker_record_failure(tepval, ep_idx);
@@ -5561,13 +5603,7 @@ h2_have_tepval:
     return -1;
   }
   
-  // Create stream mapping (client_stream_id → backend_stream_id)
-  stream_mapping_t *mapping = calloc(1, sizeof(stream_mapping_t));
-  if (!mapping) {
-    log_error("[HTTP/2] stream %d: Failed to allocate stream mapping", stream->stream_id);
-    return -1;
-  }
-  
+  // Fill the stream mapping (client_stream_id → backend_stream_id)
   mapping->client_stream_id = stream->stream_id;
   mapping->backend_stream_id = backend_stream_id;
   mapping->ep_idx = ep_idx;

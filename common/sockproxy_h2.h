@@ -433,6 +433,16 @@ int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe, int clean_eof);
  * other legs and streams go on. Call with nothing held, before the leg's
  * teardown takes PROXY_LOCK. Returns 1 when pfe was such a leg. */
 int proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe);
+/* A request body handed to a backend stream: the bytes are copied into the
+ * source (one allocation, freed with free()), so the backend can read them
+ * after the client stream that held them is gone. */
+typedef struct {
+  uint8_t *data;      // the copy, right after this header
+  size_t len;
+  size_t offset;      // read position
+} h2_data_source_t;
+h2_data_source_t *proxy_h2_body_source_new(const uint8_t *body, size_t len);
+
 /* A new HTTP/2 backend leg's own fields, before it is linked to its client.
  * It takes the pool (the slot's reuse identity) and no P/D unit. */
 void proxy_h2_backend_leg_init(proxy_fd_ent_t *bpfe, int fd, void *ssl,
