@@ -1180,7 +1180,23 @@ struct dp_proxy_tacts {
   // reserved. Copied verbatim into proxy_arg by llb_conv_nat2proxy; set
   // from Go through cgo.
   uint32_t ai_default_tokens;
-  uint32_t ai_pad;
+  // Priority bands of the rule's capacity gate (sockproxy_fc.h). The four
+  // switches take the four bytes that were ai_pad: 0 inherits the
+  // environment. fc_wake_policy is enum fc_rule_wake (1 strict, 2
+  // weighted), fc_tenant_wake enum fc_rule_tenant_wake (1 fifo, 2 rr),
+  // fc_shed_queue and fc_llmd_headers enum fc_rule_switch (1 off, 2 on).
+  uint8_t  fc_wake_policy;
+  uint8_t  fc_shed_queue;
+  uint8_t  fc_tenant_wake;
+  uint8_t  fc_llmd_headers;
+  // The numeric band knobs are the rule's own (0 = none). Every triple is
+  // indexed by band: 0 standard, 1 critical, 2 sheddable (FC_BAND_*).
+  uint8_t  fc_band_weight[3];         // weighted wake, 1..62 each
+  uint8_t  fc_band_min_share_pct[3];  // hard floor, % of the ceiling in force
+  uint8_t  fc_critical_reserve_pct;   // the critical floor under its own name
+  uint8_t  fc_band_queue_pct[3];      // % of the queue depth a band may hold
+  uint8_t  fc_band_pad[2];
+  uint32_t fc_band_wait_ms[3];        // a band's wait window, 0 = the queue's
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1254,23 +1270,30 @@ struct dp_proxy_tacts {
 //   shift by +8 (2960→2968, 2952→2960, 3992→4000, 3984→3992). Set from Go
 //   through cgo (dpebpf_linux.go DpLBRuleMod), copied verbatim into proxy_arg
 //   by llb_conv_nat2proxy.
+// ABI guard updated for the priority bands: the four switches replace
+//   ai_pad(4) (no size change), then +fc_band_weight(3)+fc_band_min_share_pct(3)
+//   +fc_critical_reserve_pct(1)+fc_band_queue_pct(3)+fc_band_pad(2)
+//   +fc_band_wait_ms(12) = +24 (8-aligned region): all four asserts shift by
+//   +24 (2968→2992, 2960→2984, 4000→4024, 3992→4016). Set from Go through
+//   cgo (dpebpf_linux.go DpLBRuleMod), copied verbatim into proxy_arg by
+//   llb_conv_nat2proxy.
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2968,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2992,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2960,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2984,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2968→4000 bytes, DPU slim 2960→3992 bytes
+// mTLS-enabled layout: 2992→4024 bytes, DPU slim 2984→4016 bytes
 // (mtls_backend_server_name(256): 3736→3992, 3728→3984; mtls_backend_verify
 // replaced one byte of mtls_pad: no size change).
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 4000,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 4024,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3992,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 4016,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */

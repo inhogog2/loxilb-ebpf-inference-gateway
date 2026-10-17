@@ -5024,8 +5024,12 @@ _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
 _Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
-_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 2 == FC_LIMITS,
+_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 2 + PROXY_FC_BAND_LIMITS == FC_LIMITS,
                "limit count drifted from sockproxy_fc.h");
+_Static_assert(PROXY_FC_BAND_LIMITS == FC_BAND_LIMITS && PROXY_FC_BANDS == FC_BANDS,
+               "band counts drifted from sockproxy_fc.h");
+_Static_assert(FC_L_WAKE_POLICY == FC_L_EXPOSE_HEADERS + 1,
+               "the band knobs' sources follow the admission headers'");
 _Static_assert(FC_L_ADAPTIVE == PROXY_FC_LIMITS,
                "the adaptive limits must follow the first block");
 _Static_assert(FC_L_TENANT_SHARE == PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS,
@@ -5065,6 +5069,25 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   st->src_tenant = fc->cfg.src[FC_L_TENANT_SHARE];
   st->expose_headers = fc->cfg.expose_headers;
   st->src_expose = fc->cfg.src[FC_L_EXPOSE_HEADERS];
+  for (int b = 0; b < FC_BANDS; b++) {
+    st->band_inflight[b] = fc_band_inflight(fc, (uint8_t)b);
+    st->band_queued[b] = fc_band_queued(fc, (uint8_t)b);
+    st->band_wait_ms[b] = fc->cfg.band_wait_ms[b];
+    st->band_weight[b] = fc->cfg.band_weight[b];
+    st->band_min_share_pct[b] = fc->cfg.band_min_share_pct[b];
+    st->band_queue_pct[b] = fc->cfg.band_queue_pct[b];
+  }
+  st->wake_policy = fc->cfg.wake_policy;
+  st->shed_queue = fc->cfg.shed_queue;
+  st->tenant_wake = fc->cfg.tenant_wake;
+  st->llmd_headers = fc->cfg.llmd_headers;
+  st->bands = fc->cfg.bands;
+  st->band_fallback = fc->cfg.band_fallback;
+  st->wake_policy_cfg = fc->cfg.wake_policy_cfg;
+  st->shed_queue_cfg = fc->cfg.shed_queue_cfg;
+  st->tenant_wake_cfg = fc->cfg.tenant_wake_cfg;
+  for (int l = 0; l < PROXY_FC_BAND_LIMITS; l++)
+    st->src_band[l] = fc->cfg.src[FC_L_WAKE_POLICY + l];
 }
 
 int
@@ -9670,17 +9693,47 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   rule.ttft_target_ms = arg->fc_ttft_target_ms;
   rule.tenant_share_pct = arg->fc_tenant_share_pct;
   rule.expose_headers = arg->fc_expose_headers;
+  rule.wake_policy = arg->fc_wake_policy;
+  rule.shed_queue = arg->fc_shed_queue;
+  rule.tenant_wake = arg->fc_tenant_wake;
+  rule.llmd_headers = arg->fc_llmd_headers;
+  rule.critical_reserve_pct = arg->fc_critical_reserve_pct;
+  for (int b = 0; b < FC_BANDS; b++) {
+    rule.band_weight[b] = arg->fc_band_weight[b];
+    rule.band_min_share_pct[b] = arg->fc_band_min_share_pct[b];
+    rule.band_queue_pct[b] = arg->fc_band_queue_pct[b];
+    rule.band_wait_ms[b] = arg->fc_band_wait_ms[b];
+  }
   fc_cfg_from_env(&env);
   fc_cfg_resolve(&cfg, &env, &rule);
+  /* What the control plane refuses a rule to declare, the gate does not
+   * run when the rule inherits it either. */
+  fc_cfg_band_guard(&cfg, (arg->sockmap_en == 1 || arg->sockmap_en == 2) &&
+                          !arg->ai_gw_mode);
   if (!created && fc_cfg_equal(&cfg, &tepval->fc.cfg))
     return;
+  if (cfg.band_fallback != FC_BAND_FB_NONE)
+    log_warn("[AIGateway] %s:%u (%s) admission bands run on fallback (%s): "
+             "wake=%s(%s) runs %s, shed_queue=%s(%s) runs %s, "
+             "tenant_wake=%s(%s) runs %s",
+             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+             tepval->ephash_key, fc_band_fallback_name(cfg.band_fallback),
+             cfg.wake_policy_cfg == FC_WAKE_WEIGHTED ? "weighted" : "strict",
+             fc_src_name(cfg.src[FC_L_WAKE_POLICY]),
+             cfg.wake_policy == FC_WAKE_WEIGHTED ? "weighted" : "strict",
+             cfg.shed_queue_cfg ? "on" : "off",
+             fc_src_name(cfg.src[FC_L_SHED_QUEUE]),
+             cfg.shed_queue ? "on" : "off",
+             cfg.tenant_wake_cfg == FC_TENANT_WAKE_RR ? "rr" : "fifo",
+             fc_src_name(cfg.src[FC_L_TENANT_WAKE]),
+             cfg.tenant_wake == FC_TENANT_WAKE_RR ? "rr" : "fifo");
   old_depth = tepval->fc.cfg.max_queue_depth;
   fc_state_apply(&tepval->fc, &cfg);
   if (!created)
     fc_queue_wake_room(&tepval->fc);
   if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE ||
       cfg.adaptive || cfg.warmup_ms || cfg.tenant_share_pct ||
-      cfg.expose_headers) {
+      cfg.expose_headers || cfg.bands || cfg.llmd_headers) {
     log_info("[AIGateway] %s:%u (%s) admission: mode=%s max_outstanding=%u "
              "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums "
              "adaptive=%s warmup=%ums ttft_target=%ums tenant_share=%u%% "
@@ -9696,6 +9749,30 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
              tepval->fc.cfg.adaptive ? "on" : "off", tepval->fc.cfg.warmup_ms,
              tepval->fc.cfg.ttft_target_ms, tepval->fc.cfg.tenant_share_pct,
              tepval->fc.cfg.expose_headers ? "on" : "off");
+  }
+  if (tepval->fc.cfg.bands || tepval->fc.cfg.llmd_headers) {
+    const fc_cfg_t *c = &tepval->fc.cfg;
+
+    /* Triples printed critical:standard:sheddable, the order operators
+     * write them in. */
+    log_info("[AIGateway] %s:%u (%s) admission bands: wake=%s weights=%u:%u:%u "
+             "min_share=%u:%u:%u%% wait=%u:%u:%ums queue_share=%u:%u:%u%% "
+             "shed_queue=%s tenant_wake=%s llmd_headers=%s",
+             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+             tepval->ephash_key,
+             c->wake_policy == FC_WAKE_WEIGHTED ? "weighted" : "strict",
+             c->band_weight[FC_BAND_CRITICAL], c->band_weight[FC_BAND_STANDARD],
+             c->band_weight[FC_BAND_SHEDDABLE],
+             c->band_min_share_pct[FC_BAND_CRITICAL],
+             c->band_min_share_pct[FC_BAND_STANDARD],
+             c->band_min_share_pct[FC_BAND_SHEDDABLE],
+             c->band_wait_ms[FC_BAND_CRITICAL], c->band_wait_ms[FC_BAND_STANDARD],
+             c->band_wait_ms[FC_BAND_SHEDDABLE],
+             c->band_queue_pct[FC_BAND_CRITICAL], c->band_queue_pct[FC_BAND_STANDARD],
+             c->band_queue_pct[FC_BAND_SHEDDABLE],
+             c->shed_queue ? "on" : "off",
+             c->tenant_wake == FC_TENANT_WAKE_RR ? "rr" : "fifo",
+             c->llmd_headers ? "on" : "off");
   }
   if (created || tepval->fc.cfg.max_queue_depth != old_depth) {
     uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);

@@ -126,8 +126,47 @@ enum fc_limit {
   FC_L_TTFT_TARGET,
   FC_L_TENANT_SHARE,
   FC_L_EXPOSE_HEADERS,
+  /* Priority bands. */
+  FC_L_WAKE_POLICY,
+  FC_L_BAND_WEIGHTS,
+  FC_L_BAND_MIN_SHARE,
+  FC_L_CRITICAL_RESERVE,
+  FC_L_BAND_WAIT,
+  FC_L_BAND_QUEUE,
+  FC_L_SHED_QUEUE,
+  FC_L_TENANT_WAKE,
+  FC_L_LLMD_HEADERS,
   FC_LIMITS,
 };
+#define FC_BAND_LIMITS (FC_LIMITS - FC_L_WAKE_POLICY)
+
+/* Which waiting band a freed unit wakes. */
+enum fc_wake_policy {
+  FC_WAKE_STRICT = 0,            /* the highest band with a runnable waiter */
+  FC_WAKE_WEIGHTED = 1,          /* deficit round robin by band_weight */
+};
+
+/* Which tenant's entry a wake takes inside one band. */
+enum fc_tenant_wake {
+  FC_TENANT_WAKE_FIFO = 0,       /* the oldest runnable entry */
+  FC_TENANT_WAKE_RR = 1,         /* rotate across the tenants with a runnable entry */
+};
+
+/* Why a pool runs band settings other than the ones it was configured with
+ * (fc_cfg_band_guard): a combination the control plane refuses when a rule
+ * declares it, reached by inheriting the environment (or by a restore
+ * replay), runs on the defaults instead. */
+enum fc_band_fallback {
+  FC_BAND_FB_NONE = 0,
+  FC_BAND_FB_SOCKMAP = 1,        /* sockMapMode request/both without an AI gateway: every band knob at its default */
+  FC_BAND_FB_NO_WEIGHTS = 2,     /* weighted with a zero weight: strict */
+  FC_BAND_FB_NO_QUEUE = 3,       /* shed queue on with no queue depth: off */
+};
+
+/* A band's weight under weighted wake is 1..62 and a round, the sum, at
+ * most 64; a band's TTL at most the queue's own window bound. */
+#define FC_BAND_WEIGHT_MAX 62u
+#define FC_BAND_ROUND_MAX  64u
 
 /* How long an endpoint's scraped queue depth is trusted without a refresh
  * (three default scrape intervals). */
@@ -149,6 +188,19 @@ enum fc_limit {
 #define FC_TENANT_SLOTS_DEFAULT 256
 #define FC_TENANT_SLOTS_MAX 4096
 
+/* Priority bands. A band is the request's class constant as the admission
+ * gate resolved it (AI_GW_CLASS_*: 0 standard, 1 critical, 2 sheddable), so
+ * a zeroed permit or entry is standard: a request with no class (MCP,
+ * keyless, a pool with no class configured) is standard and FIFO. Band
+ * order is by rank, not by number: critical first, then standard, then
+ * sheddable. The per-band counts below are kept for critical and sheddable
+ * only; standard is the total less those two, so a request with no class
+ * moves no counter it did not move before. */
+#define FC_BANDS 3
+#define FC_BAND_STANDARD  0
+#define FC_BAND_CRITICAL  1
+#define FC_BAND_SHEDDABLE 2
+
 typedef struct fc_cfg {
   uint8_t  mode;                 /* enum fc_mode */
   uint8_t  src[FC_LIMITS];       /* enum fc_src per enum fc_limit */
@@ -162,6 +214,22 @@ typedef struct fc_cfg {
   uint32_t ttft_target_ms;       /* an endpoint's TTFT above this is backpressure; 0 = TTFT unused */
   uint8_t  tenant_share_pct;     /* most of the ceiling and of the queue one tenant may hold; 0 or 100 = no share */
   uint8_t  expose_headers;       /* 1: an admitted response carries the admission headers */
+  /* Priority bands. Every triple is indexed by band (FC_BAND_*). */
+  uint8_t  wake_policy;          /* enum fc_wake_policy */
+  uint8_t  band_weight[FC_BANDS];        /* weighted wake: 1..62 each, 0 = not set */
+  uint8_t  band_min_share_pct[FC_BANDS]; /* hard floor, % of the ceiling in force; the critical reserve is folded in */
+  uint32_t band_wait_ms[FC_BANDS];       /* a band's wait window; 0 = max_queue_wait_ms */
+  uint8_t  band_queue_pct[FC_BANDS];     /* most of max_queue_depth a band may hold; 0 = the shared depth */
+  uint8_t  shed_queue;           /* 1: a sheddable request at the ceiling waits in its band instead of 429 */
+  uint8_t  tenant_wake;          /* enum fc_tenant_wake */
+  uint8_t  llmd_headers;         /* 1: refusals carry x-llm-d-request-dropped-reason; x-llm-d-inference-ttl shortens a wait */
+  uint8_t  bands;                /* derived: 1 when a band knob differs from its default (wake, weights, floors, waits, shares, shed queue, rr) */
+  /* The switches as configured (rule, else environment), before
+   * fc_cfg_band_guard; the fields above are what the gate runs. */
+  uint8_t  wake_policy_cfg;
+  uint8_t  shed_queue_cfg;
+  uint8_t  tenant_wake_cfg;
+  uint8_t  band_fallback;        /* enum fc_band_fallback */
 } fc_cfg_t;
 
 /* A rule's declarations, as the control plane sends them. 0 on any field
@@ -188,6 +256,26 @@ enum fc_rule_expose {
   FC_RULE_EXPOSE_ON = 2,
 };
 
+/* The band switches, the same shift: 0 inherits. */
+enum fc_rule_wake {
+  FC_RULE_WAKE_INHERIT = 0,
+  FC_RULE_WAKE_STRICT = 1,
+  FC_RULE_WAKE_WEIGHTED = 2,
+};
+
+enum fc_rule_tenant_wake {
+  FC_RULE_TENANT_WAKE_INHERIT = 0,
+  FC_RULE_TENANT_WAKE_FIFO = 1,
+  FC_RULE_TENANT_WAKE_RR = 2,
+};
+
+/* An on/off switch (shed queue, llm-d headers). */
+enum fc_rule_switch {
+  FC_RULE_SWITCH_INHERIT = 0,
+  FC_RULE_SWITCH_OFF = 1,
+  FC_RULE_SWITCH_ON = 2,
+};
+
 typedef struct fc_rule_cfg {
   uint8_t  mode;                 /* enum fc_rule_mode */
   uint32_t max_outstanding;
@@ -200,6 +288,18 @@ typedef struct fc_rule_cfg {
   uint32_t ttft_target_ms;
   uint8_t  tenant_share_pct;     /* 1..100; 0 inherits */
   uint8_t  expose_headers;       /* enum fc_rule_expose */
+  /* Priority bands. The switches inherit the environment at 0; the numeric
+   * knobs are the rule's own (no environment value: 0 is "none"). Triples
+   * are indexed by band (FC_BAND_*). */
+  uint8_t  wake_policy;          /* enum fc_rule_wake */
+  uint8_t  band_weight[FC_BANDS];
+  uint8_t  band_min_share_pct[FC_BANDS];
+  uint8_t  critical_reserve_pct; /* the critical floor under its own name; folded into band_min_share_pct */
+  uint32_t band_wait_ms[FC_BANDS];
+  uint8_t  band_queue_pct[FC_BANDS];
+  uint8_t  shed_queue;           /* enum fc_rule_switch */
+  uint8_t  tenant_wake;          /* enum fc_rule_tenant_wake */
+  uint8_t  llmd_headers;         /* enum fc_rule_switch */
 } fc_rule_cfg_t;
 
 /* The adaptive ceiling's state, for the read-back and the metrics. */
@@ -258,19 +358,6 @@ enum fc_anomaly {
  * milliseconds; a wait above the last bound lands in the count and the sum
  * only (the +Inf bucket of the exported histogram). */
 #define FC_QWAIT_BUCKETS 8
-
-/* Priority bands. A band is the request's class constant as the admission
- * gate resolved it (AI_GW_CLASS_*: 0 standard, 1 critical, 2 sheddable), so
- * a zeroed permit or entry is standard: a request with no class (MCP,
- * keyless, a pool with no class configured) is standard and FIFO. Band
- * order is by rank, not by number: critical first, then standard, then
- * sheddable. The per-band counts below are kept for critical and sheddable
- * only; standard is the total less those two, so a request with no class
- * moves no counter it did not move before. */
-#define FC_BANDS 3
-#define FC_BAND_STANDARD  0
-#define FC_BAND_CRITICAL  1
-#define FC_BAND_SHEDDABLE 2
 extern const uint32_t fc_qwait_bounds_ms[FC_QWAIT_BUCKETS];
 
 /* One waiting request: the parked client's fd and the connection generation
@@ -418,6 +505,17 @@ void fc_cfg_from_env(fc_cfg_t *cfg);
  * `rule` in its place, the queue depth held at its ceiling and a depth
  * given a wait window, and the source of every value recorded. */
 void fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule);
+/* Holds a resolved configuration to what the control plane accepts from a
+ * declaring rule: a pool whose request direction bypasses the gate
+ * (`gate_bypassed`: sockMapMode request or both, not an AI-gateway service)
+ * runs every band knob at its default; weighted with a zero weight runs
+ * strict; a shed queue with no queue depth runs off. The configured
+ * switches are kept beside the effective ones and the first reason in
+ * band_fallback. Returns band_fallback. */
+uint8_t fc_cfg_band_guard(fc_cfg_t *cfg, int gate_bypassed);
+const char *fc_band_fallback_name(uint8_t reason);
+/* enum fc_src as the read-back spells it: rule, env, default. */
+const char *fc_src_name(uint8_t src);
 /* Whether two configurations differ in any value or source. */
 int fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b);
 void fc_state_init(fc_state_t *fc);

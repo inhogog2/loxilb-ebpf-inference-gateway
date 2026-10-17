@@ -151,6 +151,50 @@ fc_env_u32(const char *name, uint32_t dflt, uint8_t *src)
   return (uint32_t)n;
 }
 
+/* A two-valued switch from the environment: 0 for `v0` (or unset, or any
+ * other value), 1 for `v1`; the source is the environment only for a value
+ * it names. */
+static int
+fc_env_choice(const char *name, const char *v0, const char *v1, uint8_t *src)
+{
+  const char *v = getenv(name);
+
+  if (v && !strcasecmp(v, v1)) {
+    *src = FC_SRC_ENV;
+    return 1;
+  }
+  if (v && !strcasecmp(v, v0))
+    *src = FC_SRC_ENV;
+  return 0;
+}
+
+/* Whether any band knob differs from its default. With none set, a pool's
+ * bands run the defaults: strict wake, no floor, the shared wait and
+ * depth, sheddable refused at the ceiling, FIFO inside a band. */
+static uint8_t
+fc_cfg_bands(const fc_cfg_t *c)
+{
+  if (c->wake_policy != FC_WAKE_STRICT || c->shed_queue ||
+      c->tenant_wake != FC_TENANT_WAKE_FIFO)
+    return 1;
+  for (int b = 0; b < FC_BANDS; b++)
+    if (c->band_weight[b] || c->band_min_share_pct[b] || c->band_wait_ms[b] ||
+        c->band_queue_pct[b])
+      return 1;
+  return 0;
+}
+
+/* The configured switches equal the effective ones until fc_cfg_band_guard
+ * judges the combination. */
+static void
+fc_cfg_band_mirror(fc_cfg_t *c)
+{
+  c->wake_policy_cfg = c->wake_policy;
+  c->shed_queue_cfg = c->shed_queue;
+  c->tenant_wake_cfg = c->tenant_wake;
+  c->band_fallback = FC_BAND_FB_NONE;
+}
+
 void
 fc_cfg_from_env(fc_cfg_t *cfg)
 {
@@ -234,6 +278,19 @@ fc_cfg_from_env(fc_cfg_t *cfg)
   } else if (expose && !strcasecmp(expose, "off")) {
     cfg->src[FC_L_EXPOSE_HEADERS] = FC_SRC_ENV;
   }
+  /* The band switches have an environment default; the numeric band knobs
+   * are rule-only (0 there means none, which an environment value could not
+   * say). */
+  cfg->wake_policy = (uint8_t)fc_env_choice("LLB_FC_WAKE_POLICY", "strict",
+                                            "weighted", &cfg->src[FC_L_WAKE_POLICY]);
+  cfg->shed_queue = (uint8_t)fc_env_choice("LLB_FC_SHED_QUEUE", "off", "on",
+                                           &cfg->src[FC_L_SHED_QUEUE]);
+  cfg->tenant_wake = (uint8_t)fc_env_choice("LLB_FC_TENANT_WAKE", "fifo", "rr",
+                                            &cfg->src[FC_L_TENANT_WAKE]);
+  cfg->llmd_headers = (uint8_t)fc_env_choice("LLB_FC_LLMD_HEADERS", "off", "on",
+                                             &cfg->src[FC_L_LLMD_HEADERS]);
+  cfg->bands = fc_cfg_bands(cfg);
+  fc_cfg_band_mirror(cfg);
 }
 
 static inline void
@@ -243,6 +300,69 @@ fc_overlay_u32(uint32_t *val, uint8_t *src, uint32_t declared)
     *val = declared;
     *src = FC_SRC_RULE;
   }
+}
+
+/* A rule-only triple: the rule's values, its own source when any is set.
+ * Values past `max` are held at it (the control plane refuses them). */
+static void
+fc_band_triple_u8(uint8_t *out, uint8_t *src, const uint8_t *rule, uint8_t max)
+{
+  int set = 0;
+
+  for (int b = 0; b < FC_BANDS; b++) {
+    out[b] = rule[b] > max ? max : rule[b];
+    set |= out[b] != 0;
+  }
+  *src = set ? FC_SRC_RULE : FC_SRC_DEFAULT;
+}
+
+static void
+fc_cfg_resolve_bands(fc_cfg_t *out, const fc_rule_cfg_t *rule)
+{
+  int set = 0;
+
+  if (rule->wake_policy == FC_RULE_WAKE_STRICT ||
+      rule->wake_policy == FC_RULE_WAKE_WEIGHTED) {
+    out->wake_policy = rule->wake_policy == FC_RULE_WAKE_WEIGHTED
+                       ? FC_WAKE_WEIGHTED : FC_WAKE_STRICT;
+    out->src[FC_L_WAKE_POLICY] = FC_SRC_RULE;
+  }
+  fc_band_triple_u8(out->band_weight, &out->src[FC_L_BAND_WEIGHTS],
+                    rule->band_weight, FC_BAND_WEIGHT_MAX);
+  fc_band_triple_u8(out->band_min_share_pct, &out->src[FC_L_BAND_MIN_SHARE],
+                    rule->band_min_share_pct, 100);
+  /* The reserve is the critical floor under another name: one mechanism.
+   * The control plane refuses both set; here the reserve wins. */
+  out->src[FC_L_CRITICAL_RESERVE] = FC_SRC_DEFAULT;
+  if (rule->critical_reserve_pct) {
+    out->band_min_share_pct[FC_BAND_CRITICAL] =
+      rule->critical_reserve_pct > 100 ? 100 : rule->critical_reserve_pct;
+    out->src[FC_L_CRITICAL_RESERVE] = FC_SRC_RULE;
+  }
+  for (int b = 0; b < FC_BANDS; b++) {
+    out->band_wait_ms[b] = rule->band_wait_ms[b] > FC_QUEUE_WAIT_MS_MAX
+                           ? FC_QUEUE_WAIT_MS_MAX : rule->band_wait_ms[b];
+    set |= out->band_wait_ms[b] != 0;
+  }
+  out->src[FC_L_BAND_WAIT] = set ? FC_SRC_RULE : FC_SRC_DEFAULT;
+  fc_band_triple_u8(out->band_queue_pct, &out->src[FC_L_BAND_QUEUE],
+                    rule->band_queue_pct, 100);
+  if (rule->shed_queue == FC_RULE_SWITCH_OFF || rule->shed_queue == FC_RULE_SWITCH_ON) {
+    out->shed_queue = rule->shed_queue == FC_RULE_SWITCH_ON;
+    out->src[FC_L_SHED_QUEUE] = FC_SRC_RULE;
+  }
+  if (rule->tenant_wake == FC_RULE_TENANT_WAKE_FIFO ||
+      rule->tenant_wake == FC_RULE_TENANT_WAKE_RR) {
+    out->tenant_wake = rule->tenant_wake == FC_RULE_TENANT_WAKE_RR
+                       ? FC_TENANT_WAKE_RR : FC_TENANT_WAKE_FIFO;
+    out->src[FC_L_TENANT_WAKE] = FC_SRC_RULE;
+  }
+  if (rule->llmd_headers == FC_RULE_SWITCH_OFF || rule->llmd_headers == FC_RULE_SWITCH_ON) {
+    out->llmd_headers = rule->llmd_headers == FC_RULE_SWITCH_ON;
+    out->src[FC_L_LLMD_HEADERS] = FC_SRC_RULE;
+  }
+  out->bands = fc_cfg_bands(out);
+  fc_cfg_band_mirror(out);
 }
 
 void
@@ -304,6 +424,65 @@ fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule)
     out->expose_headers = rule->expose_headers == FC_RULE_EXPOSE_ON;
     out->src[FC_L_EXPOSE_HEADERS] = FC_SRC_RULE;
   }
+  fc_cfg_resolve_bands(out, rule);
+}
+
+uint8_t
+fc_cfg_band_guard(fc_cfg_t *c, int gate_bypassed)
+{
+  fc_cfg_band_mirror(c);
+  if (gate_bypassed && c->bands) {
+    /* The request direction is carried by the kernel and never reaches
+     * the gate: the bands have nothing to order. llmd_headers is not a
+     * band knob (it changes no admission decision) and stays. */
+    c->wake_policy = FC_WAKE_STRICT;
+    c->shed_queue = 0;
+    c->tenant_wake = FC_TENANT_WAKE_FIFO;
+    memset(c->band_weight, 0, sizeof(c->band_weight));
+    memset(c->band_min_share_pct, 0, sizeof(c->band_min_share_pct));
+    memset(c->band_wait_ms, 0, sizeof(c->band_wait_ms));
+    memset(c->band_queue_pct, 0, sizeof(c->band_queue_pct));
+    c->band_fallback = FC_BAND_FB_SOCKMAP;
+  }
+  if (c->wake_policy == FC_WAKE_WEIGHTED) {
+    for (int b = 0; b < FC_BANDS; b++) {
+      if (c->band_weight[b] == 0) {
+        /* A zero weight is strict under another name. */
+        c->wake_policy = FC_WAKE_STRICT;
+        if (c->band_fallback == FC_BAND_FB_NONE)
+          c->band_fallback = FC_BAND_FB_NO_WEIGHTS;
+        break;
+      }
+    }
+  }
+  if (c->shed_queue && c->max_queue_depth == 0) {
+    c->shed_queue = 0;
+    if (c->band_fallback == FC_BAND_FB_NONE)
+      c->band_fallback = FC_BAND_FB_NO_QUEUE;
+  }
+  c->bands = fc_cfg_bands(c);
+  return c->band_fallback;
+}
+
+const char *
+fc_band_fallback_name(uint8_t reason)
+{
+  switch (reason) {
+  case FC_BAND_FB_SOCKMAP:    return "sockmap_request";
+  case FC_BAND_FB_NO_WEIGHTS: return "zero_weight";
+  case FC_BAND_FB_NO_QUEUE:   return "no_queue";
+  }
+  return "none";
+}
+
+const char *
+fc_src_name(uint8_t src)
+{
+  switch (src) {
+  case FC_SRC_RULE: return "rule";
+  case FC_SRC_ENV:  return "env";
+  }
+  return "default";
 }
 
 int
@@ -316,8 +495,20 @@ fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b)
       a->adaptive != b->adaptive || a->warmup_ms != b->warmup_ms ||
       a->ttft_target_ms != b->ttft_target_ms ||
       a->tenant_share_pct != b->tenant_share_pct ||
-      a->expose_headers != b->expose_headers)
+      a->expose_headers != b->expose_headers ||
+      a->wake_policy != b->wake_policy || a->shed_queue != b->shed_queue ||
+      a->tenant_wake != b->tenant_wake || a->llmd_headers != b->llmd_headers ||
+      a->bands != b->bands || a->wake_policy_cfg != b->wake_policy_cfg ||
+      a->shed_queue_cfg != b->shed_queue_cfg ||
+      a->tenant_wake_cfg != b->tenant_wake_cfg ||
+      a->band_fallback != b->band_fallback)
     return 0;
+  for (int i = 0; i < FC_BANDS; i++)
+    if (a->band_weight[i] != b->band_weight[i] ||
+        a->band_min_share_pct[i] != b->band_min_share_pct[i] ||
+        a->band_wait_ms[i] != b->band_wait_ms[i] ||
+        a->band_queue_pct[i] != b->band_queue_pct[i])
+      return 0;
   for (int r = 0; r < FC_ROLES; r++)
     if (a->ep_cap[r] != b->ep_cap[r])
       return 0;

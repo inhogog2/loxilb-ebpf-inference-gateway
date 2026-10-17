@@ -2246,6 +2246,17 @@ struct proxy_arg {
   // Admission headers on admitted responses, same hop: 0 = the
   // environment, 1 off, 2 on.
   uint8_t  fc_expose_headers;
+  // Priority bands, same hop (dp_proxy_tacts has the encodings): switches
+  // 0 = the environment; numeric knobs the rule's own, triples by band.
+  uint8_t  fc_wake_policy;
+  uint8_t  fc_shed_queue;
+  uint8_t  fc_tenant_wake;
+  uint8_t  fc_llmd_headers;
+  uint8_t  fc_band_weight[3];
+  uint8_t  fc_band_min_share_pct[3];
+  uint8_t  fc_critical_reserve_pct;
+  uint8_t  fc_band_queue_pct[3];
+  uint32_t fc_band_wait_ms[3];
 
   // The rule's connectionLimit (dp_proxy_tacts.conn_limit), copied by
   // llb_conv_nat2proxy. A fullproxy rule never enters nat_map, so the

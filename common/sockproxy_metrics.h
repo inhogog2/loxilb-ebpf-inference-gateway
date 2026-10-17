@@ -328,7 +328,9 @@ int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
 #define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
 #define PROXY_FC_QWAIT_BUCKETS 8 /* queue wait histogram buckets (FC_QWAIT_BUCKETS) */
 #define PROXY_FC_LIMITS 8        /* configured limits with a source, first block */
-#define PROXY_FC_ADAPT_LIMITS 3  /* adaptive, warm-up, TTFT target: FC_LIMITS is the sum */
+#define PROXY_FC_ADAPT_LIMITS 3  /* adaptive, warm-up, TTFT target */
+#define PROXY_FC_BAND_LIMITS 9   /* the band knobs (FC_BAND_LIMITS): FC_LIMITS is the sum with the tenant share and the headers */
+#define PROXY_FC_BANDS 3         /* FC_BANDS: 0 standard, 1 critical, 2 sheddable */
 
 typedef struct proxy_fc_svc_stat {
     uint32_t xip;                          /* service VIP, network byte order (v4) */
@@ -371,13 +373,31 @@ typedef struct proxy_fc_svc_stat {
     uint8_t  expose_headers;               /* 1 when admitted responses carry the admission headers */
     uint8_t  src_expose;                   /* source of expose_headers */
     uint32_t tenant_slots;                 /* tenants the pool tracks by name: the table size in force */
+    /* Priority bands: same lockstep, offsets pinned below. Triples by band. */
+    uint32_t band_inflight[PROXY_FC_BANDS];      /* gauge: service units held per band */
+    uint32_t band_queued[PROXY_FC_BANDS];        /* gauge: requests waiting per band */
+    uint32_t band_wait_ms[PROXY_FC_BANDS];       /* a band's wait window, 0 = the queue's */
+    uint8_t  wake_policy;                  /* enum fc_wake_policy: 0 strict, 1 weighted */
+    uint8_t  shed_queue;                   /* 1: sheddable waits at the ceiling */
+    uint8_t  tenant_wake;                  /* enum fc_tenant_wake: 0 fifo, 1 rr */
+    uint8_t  llmd_headers;                 /* 1: llm-d headers on */
+    uint8_t  band_weight[PROXY_FC_BANDS];        /* weighted wake weights, 0 = not set */
+    uint8_t  band_min_share_pct[PROXY_FC_BANDS]; /* hard floors, the critical reserve folded in */
+    uint8_t  band_queue_pct[PROXY_FC_BANDS];     /* a band's share of the queue depth, 0 = shared */
+    uint8_t  bands;                        /* 1 when a band knob differs from its default */
+    uint8_t  src_band[PROXY_FC_BAND_LIMITS];     /* enum fc_src per band knob, in enum fc_limit order */
+    uint8_t  band_fallback;                /* enum fc_band_fallback: why the switches above differ from the configured ones */
+    uint8_t  wake_policy_cfg;              /* the switches as configured (rule, else environment); the ones above run */
+    uint8_t  shed_queue_cfg;
+    uint8_t  tenant_wake_cfg;
+    uint8_t  band_pad[5];
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
  * definition, and its test links a stub with a third: all three pin the
  * same layout, so a field moved in one without the others fails to build
  * instead of shifting every counter after it. */
-_Static_assert(sizeof(proxy_fc_svc_stat_t) == 376, "proxy_fc_svc_stat_t size");
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 440, "proxy_fc_svc_stat_t size");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 144, "pool offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 208, "queued offset");
@@ -392,6 +412,10 @@ _Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 338, "warming_eps o
 _Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 344, "adapt_down offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, tenants_active) == 360, "tenants_active offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, tenant_slots) == 368, "tenant_slots offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, band_inflight) == 372, "band_inflight offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, wake_policy) == 408, "wake_policy offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, src_band) == 422, "src_band offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, band_fallback) == 431, "band_fallback offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every
