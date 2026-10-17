@@ -258,6 +258,19 @@ enum fc_anomaly {
  * milliseconds; a wait above the last bound lands in the count and the sum
  * only (the +Inf bucket of the exported histogram). */
 #define FC_QWAIT_BUCKETS 8
+
+/* Priority bands. A band is the request's class constant as the admission
+ * gate resolved it (AI_GW_CLASS_*: 0 standard, 1 critical, 2 sheddable), so
+ * a zeroed permit or entry is standard: a request with no class (MCP,
+ * keyless, a pool with no class configured) is standard and FIFO. Band
+ * order is by rank, not by number: critical first, then standard, then
+ * sheddable. The per-band counts below are kept for critical and sheddable
+ * only; standard is the total less those two, so a request with no class
+ * moves no counter it did not move before. */
+#define FC_BANDS 3
+#define FC_BAND_STANDARD  0
+#define FC_BAND_CRITICAL  1
+#define FC_BAND_SHEDDABLE 2
 extern const uint32_t fc_qwait_bounds_ms[FC_QWAIT_BUCKETS];
 
 /* One waiting request: the parked client's fd and the connection generation
@@ -267,7 +280,8 @@ extern const uint32_t fc_qwait_bounds_ms[FC_QWAIT_BUCKETS];
  * the tenant slot whose queue count the entry holds, -1 for none. */
 typedef struct fc_queue_ent {
   int      fd;
-  uint16_t live;
+  uint8_t  live;
+  uint8_t  band;                 /* FC_BAND_*: the request's class when it parked */
   int16_t  tslot;
   uint64_t gen;
   uint64_t enqueue_ns;
@@ -285,6 +299,7 @@ typedef struct fc_queue {
   uint32_t tail;
   uint32_t used;
   uint32_t count;
+  uint32_t band_count[FC_BANDS]; /* live entries per band; the standard slot is never written */
   uint32_t dead;                 /* the pool's rule is gone: nothing may wait here again */
   pthread_mutex_t lock;
 } fc_queue_t;
@@ -319,6 +334,10 @@ typedef struct fc_state {
   fc_cfg_t cfg;
   _Atomic uint32_t inflight;
   _Atomic uint32_t queued;                       /* live queue entries, mirrored for lock-free reads */
+  /* Per band (critical and sheddable; the standard slot is never written):
+   * service units held, and live queue entries mirrored like `queued`. */
+  _Atomic uint32_t band_inflight[FC_BANDS];
+  _Atomic uint32_t band_queued[FC_BANDS];
   _Atomic uint32_t ep_inflight[FC_MAX_EP][FC_ROLES];
   _Atomic uint64_t decisions[FC_R_COUNT];
   _Atomic uint64_t qwait_bucket[FC_QWAIT_BUCKETS];
@@ -369,6 +388,7 @@ typedef struct fc_permit {
   uint8_t state;                 /* enum fc_permit_state */
   uint8_t svc_held;
   uint8_t woken;                 /* popped from the queue: may not be made to queue again behind newcomers */
+  uint8_t band;                  /* FC_BAND_*: set at the service acquire, kept while queued */
   int8_t  ep[FC_ROLES];          /* endpoint holding this role's unit, -1 = none */
   int      q_fd;                 /* the queue entry this permit sits in, while QUEUED */
   uint32_t q_slot;
@@ -528,6 +548,13 @@ fc_verdict_t fc_service_acquire_tenant(fc_state_t *fc, fc_permit_t *p,
 fc_verdict_t fc_service_acquire_h1_tenant(fc_state_t *fc, fc_permit_t *p,
                                           int woken, uint64_t tkey);
 
+/* The same two, for a request of band `band` (FC_BAND_*; anything else is
+ * standard). The two above are band standard. */
+fc_verdict_t fc_service_acquire_band(fc_state_t *fc, fc_permit_t *p,
+                                     uint64_t tkey, uint8_t band);
+fc_verdict_t fc_service_acquire_h1_band(fc_state_t *fc, fc_permit_t *p,
+                                        int woken, uint64_t tkey, uint8_t band);
+
 /* The same, for a request that is not an inference request. */
 void fc_bypass(fc_state_t *fc, fc_permit_t *p);
 
@@ -665,6 +692,58 @@ static inline uint32_t
 fc_queued(const fc_state_t *fc)
 {
   return fc ? atomic_load_explicit(&fc->queued, memory_order_relaxed) : 0;
+}
+
+/* A class constant as a band: anything out of range is standard. */
+static inline uint8_t
+fc_band_of(int cls)
+{
+  return (cls == FC_BAND_CRITICAL || cls == FC_BAND_SHEDDABLE) ? (uint8_t)cls
+                                                              : FC_BAND_STANDARD;
+}
+
+/* Order between bands: 0 is served first. */
+static inline int
+fc_band_rank(uint8_t band)
+{
+  return band == FC_BAND_CRITICAL ? 0 : band == FC_BAND_SHEDDABLE ? 2 : 1;
+}
+
+/* Service units held, and requests waiting, in one band. Standard is the
+ * total less the two counted bands; the reads are not one snapshot, so it
+ * is clamped at zero. */
+static inline uint32_t
+fc_band_derive(uint32_t total, uint32_t crit, uint32_t shed, uint8_t band)
+{
+  if (band == FC_BAND_CRITICAL)
+    return crit;
+  if (band == FC_BAND_SHEDDABLE)
+    return shed;
+  return total > crit + shed ? total - crit - shed : 0;
+}
+
+static inline uint32_t
+fc_band_inflight(const fc_state_t *fc, uint8_t band)
+{
+  if (!fc)
+    return 0;
+  return fc_band_derive(
+      atomic_load_explicit(&fc->inflight, memory_order_relaxed),
+      atomic_load_explicit(&fc->band_inflight[FC_BAND_CRITICAL], memory_order_relaxed),
+      atomic_load_explicit(&fc->band_inflight[FC_BAND_SHEDDABLE], memory_order_relaxed),
+      fc_band_of(band));
+}
+
+static inline uint32_t
+fc_band_queued(const fc_state_t *fc, uint8_t band)
+{
+  if (!fc)
+    return 0;
+  return fc_band_derive(
+      atomic_load_explicit(&fc->queued, memory_order_relaxed),
+      atomic_load_explicit(&fc->band_queued[FC_BAND_CRITICAL], memory_order_relaxed),
+      atomic_load_explicit(&fc->band_queued[FC_BAND_SHEDDABLE], memory_order_relaxed),
+      fc_band_of(band));
 }
 
 static inline uint32_t

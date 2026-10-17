@@ -140,6 +140,12 @@ void llamafirewall_set_initialized(int initialized) { atomic_store(&g_llamafirew
 
 #include "sockproxy_http.h"  /* own header — after all deps; provides PROXY_SESSION_* */
 
+/* A capacity band is the class constant the admission gate resolved. */
+_Static_assert(AI_GW_CLASS_STANDARD == FC_BAND_STANDARD &&
+               AI_GW_CLASS_CRITICAL == FC_BAND_CRITICAL &&
+               AI_GW_CLASS_SHEDDABLE == FC_BAND_SHEDDABLE,
+               "capacity bands are the class constants");
+
 /* Portable strnstr (needed by inject_forwarded_headers and url-matching) */
 /* Service identity "VIP:port" for the QoS ladder, from the connection's
  * rule head. "" when the head is gone (teardown races) — the ladder treats
@@ -9501,9 +9507,11 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
     return 0;
   }
   /* Admitted as the tenant the credential resolved to (the admission gate
-   * ran before dispatch); no tenant is the keyless pseudo-tenant. */
-  v = fc_service_acquire_h1_tenant(&tepval->fc, &pfe->fc, woken,
-                                   fc_tenant_key(pfe->tenant_id));
+   * ran before dispatch); no tenant is the keyless pseudo-tenant. The band
+   * is the class the gate resolved; a request it gave none is standard. */
+  v = fc_service_acquire_h1_band(&tepval->fc, &pfe->fc, woken,
+                                 fc_tenant_key(pfe->tenant_id),
+                                 fc_band_of(pfe->adm_class));
   if (v == FC_ADMIT) {
     pfe->fc_expose_pending = 1;
     return 0;

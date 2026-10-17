@@ -335,6 +335,40 @@ fc_ring_wrap(const fc_queue_t *q, uint32_t i)
   return i >= q->cap ? i - q->cap : i;
 }
 
+/* Whether a band has its own counts: critical and sheddable. Standard is
+ * the total less those two, so a request with no class moves nothing new. */
+static inline int
+fc_band_counted(uint8_t band)
+{
+  return band == FC_BAND_CRITICAL || band == FC_BAND_SHEDDABLE;
+}
+
+/* Lock held. A live entry joins or leaves the ring's per-band count. */
+static inline void
+fc_ring_band_add(fc_queue_t *q, uint8_t band)
+{
+  if (fc_band_counted(band))
+    q->band_count[band]++;
+}
+
+static inline void
+fc_ring_band_sub(fc_queue_t *q, uint8_t band)
+{
+  if (fc_band_counted(band) && q->band_count[band] > 0)
+    q->band_count[band]--;
+}
+
+/* Lock held. The lock-free mirrors of the queue's counts. */
+static void
+fc_queue_publish(fc_state_t *fc)
+{
+  atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  atomic_store_explicit(&fc->band_queued[FC_BAND_CRITICAL],
+                        fc->queue.band_count[FC_BAND_CRITICAL], memory_order_relaxed);
+  atomic_store_explicit(&fc->band_queued[FC_BAND_SHEDDABLE],
+                        fc->queue.band_count[FC_BAND_SHEDDABLE], memory_order_relaxed);
+}
+
 /* Re-lay the live entries, in order, from slot 0 of `dst` (a fresh buffer,
  * never the ring itself), then adopt it. Runs when the slots are used up by
  * tombstones, or when the depth grows. The slot hints held by waiting
@@ -345,10 +379,13 @@ fc_ring_relayout(fc_queue_t *q, fc_queue_ent_t *dst, uint32_t dst_cap)
   uint32_t n = 0;
   uint32_t i = q->head;
 
+  memset(q->band_count, 0, sizeof(q->band_count));
   for (uint32_t k = 0; k < q->used; k++) {
     const fc_queue_ent_t *e = &q->ring[i];
-    if (e->live && n < dst_cap)
+    if (e->live && n < dst_cap) {
       dst[n++] = *e;
+      fc_ring_band_add(q, e->band);
+    }
     i = fc_ring_wrap(q, i + 1);
   }
   free(q->ring);
@@ -392,6 +429,7 @@ fc_ring_grow(fc_queue_t *q, uint32_t want)
     q->ring = ring;
     q->cap = want;
     q->head = q->tail = q->used = q->count = 0;
+    memset(q->band_count, 0, sizeof(q->band_count));
   }
   return 0;
 }
@@ -495,8 +533,9 @@ fc_state_destroy(fc_state_t *fc)
   fc->queue.ring = NULL;
   fc->queue.cap = fc->queue.head = fc->queue.tail = 0;
   fc->queue.used = fc->queue.count = 0;
+  memset(fc->queue.band_count, 0, sizeof(fc->queue.band_count));
   fc->queue.dead = 1;
-  atomic_store_explicit(&fc->queued, 0, memory_order_relaxed);
+  fc_queue_publish(fc);
   /* The tenant table goes with the rule, so creating and deleting rules
    * does not grow the process. A request that still holds the pool settles
    * its service unit as before and finds no tenant slot to settle. */
@@ -519,6 +558,7 @@ fc_permit_reset(fc_permit_t *p)
   p->state = FC_P_NONE;
   p->svc_held = 0;
   p->woken = 0;
+  p->band = FC_BAND_STANDARD;
   for (int r = 0; r < FC_ROLES; r++)
     p->ep[r] = -1;
   p->q_fd = -1;
@@ -1057,6 +1097,23 @@ fc_bypass(fc_state_t *fc, fc_permit_t *p)
     fc_count(fc, FC_R_BYPASS_NON_INFERENCE);
 }
 
+/* The permit's service unit is counted in its band too (critical and
+ * sheddable only). Taken where svc_held is set, given back where it is
+ * cleared; the band does not change while the unit is held. */
+static inline void
+fc_band_unit_take(fc_state_t *fc, const fc_permit_t *p)
+{
+  if (fc_band_counted(p->band))
+    atomic_fetch_add_explicit(&fc->band_inflight[p->band], 1, memory_order_relaxed);
+}
+
+static inline void
+fc_band_unit_give(fc_state_t *fc, const fc_permit_t *p)
+{
+  if (fc_band_counted(p->band))
+    fc_unit_give(&fc->band_inflight[p->band]);
+}
+
 /* The service unit on a pool with a tenant share: the tenant's own count
  * is checked and moved under the queue lock, with the service unit. */
 static fc_verdict_t
@@ -1110,6 +1167,7 @@ admitted:
   pthread_mutex_unlock(&fc->queue.lock);
   p->tslot = (int16_t)slot;
   p->svc_held = 1;
+  fc_band_unit_take(fc, p);
   p->state = FC_P_EXECUTING;
   p->woken = (uint8_t)(woken ? 1 : 0);
   return FC_ADMIT;
@@ -1123,7 +1181,7 @@ refused:
 /* The service unit for a request that may (can_queue) or may not wait. */
 static fc_verdict_t
 fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
-                     uint64_t tkey)
+                     uint64_t tkey, uint8_t band)
 {
   int over = 0;
   uint64_t enq = woken ? p->q_enqueue_ns : 0;
@@ -1134,6 +1192,7 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
   p->q_enqueue_ns = enq;
   p->q_deadline_ns = deadline;
   p->tkey = tkey;
+  p->band = fc_band_of(band);
   if (!fc_active(fc)) {
     p->state = FC_P_BYPASS;
     return FC_ADMIT;
@@ -1163,6 +1222,7 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
     fc_unit_take(&fc->inflight, 0);
   }
   p->svc_held = 1;
+  fc_band_unit_take(fc, p);
   p->state = FC_P_EXECUTING;
   p->woken = (uint8_t)(woken ? 1 : 0);
   /* Not yet an admission: the endpoint unit decides. Counted when the
@@ -1173,26 +1233,41 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
 fc_verdict_t
 fc_service_acquire(fc_state_t *fc, fc_permit_t *p)
 {
-  return fc_service_acquire__(fc, p, 0, 0, fc_tenant_key(NULL));
+  return fc_service_acquire__(fc, p, 0, 0, fc_tenant_key(NULL), FC_BAND_STANDARD);
 }
 
 fc_verdict_t
 fc_service_acquire_h1(fc_state_t *fc, fc_permit_t *p, int woken)
 {
-  return fc_service_acquire__(fc, p, 1, woken, fc_tenant_key(NULL));
+  return fc_service_acquire__(fc, p, 1, woken, fc_tenant_key(NULL),
+                              FC_BAND_STANDARD);
 }
 
 fc_verdict_t
 fc_service_acquire_tenant(fc_state_t *fc, fc_permit_t *p, uint64_t tkey)
 {
-  return fc_service_acquire__(fc, p, 0, 0, tkey);
+  return fc_service_acquire__(fc, p, 0, 0, tkey, FC_BAND_STANDARD);
 }
 
 fc_verdict_t
 fc_service_acquire_h1_tenant(fc_state_t *fc, fc_permit_t *p, int woken,
                              uint64_t tkey)
 {
-  return fc_service_acquire__(fc, p, 1, woken, tkey);
+  return fc_service_acquire__(fc, p, 1, woken, tkey, FC_BAND_STANDARD);
+}
+
+fc_verdict_t
+fc_service_acquire_band(fc_state_t *fc, fc_permit_t *p, uint64_t tkey,
+                        uint8_t band)
+{
+  return fc_service_acquire__(fc, p, 0, 0, tkey, band);
+}
+
+fc_verdict_t
+fc_service_acquire_h1_band(fc_state_t *fc, fc_permit_t *p, int woken,
+                           uint64_t tkey, uint8_t band)
+{
+  return fc_service_acquire__(fc, p, 1, woken, tkey, band);
 }
 
 int
@@ -1369,9 +1444,10 @@ fc_permit_release__(fc_permit_t *p, int wake)
     fc_release_role(p, r);
   fc = p->fc;
   if (p->svc_held) {
-    if (fc)
+    if (fc) {
       fc_unit_give(&fc->inflight);
-    else
+      fc_band_unit_give(fc, p);
+    } else
       atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_UNKNOWN_PERMIT], 1,
                                 memory_order_relaxed);
     p->svc_held = 0;
@@ -1462,6 +1538,7 @@ fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
   q->ring[slot].live = 1;
   q->used++;
   q->count++;
+  fc_ring_band_add(q, e->band);
   if (slot_out)
     *slot_out = slot;
   return 0;
@@ -1475,12 +1552,14 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   uint32_t slot = 0;
   uint64_t first_deadline = 0;
   uint64_t tkey;
+  uint8_t band;
   int tslot = -1;
   int rc = -1;
 
   if (!fc || !p || fd < 0)
     return -1;
   tkey = p->tkey;
+  band = p->band;
   /* A woken request going back is still bounded by its first window, and
    * takes its place among the waiters by when it first arrived. */
   if (front && p->q_deadline_ns) {
@@ -1489,6 +1568,7 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   }
   e.fd = fd;
   e.live = 1;
+  e.band = band;
   e.tslot = -1;
   e.gen = gen;
   e.enqueue_ns = now_ns;
@@ -1502,6 +1582,7 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   p->q_gen = gen;
   p->q_enqueue_ns = now_ns;
   p->tkey = tkey;
+  p->band = band;
 
   pthread_mutex_lock(&fc->queue.lock);
   e.deadline_ns = first_deadline ? first_deadline
@@ -1531,13 +1612,14 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   }
   if (rc == 0) {
     p->q_slot = slot;
-    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+    fc_queue_publish(fc);
   }
   pthread_mutex_unlock(&fc->queue.lock);
 
   if (rc != 0) {
     fc_permit_bind(p, fc);
     p->tkey = tkey;
+    p->band = band;
     fc_count(fc, rc == -2 ? FC_R_TENANT_SHARE : FC_R_QUEUE_FULL);
     return rc == -2 ? -2 : -1;
   }
@@ -1581,6 +1663,7 @@ fc_queue_take(fc_state_t *fc, fc_permit_t *p)
   if (slot != UINT32_MAX) {
     fc->queue.ring[slot].live = 0;
     fc->queue.count--;
+    fc_ring_band_sub(&fc->queue, fc->queue.ring[slot].band);
     fc_tenant_dec(fc, fc->queue.ring[slot].tslot, 1);
     taken = 1;
     /* A tombstone at the head is dead weight: drop it now. */
@@ -1588,7 +1671,7 @@ fc_queue_take(fc_state_t *fc, fc_permit_t *p)
       fc->queue.head = fc_ring_wrap(&fc->queue, fc->queue.head + 1);
       fc->queue.used--;
     }
-    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+    fc_queue_publish(fc);
   }
   pthread_mutex_unlock(&fc->queue.lock);
   return taken;
@@ -1621,6 +1704,7 @@ fc_ring_pop(fc_queue_t *q, fc_queue_ent_t *out)
     q->used--;
     if (live) {
       q->count--;
+      fc_ring_band_sub(q, e->band);
       return 1;
     }
   }
@@ -1639,7 +1723,7 @@ fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out)
   rc = fc_ring_pop(&fc->queue, &e);
   if (rc)
     fc_tenant_dec(fc, e.tslot, 1);
-  atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  fc_queue_publish(fc);
   pthread_mutex_unlock(&fc->queue.lock);
   if (rc && out)
     *out = e;
@@ -1663,6 +1747,7 @@ fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out)
       *out = *e;
       e->live = 0;
       q->count--;
+      fc_ring_band_sub(q, e->band);
       while (q->used > 0 && !q->ring[q->head].live) {
         q->head = fc_ring_wrap(q, q->head + 1);
         q->used--;
@@ -1712,7 +1797,7 @@ fc_queue_wake_head(fc_state_t *fc)
 
   pthread_mutex_lock(&fc->queue.lock);
   rc = fc_ring_pop_runnable(fc, &e);
-  atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  fc_queue_publish(fc);
   pthread_mutex_unlock(&fc->queue.lock);
   if (!rc)
     return 0;
@@ -1723,7 +1808,7 @@ fc_queue_wake_head(fc_state_t *fc)
     pthread_mutex_lock(&fc->queue.lock);
     if (fc_ring_insert(&fc->queue, &e, 1, NULL) != 0)
       fc_tenant_dec(fc, e.tslot, 1);
-    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+    fc_queue_publish(fc);
     pthread_mutex_unlock(&fc->queue.lock);
     return 0;
   }

@@ -3580,8 +3580,9 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   {
     /* The stream's own tenant: concurrent streams may carry different
      * credentials. */
-    fc_verdict_t v = fc_service_acquire_tenant(&tepval->fc, &stream->fc,
-                                               fc_tenant_key(stream->tenant_id));
+    fc_verdict_t v = fc_service_acquire_band(&tepval->fc, &stream->fc,
+                                             fc_tenant_key(stream->tenant_id),
+                                             fc_band_of(stream->adm_class));
     if (v == FC_SHED || v == FC_DRAINING || v == FC_TENANT_SHARE) {
       sp_fc_h2_shed(pfe, stream, tepval, v, -1);
       return -1;
