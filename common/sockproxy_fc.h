@@ -632,6 +632,14 @@ void fc_queue_wake_room(fc_state_t *fc);
 typedef int (*fc_drain_fn)(void *ctx, const fc_queue_ent_t *ent);
 void fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx);
 
+/* Hand every waiting entry to `fn`, oldest first, with the queue lock held;
+ * nothing is taken out and the order is kept. Returns the number of entries
+ * visited. `fn` runs under the lock, so a write it makes to its waiter's
+ * connection is ordered before that waiter's pop: it must not call back into
+ * this queue. */
+typedef void (*fc_visit_fn)(void *ctx, const fc_queue_ent_t *ent);
+uint32_t fc_queue_visit(fc_state_t *fc, fc_visit_fn fn, void *ctx);
+
 /* Process-wide drain for maintenance: while set, the gate refuses new
  * inference requests with FC_DRAINING and pools drain their queues. */
 void fc_drain_set(int on);

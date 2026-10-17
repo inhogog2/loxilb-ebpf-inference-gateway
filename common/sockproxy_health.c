@@ -1012,6 +1012,30 @@ reap_pending_connects(uint64_t now_ms)
   }
 }
 
+/* One waiter of a capacity queue: its connection is waiting for its turn,
+ * not idle. Runs under the queue's lock (fc_queue_visit), so the anchor
+ * writes are ordered before the pop that ends the wait and before every
+ * write the connection's worker makes after its resume. The entry's
+ * generation names the connection that parked: a shell that has moved on
+ * since is left alone. */
+static void
+sp_fc_park_idle_visit(void *ctx, const fc_queue_ent_t *e)
+{
+  time_t now = *(const time_t *)ctx;
+  uint64_t reg_gen = 0;
+  proxy_fd_ent_t *pfe;
+
+  pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
+  if (!pfe || reg_gen != e->gen ||
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen) {
+    return;
+  }
+  pfe->idle_since = now;
+  if (pfe->last_activity > 0) {
+    pfe->last_activity = now;
+  }
+}
+
 static void
 check_draining_endpoints(void)
 {
@@ -1144,6 +1168,32 @@ check_draining_endpoints(void)
         pfe = pfe->next;
       }
       qp_node = qp_node->next;
+    }
+  }
+
+  /* Capacity-queue idle guard — also BEFORE the idle reapers. A request
+   * parked in a pool's capacity queue has sent its request and waits for a
+   * unit: its reads are paused and its client sends nothing more, so its
+   * idle anchors stand still from its last byte. Left alone, the per-rule
+   * inactiveTimeout (and the L7 member-data deadline) shut it with no
+   * answer whenever the queue's wait window is longer than they are; the
+   * wait is bounded by the queue's own deadline, which answers 504. So each
+   * pass refreshes the anchors of every waiting request (the disarmed
+   * last_activity == 0 is kept), and a resumed request's idle clock starts
+   * at most one pass before its resume. The walk is over the queues, not
+   * the connections: a pool with nobody waiting costs one atomic read. A
+   * departed client is not kept: a parked connection keeps its hang-up
+   * events armed, and its teardown takes its entry out of the queue. Runs
+   * under the PROXY_LOCK already held by this pass. */
+  {
+    proxy_map_ent_t *fp_node;
+    proxy_epval_t *fp_ep, *fp_tmp;
+
+    for (fp_node = proxy_struct->head; fp_node; fp_node = fp_node->next) {
+      HASH_ITER(hh, fp_node->val.ephash, fp_ep, fp_tmp) {
+        if (fc_queued(&fp_ep->fc) > 0)
+          fc_queue_visit(&fp_ep->fc, sp_fc_park_idle_visit, &now);
+      }
     }
   }
 

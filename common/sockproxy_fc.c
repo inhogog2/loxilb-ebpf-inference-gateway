@@ -1784,6 +1784,31 @@ fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx)
 }
 
 uint32_t
+fc_queue_visit(fc_state_t *fc, fc_visit_fn fn, void *ctx)
+{
+  fc_queue_t *q;
+  uint32_t i, n = 0;
+
+  if (!fc || !fn)
+    return 0;
+  q = &fc->queue;
+  pthread_mutex_lock(&q->lock);
+  if (q->cap > 0) {
+    i = q->head;
+    for (uint32_t k = 0; k < q->used; k++) {
+      const fc_queue_ent_t *e = &q->ring[i];
+      if (e->live) {
+        fn(ctx, e);
+        n++;
+      }
+      i = fc_ring_wrap(q, i + 1);
+    }
+  }
+  pthread_mutex_unlock(&q->lock);
+  return n;
+}
+
+uint32_t
 fc_retry_after_s(const fc_state_t *fc)
 {
   uint64_t n, sum, mean_ms, s;
