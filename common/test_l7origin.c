@@ -606,6 +606,9 @@ test_requests_parsed_together_keep_their_own_chains(void)
 int
 main(void)
 {
+  /* The policy unit reads routes under the proxy read lock: the listener
+   * table exists before the first request, as in the product. */
+  listeners_init();
   test_edge_listener();
   test_trusting_listener();
   test_per_request();

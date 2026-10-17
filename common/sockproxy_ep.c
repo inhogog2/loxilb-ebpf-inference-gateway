@@ -577,7 +577,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           // L7_DISPATCH_FALLTHROUGH, so the model path below runs byte-for-byte
           // unchanged (Pitfall 5). The SAME shared helper is invoked at the
           // H2 seam (sockproxy_h2.c) — parity.
-          if (node && node->has_l7_policy) {
+          if (node && l7_policy_on(node)) {
             proxy_epval_t *l7_tepval = NULL;
             int l7_rc = l7_route_dispatch(pfe, node, &l7_tepval);
             if (l7_rc == L7_DISPATCH_TERMINATED) {
@@ -698,8 +698,24 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
-        if (tepval->mcp_stateless && pfe) {
+        /* A FORWARD route's members (l7_route_pool): selected here, and none
+         * of the pool's own modes below runs for the request. */
+        int l7_subset = sp_route_subset(pfe, tepval);
+        if (pfe && (tepval->mcp_stateless || l7_subset)) {
           algorithm_selection=sp_mcp_request_select(tepval,pfe);
+          if (algorithm_selection<0 && l7_subset) {
+            static const char subset_down[] =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"no_healthy_backend\","
+                "\"detail\":\"every endpoint of the route is down or circuit-broken\"}\r\n";
+            fc_permit_release(&pfe->fc);
+            pfe->lb_err_body_sent=1;
+            proxy_send_local_response(pfe,subset_down,sizeof(subset_down)-1);
+            return -1;
+          }
           if (algorithm_selection<0) {
             static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             fc_permit_release(&pfe->fc);
@@ -719,6 +735,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
 #ifdef HAVE_DP_GPU_ROUTING
         // Check selection algorithm
+        if (!l7_subset)
         switch (tepval->select) {
           case PROXY_SEL_CHWBL:
             {              
@@ -840,7 +857,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         }
 #else
         // P3: WRR support (without HAVE_DP_GPU_ROUTING flag)
-        if (tepval->select == PROXY_SEL_WRR) {
+        if (!l7_subset && tepval->select == PROXY_SEL_WRR) {
           if (!tepval->mcp_stateless) algorithm_selection = wrr_select_endpoint(tepval);
           if (algorithm_selection < 0) {
             log_error("P3: WRR selection failed, falling back to round-robin");
@@ -856,7 +873,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 #endif /* HAVE_DP_GPU_ROUTING */
 
         /* US-PD804: 3-tier P/D selection (replaces first-healthy stub) */
-        if (tepval->pd_disagg_enabled && tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0) {
+        if (!l7_subset &&
+            tepval->pd_disagg_enabled && tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0) {
           int pd_prefill = -1, pd_decode = -1;
 
           /* KV-T15 /.3: seed the exclusion mask with health/CB state so the
@@ -987,7 +1005,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
 
           log_info("US-PD804: P/D EP selected — prefill=EP%d decode=EP%d", pd_prefill, pd_decode);
-        } else if (tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE && pfe) {
+        } else if (!l7_subset && tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE && pfe) {
           /* single-role Tier-1.5 KV-exact selection — the
            * SIBLING of the P/D block above, structurally parallel and textually
            * independent (at kv_exact_mode == 1 this branch is provably never
@@ -1085,7 +1103,7 @@ pd_fallback_normal:
                                              tepval) == 0 &&
                 ns_bound >= 0 && ns_bound < tepval->n_eps &&
                 tepval->eps[ns_bound].inv == 0 &&
-                is_endpoint_healthy(tepval, ns_bound)) {
+                is_endpoint_healthy(tepval, ns_bound) && sp_route_allows(pfe, ns_bound)) {
               nso.learned_ep = ns_bound;
               nso.learned_ok = 1;
             } else {
@@ -1094,7 +1112,7 @@ pd_fallback_normal:
                * below picks a healthy one; the hash re-pins once it heals. */
               int h = (int)(session_key_hash(ns_session_key) %
                             (uint32_t)tepval->n_eps);
-              if (is_endpoint_healthy(tepval, h)) {
+              if (is_endpoint_healthy(tepval, h) && sp_route_allows(pfe, h)) {
                 nso.hash_ep = h;
                 nso.hash_ok = 1;
               }
@@ -1175,6 +1193,10 @@ pd_fallback_normal:
           // Use algorithm-selected endpoint
           sel = algorithm_selection;
         }
+        /* The pool's own selector takes its bounded-load unit; the route's
+         * does not, and the connection gives one back at its teardown. */
+        if (l7_subset && h2_load_units_active(tepval))
+          chwbl_inc_runtime(tepval, sel);
 
         /* Capacity admission, endpoint level: the pick above is a preference,
          * the unit is the decision. A pick over its ceiling moves to another
@@ -1222,7 +1244,11 @@ pd_fallback_normal:
           }
         }
 
-        if (tepval->mcp_stateless && !sp_mcp_reserve_probe(tepval,sel)) {
+        /* The selector only looked at the breaker; the pick takes its
+         * half-open probe here, or is refused. */
+        if ((tepval->mcp_stateless || l7_subset) && !sp_mcp_reserve_probe(tepval,sel)) {
+          if (l7_subset && h2_load_units_active(tepval))
+            chwbl_dec_runtime(tepval, sel);
           static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
           fc_permit_release(&pfe->fc);
           pfe->lb_err_body_sent=1;
@@ -1328,7 +1354,8 @@ pd_fallback_normal:
            * than returning an error immediately, try every remaining healthy
            * prefill EP while recording TCP failures in the circuit breaker.
            * A 503 is sent only when all prefill EPs are exhausted. */
-          if (tepval->pd_disagg_enabled && pfe) {
+          /* A route's request took no P/D pair (it selects plainly). */
+          if (tepval->pd_disagg_enabled && pfe && !sp_route_subset(pfe, tepval)) {
             /* Undo active_conns for the original failed EP pair so the
              * counters remain consistent regardless of retry outcome. */
             int fc_orig_decode = pfe->pd_decode_ep_idx;
@@ -1439,8 +1466,7 @@ pd_fallback_normal:
                     (sel + 1 + a) % tepval->n_eps :
                     (tepval->ep_sel + a) % tepval->n_eps;
                 if (c < 0 || c >= 32) continue;
-                if (tepval->mcp_stateless && pfe->mcp_route_active &&
-                    !(pfe->mcp_route_mask & (UINT32_C(1)<<c))) continue;
+                if (!sp_route_allows(pfe, c)) continue;
                 if (nx_excluded & (1u << (unsigned)c)) continue;
                 if (tepval->mcp_stateless ? !sp_mcp_candidate(tepval,c) :
                     !is_endpoint_healthy(tepval,c)) continue;
@@ -1586,7 +1612,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         // backend (the cookie pin is purely additive — miss->rehash).
         if (tepval->select == PROXY_SEL_STICKY ||
             (tepval->select == PROXY_SEL_RR && tepval->session_header_enabled) ||
-            (node->has_l7_policy && pfe && l7_cookie_persist_active(pfe, node))) {
+            (l7_policy_on(node) && pfe && l7_cookie_persist_active(pfe, node))) {
           /* Sized by the conv key contract, not by hand: an id longer than
            * this is not truncated on the way into conv_map, it is MERGED
            * with whatever else shares its prefix. */
@@ -1605,7 +1631,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
            * arbitrary backend). Nothing is read from / written to proxy_fd_ent
  * state — the cookie value IS the binding, so this works
            * identically on an HA peer that never saw the original request. */
-          if (node->has_l7_policy && pfe &&
+          if (l7_policy_on(node) && pfe &&
               l7_cookie_persist_active(pfe, node)) {
             char presented[LB_COOKIE_TOKEN_MAX];
             if (l7_cookie_read_presented(pfe, presented, sizeof(presented)) == 0) {

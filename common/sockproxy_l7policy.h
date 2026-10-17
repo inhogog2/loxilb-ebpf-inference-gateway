@@ -178,9 +178,9 @@ typedef enum {
   L7A_REJECT   = 2,   /* synthetic 4xx, terminal                                  */
 } l7_action_kind_t;
 
-/* FORWARD: a plain pool (reuses the existing intra-pool EP-select), optionally
- * with per-endpoint weights (Gateway weighted backendRefs). Resolution to a
- * tepval-equivalent is Plan 04's l7_resolve_pool — the engine only carries it. */
+/* FORWARD: the listener's pool, optionally restricted to some of its members
+ * with per-member weights (Gateway weighted backendRefs). The dispatch turns
+ * it into the request's route (l7_route_pool) — the engine only carries it. */
 typedef struct {
   uint32_t pool_id;               /* target plain pool id */
   struct {
@@ -398,15 +398,6 @@ void l7_derive_origin(const l7_origin_scope_t *scope, struct proxy_map_ent *ent,
                       const char *peer_ip);
 
 /*
- * l7_resolve_pool — map a FORWARD action's target pool to a tepval-equivalent
- * (proxy_epval_t *) so a FORWARD decision re-enters the EXISTING intra-pool
- * endpoint selector (CONTEXT — a plain pool, never the AI model engine).
- * Returns NULL when there is no usable pool. Defined in sockproxy_l7policy.c.
- */
-struct proxy_epval *l7_resolve_pool(struct proxy_map_ent *ent,
-                                    l7_forward_t *fwd);
-
-/*
  * l7_route_dispatch — the SINGLE shared discriminator + dispatch helper invoked
  * at BOTH routing seams (H1 sockproxy_ep.c:400 and H2 sockproxy_h2.c:1962) so the
  * two paths cannot drift (the dominant H1/H2 parity landmine).
@@ -419,7 +410,9 @@ struct proxy_epval *l7_resolve_pool(struct proxy_map_ent *ent,
  * Otherwise it runs l7_policy_evaluate and acts on the decision:
  *   REJECT / REDIRECT / no-match -> emit terminal response, return
  *                                   L7_DISPATCH_TERMINATED (caller returns -1)
- *   FORWARD -> *tepval_out = l7_resolve_pool(...), return L7_DISPATCH_FORWARD
+ *   FORWARD -> *tepval_out = the listener's pool, the route's members marked
+ *              on pfe (NULL: none exists), return L7_DISPATCH_FORWARD; on an
+ *              MCP pool a NULL is answered 503 and TERMINATED
  *
  * NOTE (H1/H2 contract): the engine is pfe-only. For HTTP/2 the per-request
  * authority/path/method live on the stream, so the H2 caller MUST mirror them

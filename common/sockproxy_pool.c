@@ -19,9 +19,9 @@
 
 typedef struct sp_pool_hdr {
   _Atomic uint32_t refs;
-  uint8_t uncounted;                   /* the L7 scratch pool */
   _Atomic uint8_t queued;              /* work is waiting on the reclaimer */
   uint64_t born_ms;
+  proxy_epval_t *waiting_next;         /* the listener's pools_waiting list */
   sp_qsbr_work_t work;
 } __attribute__((aligned(64))) sp_pool_hdr_t;
 
@@ -51,8 +51,8 @@ pool_now_ms(void)
   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
-static proxy_epval_t *
-pool_alloc(int uncounted)
+proxy_epval_t *
+sp_pool_alloc(void)
 {
   size_t sz = sizeof(sp_pool_hdr_t) + sizeof(proxy_epval_t);
   sp_pool_hdr_t *h;
@@ -62,31 +62,10 @@ pool_alloc(int uncounted)
   if (!h)
     return NULL;
   memset(h, 0, sz);
-  h->uncounted = (uint8_t)uncounted;
   h->born_ms = pool_now_ms();
-  atomic_init(&h->refs, uncounted ? 0 : 1);
-  if (!uncounted)
-    atomic_fetch_add_explicit(&pools_live, 1, memory_order_relaxed);
+  atomic_init(&h->refs, 1);
+  atomic_fetch_add_explicit(&pools_live, 1, memory_order_relaxed);
   return pool_body(h);
-}
-
-proxy_epval_t *
-sp_pool_alloc(void)
-{
-  return pool_alloc(0);
-}
-
-proxy_epval_t *
-sp_pool_alloc_uncounted(void)
-{
-  return pool_alloc(1);
-}
-
-void
-sp_pool_free_uncounted(proxy_epval_t *p)
-{
-  if (p && pool_hdr(p)->uncounted)
-    free(pool_hdr(p));
 }
 
 /* A capacity permit points into its pool (&pool->fc): it holds the pool. */
@@ -117,7 +96,7 @@ sp_pool_init(void (*fn)(proxy_epval_t *p))
 void
 sp_pool_discard(proxy_epval_t *p)
 {
-  if (!p || pool_hdr(p)->uncounted)
+  if (!p)
     return;
   free(pool_hdr(p));
   atomic_fetch_sub_explicit(&pools_live, 1, memory_order_relaxed);
@@ -160,7 +139,7 @@ pool_queue(sp_pool_hdr_t *h, void (*fn)(sp_qsbr_work_t *w))
 void
 sp_pool_get(proxy_epval_t *p)
 {
-  if (!p || pool_hdr(p)->uncounted)
+  if (!p)
     return;
   atomic_fetch_add_explicit(&pool_hdr(p)->refs, 1, memory_order_relaxed);
 }
@@ -174,8 +153,6 @@ sp_pool_put(proxy_epval_t *p)
   if (!p)
     return;
   h = pool_hdr(p);
-  if (h->uncounted)
-    return;
   was = atomic_fetch_sub_explicit(&h->refs, 1, memory_order_acq_rel);
   if (was == 1) {
     pool_queue(h, pool_final_free);
@@ -219,7 +196,7 @@ pool_table_drop(sp_qsbr_work_t *w)
 void
 sp_pool_unlinked(proxy_epval_t *p)
 {
-  if (!p || pool_hdr(p)->uncounted)
+  if (!p)
     return;
   pool_queue(pool_hdr(p), pool_table_drop);
 }
@@ -295,7 +272,36 @@ sp_pool_index_publish(proxy_map_ent_t *ent)
   old = atomic_exchange_explicit(&ent->val.pools, ix, memory_order_acq_rel);
   if (old)
     sp_qsbr_defer(&old->work, index_free);
+  /* Pools out of the table that the old index still had: this one does not. */
+  while ((p = ent->val.pools_waiting)) {
+    ent->val.pools_waiting = pool_hdr(p)->waiting_next;
+    pool_hdr(p)->waiting_next = NULL;
+    sp_pool_unlinked(p);
+  }
   return 0;
+}
+
+int
+sp_pool_link(proxy_map_ent_t *ent, proxy_epval_t *p)
+{
+  HASH_ADD_KEYPTR(hh, ent->val.ephash, p->ephash_key, strlen(p->ephash_key), p);
+  if (sp_pool_index_publish(ent) == 0)
+    return 0;
+  HASH_DEL(ent->val.ephash, p);
+  return -1;
+}
+
+int
+sp_pool_unlink(proxy_map_ent_t *ent, proxy_epval_t *p)
+{
+  HASH_DEL(ent->val.ephash, p);
+  if (sp_pool_index_publish(ent) == 0) {
+    sp_pool_unlinked(p);
+    return 0;
+  }
+  pool_hdr(p)->waiting_next = ent->val.pools_waiting;
+  ent->val.pools_waiting = p;
+  return -1;
 }
 
 const sp_pool_index_t *

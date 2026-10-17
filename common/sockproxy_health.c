@@ -116,6 +116,7 @@ pd_teardown_conn(proxy_fd_ent_t *client)
   if (client == NULL) {
     return;
   }
+  proxy_h2_client_end_mark(client, SP_H2_END_TEARDOWN, 0, NULL);
 
   for (int i = 0; i < client->n_rfd && i < MAX_PROXY_EP; i++) {
     proxy_fd_ent_t *be = client->rfd_ent[i];
@@ -141,6 +142,13 @@ pd_teardown_conn(proxy_fd_ent_t *client)
       be->n_rfd = 0;
       client->rfd_ent[i] = NULL;
 
+      /* Called with a backend leg (the force-close matches legs by endpoint
+       * too): the connection ending with it is the client on the other side. */
+      if (client->odir) {
+        proxy_h2_client_end_mark(be, SP_H2_END_TEARDOWN, 0, client);
+        if (be_owned)
+          proxy_h2_client_end_log(be);
+      }
       if (be_owned) {
         proxy_release_fd_ctx(be, 1);   /* reset: unlink fdlist + close be->fd */
         proxy_try_free_fd_ctx(be);     /* used-- -> free (single owner) */
@@ -156,6 +164,8 @@ pd_teardown_conn(proxy_fd_ent_t *client)
     client_owned = (notify_deregister_ent(proxy_struct->ns, client->fd) == 0);
   }
   if (client_owned) {
+    /* This thread frees it, so proxy_pdestroy never runs: log its end here. */
+    proxy_h2_client_end_log(client);
     proxy_release_fd_ctx(client, 1);   /* reset: unlink fdlist + close client->fd */
     proxy_try_free_fd_ctx(client);     /* used-- -> free (single owner) */
   }
@@ -256,6 +266,9 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
 {
   const sp_reap_text_t *t = &sp_reap_texts[kind];
 
+  /* Recorded before either path: the owner that finishes the hand-off sees
+   * only its own shutdown and the hangup, which would name the wrong actor. */
+  proxy_h2_client_end_mark(pfe, SP_H2_END_REAPER, 0, NULL);
   if (pfe->fd > 0 && proxy_struct->ns) {
     int owner = notify_owner_thr(proxy_struct->ns, pfe->fd);
 
@@ -745,6 +758,7 @@ finish_deferred_closes(uint64_t now_ms)
                 pfe->fd, pfe->odir, pfe->client_half_closed,
                 (unsigned long long)(now_ms - pfe->defer_close_ms));
       proxy_defer_close_clear(pfe);
+      proxy_h2_client_end_mark(pfe, SP_H2_END_DEFERRED, 0, NULL);
       if (pfe->fd > 0) {
         shutdown(pfe->fd, SHUT_RDWR);
       }
@@ -1008,7 +1022,10 @@ check_draining_endpoints(void)
    * path evaluates the deadline only when a byte arrives, so a connection
    * that opened, sent part of its request headers and went silent would keep
    * its fd, epoll slot and buffers until the idle deadline, which only counts
-   * from an armed last_activity. Same deadline, evaluated on the clock. */
+   * from an armed last_activity. Same deadline, evaluated on the clock.
+   * The clock is armed only while a header block is open, on HTTP/1.1 and
+   * HTTP/2 alike, and it is published for this thread: it is all this pass
+   * reads of the connection's protocol state. */
   {
     proxy_map_ent_t *hd_node = proxy_struct->head;
     while (hd_node) {
@@ -1016,15 +1033,16 @@ check_draining_endpoints(void)
       proxy_fd_ent_t *pfe = hd_ms ? hd_node->val.fdlist : NULL;
       while (pfe) {
         proxy_fd_ent_t *pfe_next = pfe->next;
+        int64_t hdr_age;
         if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
-            pfe->l7_hdr_accum_start > 0 &&
-            (pfe->h2_session || !pfe->http_hdrs_done) &&
-            proxy_hdr_deadline_expired(hd_node, pfe, now)) {
+            proxy_hdr_deadline_expired(hd_node, pfe, now, &hdr_age)) {
           atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
           log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
                    "with no further client bytes — dropping connection", pfe->fd, hd_ms);
+          /* Recorded before the hangup the worker will see. */
+          proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_CLOCK, hdr_age, hd_ms);
+          sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; the close event tears it down */
           shutdown(pfe->fd, SHUT_RDWR);
-          pfe->l7_hdr_accum_start = 0;   /* counted once; the close event tears it down */
         }
         pfe = pfe_next;
       }
@@ -1051,7 +1069,7 @@ check_draining_endpoints(void)
        * finer than 1s here — documented). For the AI peer / un-configured listeners (has_l7_policy
  * ==0 or timeout_member_data_ms==0) behaviour is byte-for-byte unchanged. */
       uint32_t l7_data_to_s = 0;
-      if (ito_node->has_l7_policy && ito_node->arg_ptr &&
+      if (l7_policy_on(ito_node) && ito_node->arg_ptr &&
           ito_node->arg_ptr->timeout_member_data_ms > 0) {
         /* ms → seconds, rounded up so a sub-second deadline still expires after one tick */
         l7_data_to_s = (ito_node->arg_ptr->timeout_member_data_ms + 999) / 1000;
@@ -1086,6 +1104,7 @@ check_draining_endpoints(void)
           log_debug("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
                    pfe->fd, (long)idle_elapsed, idle_to_s,
                    (l7_data_to_s > 0) ? " (L7 timeoutMemberData)" : "");
+          proxy_h2_client_end_mark(pfe, SP_H2_END_IDLE, 0, NULL);
           if (pfe->fd > 0) {
             shutdown(pfe->fd, SHUT_RDWR);
           }

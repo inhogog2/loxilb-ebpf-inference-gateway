@@ -986,7 +986,7 @@ proxy_sockmap_owned_dirs(proxy_map_ent_t *ent, proxy_epval_t *epv,
   *own_resp = 0;
   if (!ent)
     return;
-  in.has_l7_policy = ent->has_l7_policy ? 1 : 0;
+  in.has_l7_policy = l7_policy_on(ent) ? 1 : 0;
   if (!epv)
     epv = sp_pool_first(ent);
   if (epv) {
@@ -1048,7 +1048,7 @@ l7_inject_set_cookie_h1(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen,
   if (!client)
     return buflen;
   node = (proxy_map_ent_t *)client->head;
-  if (!node || !node->has_l7_policy)
+  if (!node || !l7_policy_on(node))
     return buflen;
   /* Only on HTTP_COOKIE listeners (the matched route's cookie_persist marker). */
   if (!l7_cookie_persist_active(client, node))
@@ -1118,7 +1118,7 @@ l7_inject_hsts_h1(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen,
   if (!client)
     return buflen;
   node = (proxy_map_ent_t *)client->head;
-  if (!node || !node->has_l7_policy)
+  if (!node || !l7_policy_on(node))
     return buflen;                       /* AI / un-configured — no-op. */
   if (!node->arg_ptr || node->arg_ptr->hsts_max_age == 0)
     return buflen;                       /* HSTS not configured (default-off). */
@@ -3220,16 +3220,14 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * on every tick, so requests already waiting get the new value. */
         tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
-        /* An add whose index could not be built left the pool in the table
-         * only: the update publishes it. */
-        int ix_rc = sp_pool_find(ent, ephash_key) == tepval ? 0 : sp_pool_index_publish(ent);
+        /* A delete whose index could not be built left its pool to the
+         * readers: any change of the listener lets go of it. */
+        if (ent->val.pools_waiting)
+          (void)sp_pool_index_publish(ent);
         if (revive) {
           proxy_listener_revive(ent, arg, &takeover);
         }
         PROXY_UNLOCK();
-        if (ix_rc != 0) {
-          return -ENOMEM;
-        }
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
                  ntohs(new_ent->xport), ephash_key);
@@ -3503,20 +3501,21 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         }
 #endif /* HAVE_DP_GPU_ROUTING */
 
-        // P6: Use stored key for hash table insertion
-        HASH_ADD_KEYPTR(hh, ent->val.ephash,
-                        tepval->ephash_key, strlen(tepval->ephash_key),
-                        tepval);
         /* Workers find the pool once the index is published. Should it not
-         * be built, the pool waits in the table for the next change of the
-         * rule, and the caller is told. */
-        int ix_rc = sp_pool_index_publish(ent);
+         * be built, the pool leaves the table again and goes the way of a
+         * deleted one, so the rule is neither served nor listed. */
+        if (sp_pool_link(ent, tepval) != 0) {
+          sp_pool_unlinked(tepval);
+          proxy_takeover_drop(&takeover);
+          PROXY_UNLOCK();
+          return -ENOMEM;
+        }
 
         if (revive) {
           proxy_listener_revive(ent, arg, &takeover);
         }
         PROXY_UNLOCK();
-        return ix_rc == 0 ? 0 : -ENOMEM;
+        return 0;
       }
     }
     ent = ent->next;
@@ -3931,22 +3930,18 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   }
 #endif /* HAVE_DP_GPU_ROUTING */
 
-  // P6: Use stored key for hash table insertion
-  HASH_ADD_KEYPTR(hh, node->val.ephash,
-                  tepval->ephash_key, strlen(tepval->ephash_key),
-                  tepval);
-  int ix_rc = sp_pool_index_publish(node);
+  /* Should the index not be built, the pool goes the way of a deleted one
+   * and the listener stays up with no pool, as after its last rule's
+   * delete: the caller is told, and nothing serves the rule. */
+  int ix_rc = sp_pool_link(node, tepval);
+  if (ix_rc != 0)
+    sp_pool_unlinked(tepval);
 
   /* new service: attach any shaper config stored ahead of rule creation */
   qos_apply_stored_cfg(node);
 
   node->next = proxy_struct->head;
   proxy_struct->head = node;
-
-  HASH_FIND_STR(node->val.ephash, ephash_key, tepval);
-  if (tepval == NULL) {
-    assert(0);
-  }
 
   PROXY_UNLOCK();
 
@@ -5629,6 +5624,9 @@ proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
       if (abandon_leg_wants_reset(pfe->odir, fd_ent->odir, fd_ent->read_paused)) {
         abandon_leg_arm_reset(fd_ent->fd);
       }
+      /* A leg's teardown takes its client with it: say which leg. */
+      if (pfe->odir)
+        proxy_h2_client_end_mark(fd_ent, SP_H2_END_LEG, 0, pfe);
       proxy_release_fd_ctx(fd_ent, 0);
       notify_delete_ent(proxy_struct->ns, fd_ent->fd, 1);
       pfe->rfd_ent[i] = NULL;
@@ -5932,7 +5930,15 @@ proxy_pdestroy(void *priv)
 
   /* A client reset that arrived while its reads were paused or disarmed is
    * visible only here, as the socket's pending error. */
-  sp_hold_peer_error(pfe, hc_client_reset_check(pfe));
+  {
+    int peer_err = hc_client_reset_check(pfe);
+
+    sp_hold_peer_error(pfe, peer_err);
+    /* Reading the pending error clears it: it is the HTTP/2 end's cause
+     * when nothing else recorded one. */
+    if (peer_err)
+      proxy_h2_client_end_mark(pfe, SP_H2_END_CLIENT_ERROR, peer_err, NULL);
+  }
 
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
@@ -5993,6 +5999,8 @@ proxy_pdestroy(void *priv)
            * the streams the collector reads. */
           proxy_collect_conn_settles(fd_ent, &settles, TEARDOWN_LISTENER);
           if (fd_ent->h2_session) {
+            proxy_h2_client_end_mark(fd_ent, SP_H2_END_LISTENER, 0, NULL);
+            proxy_h2_client_end_log(fd_ent);
             proxy_h2_cleanup_session(fd_ent);
           }
           proxy_release_rfd_ctx(fd_ent);
@@ -6419,6 +6427,7 @@ proxy_pdestroy(void *priv)
      * backend pfes and are closed exactly once, by each pfe's own teardown.
      * The streams it frees were settled by the collector above. */
     if (!is_listener && pfe->odir == 0 && pfe->h2_session) {
+      proxy_h2_client_end_log(pfe);
       proxy_h2_cleanup_session(pfe);
     }
 
@@ -8086,7 +8095,7 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
                 "the %s direction (l7_policy=%u); it stays on the userspace relay",
                 pfe->fd, ep_cfd, sockmap_mode, asked,
                 own_req && own_resp ? "request and response" : own_req ? "request" : "response",
-                ent->has_l7_policy);
+                l7_policy_on(ent));
     }
   }
 
@@ -8597,6 +8606,10 @@ handle_on_message_begin(llhttp_t* parser)
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
     pfe->http_hdrs_done = 0;   /* request N+1's header block starts here */
+    /* ... and so does its header clock. On request 1 the read path armed
+     * it at the first byte already. */
+    if (!sp_hdr_armed(&pfe->l7_hdr))
+      proxy_hdr_arm(pfe, time(NULL), -1);
     pfe->mcp_retry_pending = 0;
     pfe->mcp_retry_excluded = 0;
     /* Request N may have left an unsettled claim (no countable usage came
@@ -8805,6 +8818,16 @@ sp_fc_normal_eligible(void *ctx, int ep)
   if (tepval->ep_role[ep] != 0 || tepval->eps[ep].inv)
     return 0;
   return is_endpoint_healthy(tepval, ep);
+}
+
+/* The same, restricted to the members of the request's FORWARD route
+ * (ctx: sp_mcp_fc_scope). Shared with the HTTP/2 site. */
+int
+sp_fc_route_eligible(void *ctx, int ep)
+{
+  sp_mcp_fc_scope *scope = ctx;
+
+  return sp_route_allows(scope->request, ep) && sp_fc_normal_eligible(scope->pool, ep);
 }
 
 /* Whether a refusal may leave this connection open for its next request:
@@ -9044,8 +9067,10 @@ sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel)
   sp_mcp_fc_scope mcp_scope={.pool=tepval,.request=pfe};
   ep = fc_ep_acquire_any(&tepval->fc, &pfe->fc, FC_ROLE_NORMAL, sel,
                          tepval->n_eps,
-                         tepval->mcp_stateless ? sp_mcp_fc_eligible : sp_fc_normal_eligible,
-                         tepval->mcp_stateless ? (void *)&mcp_scope : (void *)tepval, &v);
+                         tepval->mcp_stateless ? sp_mcp_fc_eligible :
+                         sp_route_subset(pfe, tepval) ? sp_fc_route_eligible : sp_fc_normal_eligible,
+                         tepval->mcp_stateless || sp_route_subset(pfe, tepval) ?
+                         (void *)&mcp_scope : (void *)tepval, &v);
   if (ep < 0)
     return sp_fc_h1_refuse(pfe, tepval, v, FC_ROLE_NORMAL, 1);
   return ep;
@@ -9649,7 +9674,7 @@ static int sp_mcp_h1_complete(proxy_fd_ent_t *pfe, llhttp_t *parser)
   int status = sp_mcp_validate(&c->req, llhttp_method_name(parser->method), c->body, c->len);
   if (status) return sp_mcp_h1_refuse(pfe, status);
   proxy_map_ent_t *ent = pfe->head;
-  if (ent->has_l7_policy) {
+  if (l7_policy_on(ent)) {
     int name_used=l7_mcp_header_used(ent,"mcp-name",8);
     if (name_used && (c->req.name_len >= L7_HDR_VALUE_MAX || memchr(c->req.name, 0, c->req.name_len)))
       return sp_mcp_h1_refuse(pfe, 413);
@@ -9682,6 +9707,8 @@ handle_on_headers_complete(llhttp_t* parser)
    * it. http_hok cannot stand in for it: it flips on the first "Host:" name,
    * which is the first line every HTTP/1.1 client -- and every slowloris --
    * sends. */
+  if (pfe->odir == 0)
+    sp_hdr_disarm(&pfe->l7_hdr);   /* the block is complete, whatever the parse returns */
   pfe->http_hdrs_done = 1;
   if (sp_mcp_enabled(pfe)) return sp_mcp_h1_headers(pfe, parser);
   return 0;                          /* 0: parse the body that follows */
@@ -11765,7 +11792,9 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * set phase to PREFILL_SENDING. */
     if (pfe->epv) {
       proxy_epval_t *pd_tepval = (proxy_epval_t *)pfe->epv;
-      if (sp_pd_prepare_eligible(1, pd_tepval->pd_disagg_enabled,
+      /* A FORWARD route's request selected one endpoint plainly: no P/D. */
+      if (sp_pd_prepare_eligible(1, pd_tepval->pd_disagg_enabled &&
+                                    !sp_route_subset(pfe, pd_tepval),
                                  pfe->odir == 0,
                                  pfe->pd_phase == PD_PHASE_NONE,
                                  pfe->is_streamable)) {
@@ -11852,7 +11881,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
  * inject_forwarded_headers (untouched). */
     {
       proxy_map_ent_t *l7node = (proxy_map_ent_t *)pfe->head;
-      if (l7node && l7node->has_l7_policy) {
+      if (l7node && l7_policy_on(l7node)) {
         pfe->rcv_off = l7_inject_req_headers_h1(pfe, l7node, pfe->rcvbuf,
                                                 pfe->rcv_off, SP_SOCK_MSG_LEN, fd);
         pfe_rcv_note(pfe);
@@ -12627,6 +12656,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       return -1;
     }
 
+    if (rc <= 0 && !pfe->odir && pfe->h2_session)
+      proxy_h2_client_end_mark(pfe, rc == 0 ? SP_H2_END_CLIENT_EOF : SP_H2_END_CLIENT_ERROR,
+                               rc == 0 ? 0 : saved_errno, NULL);
     errno = saved_errno;  // Restore errno before error checking
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -12666,9 +12698,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
          * blocks, never the frames of a live stream. */
         {
           proxy_map_ent_t *h2ent = (proxy_map_ent_t *)pfe->head;
-          if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL))) {
-            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+          int64_t hdr_age;
+          if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL), &hdr_age)) {
+            sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_H2_READ, hdr_age,
+                                              proxy_hdr_deadline_ms(h2ent));
             log_debug("[TCP_INSPECT] fd=%d (h2): header-completion deadline %ums exceeded "
                      "(slowloris guard) — dropping connection", fd,
                      proxy_hdr_deadline_ms(h2ent));
@@ -12677,6 +12712,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
 
         if (proxy_h2_handle_client_data(pfe) < 0) {
+          proxy_h2_client_end_mark(pfe, SP_H2_END_SESSION_ERROR, 0, NULL);
           log_error("[HTTP/2] fd=%d: Failed to handle client data", fd);
           return -1; // Restart
         }
@@ -12809,7 +12845,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         pfe->rcv_off += rc;
 
         /* Header-completion deadline (slowloris guard), every listener.
-         * Anchor at the first byte of the in-progress request, then drop the
+         * Anchor at the first byte of the in-progress request (never on a
+         * body read: the block is complete; request N+1's clock starts in
+         * handle_on_message_begin), then drop the
          * connection if the listener's deadline elapses before http_hok
          * flips. The \r\n\r\n terminator is reflected by pfe->http_hok after
          * llhttp_execute below; the deadline is evaluated here, before
@@ -12818,12 +12856,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
          * stops sending altogether. */
         {
           proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
-          if (pfe->l7_hdr_accum_start == 0) {
-            pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
+          int64_t hdr_age;
+          if (!sp_hdr_armed(&pfe->l7_hdr)) {
+            if (!pfe->http_hdrs_done)
+              proxy_hdr_arm(pfe, time(NULL), -1);  /* at the first partial-header byte */
           } else if (!pfe->http_hdrs_done &&
-                     proxy_hdr_deadline_expired(hent, pfe, time(NULL))) {
-            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+                     proxy_hdr_deadline_expired(hent, pfe, time(NULL), &hdr_age)) {
+            sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; teardown follows */
             atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_H1_READ, hdr_age,
+                                              proxy_hdr_deadline_ms(hent));
             log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
                      "(slowloris guard) — dropping connection", fd,
                      proxy_hdr_deadline_ms(hent));
@@ -12857,6 +12899,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               pfe->parsed_off = 0;
               llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
               if (proxy_h2_handle_client_data(pfe) < 0) {
+                proxy_h2_client_end_mark(pfe, SP_H2_END_SESSION_ERROR, 0, NULL);
                 log_error("[HTTP/2] fd=%d: Failed to handle client data", fd);
                 return -1; // Restart
               }
@@ -12935,7 +12978,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
            * flips on the first "Host:" name, so a slowloris that sends "Host:" first
            * had its anchor cleared on its first partial read and was never dropped. */
           if (pfe->http_hdrs_done) {
-            pfe->l7_hdr_accum_start = 0;
+            sp_hdr_disarm(&pfe->l7_hdr);
             /* arm the member-data idle baseline. The request is now fully received and
              * about to be relayed to the member, so the timeoutMemberData deadline must start counting
              * "time waiting for the member to send data". The idle pass (sockproxy_health.c) only
@@ -12947,7 +12990,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
              * normally before the idle pass ticks; a member that stalls is cut at the configured ms. */
             {
               proxy_map_ent_t *l7ent = (proxy_map_ent_t *)pfe->head;
-              if (l7ent && l7ent->has_l7_policy && l7ent->arg_ptr &&
+              if (l7ent && l7_policy_on(l7ent) && l7ent->arg_ptr &&
                   l7ent->arg_ptr->timeout_member_data_ms > 0 && pfe->last_activity == 0) {
                 pfe->last_activity = time(NULL);
               }
@@ -13701,7 +13744,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
  * listeners. Legacy inject_forwarded_headers (above) stays untouched. */
       {
         proxy_map_ent_t *l7node = (proxy_map_ent_t *)pfe->head;
-        if (l7node && l7node->has_l7_policy) {
+        if (l7node && l7_policy_on(l7node)) {
           rc = (ssize_t)l7_inject_req_headers_h1(pfe, l7node, pfe->rcvbuf,
                                                  (size_t)rc, SP_SOCK_MSG_LEN, fd);
         }

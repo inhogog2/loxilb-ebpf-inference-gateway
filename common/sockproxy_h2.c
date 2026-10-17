@@ -610,10 +610,11 @@ proxy_h2_on_begin_headers_callback(nghttp2_session *session,
   proxy_fd_ent_t *pfe = (proxy_fd_ent_t *)user_data;
 
   (void)session;
-  (void)frame;
-  if (pfe && pfe->l7_hdr_accum_start == 0) {
-    pfe->l7_hdr_accum_start = time(NULL);
-  }
+  /* Header blocks are contiguous on a connection: one beginning means the
+   * last one ended, completed or reset. So every block starts its own clock,
+   * never inheriting the start of one that never reached END_HEADERS. */
+  if (pfe)
+    proxy_hdr_arm(pfe, time(NULL), frame->hd.stream_id);
   return 0;
 }
 
@@ -646,7 +647,7 @@ proxy_h2_on_frame_recv_callback(nghttp2_session *session,
       /* (H2 parity): a complete HEADERS frame arrived — clear the connection-level
        * header-accumulation anchor so the tcp_inspect deadline (checked in the H2 client-data
        * branch of proxy_run) no longer fires once real request headers have been received. */
-      pfe->l7_hdr_accum_start = 0;
+      sp_hdr_disarm(&pfe->l7_hdr);
       /* (H2 parity): arm the member-data idle baseline now that the request HEADERS are
        * complete and the request is about to be relayed to the member. Mirrors the H1 site in
        * sockproxy_http.c: the idle pass (sockproxy_health.c) only evaluates when last_activity>0, but
@@ -656,7 +657,7 @@ proxy_h2_on_frame_recv_callback(nghttp2_session *session,
  * a pure no-op for the AI peer / un-configured listeners. */
       {
         proxy_map_ent_t *l7ent = (proxy_map_ent_t *)pfe->head;
-        if (l7ent && l7ent->has_l7_policy && l7ent->arg_ptr &&
+        if (l7ent && l7_policy_on(l7ent) && l7ent->arg_ptr &&
             l7ent->arg_ptr->timeout_member_data_ms > 0 && pfe->last_activity == 0) {
           pfe->last_activity = time(NULL);
         }
@@ -947,6 +948,12 @@ proxy_h2_on_stream_close_callback(nghttp2_session *session,
   }
   
   proxy_h2_session_t *h2_sess = pfe->h2_session;  
+
+  /* A stream reset inside its header block never reaches END_HEADERS: its
+   * clock stops with it, or it would charge the live requests after it. */
+  if (sp_hdr_armed(&pfe->l7_hdr) &&
+      __atomic_load_n(&pfe->l7_hdr.stream, __ATOMIC_RELAXED) == stream_id)
+    sp_hdr_disarm(&pfe->l7_hdr);
   
   // Find and destroy stream
   proxy_h2_stream_t *stream = find_stream(h2_sess, stream_id);
@@ -1752,7 +1759,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     if (client_session->pfe) {
       proxy_fd_ent_t *client_pfe = (proxy_fd_ent_t *)client_session->pfe;
       proxy_map_ent_t *node = (proxy_map_ent_t *)client_pfe->head;
-      if (node && node->has_l7_policy &&
+      if (node && l7_policy_on(node) &&
           l7_cookie_persist_active(client_pfe, node)) {
         /* The pool must be the one THIS backend session belongs to —
          * client_pfe->epv is connection-scoped and a concurrent stream
@@ -1799,7 +1806,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     if (client_session->pfe) {
       proxy_fd_ent_t *client_pfe = (proxy_fd_ent_t *)client_session->pfe;
       proxy_map_ent_t *node = (proxy_map_ent_t *)client_pfe->head;
-      if (node && node->has_l7_policy &&
+      if (node && l7_policy_on(node) &&
           node->arg_ptr && node->arg_ptr->hsts_max_age > 0) {
         if (!node->val.have_ssl) {
           log_debug("[HSTS][H2] skip: plain-HTTP listener (have_ssl=0), "
@@ -2884,8 +2891,8 @@ proxy_setup_h2_session(proxy_fd_ent_t *pfe, int is_client)
   pfe->h2_session->created_ts = time(NULL);
   /* A client session owes its first HEADERS within the header-completion
    * deadline, counted from the preface. Cleared on END_HEADERS. */
-  if (!is_client && pfe->l7_hdr_accum_start == 0) {
-    pfe->l7_hdr_accum_start = pfe->h2_session->created_ts;
+  if (!is_client && !sp_hdr_armed(&pfe->l7_hdr)) {
+    proxy_hdr_arm(pfe, pfe->h2_session->created_ts, 0);
   }
 
   // METRICS: Track HTTP/2 session creation (TIER 1, Metric #4)
@@ -3528,8 +3535,10 @@ sp_fc_h2_gate_endpoint(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   sp_mcp_fc_scope mcp_scope={.pool=tepval,.request=pfe};
   ep = fc_ep_acquire_any(&tepval->fc, &stream->fc, FC_ROLE_NORMAL, ep_idx,
                          tepval->n_eps,
-                         tepval->mcp_stateless ? sp_mcp_fc_eligible : sp_fc_normal_eligible,
-                         tepval->mcp_stateless ? (void *)&mcp_scope : (void *)tepval, &v);
+                         tepval->mcp_stateless ? sp_mcp_fc_eligible :
+                         sp_route_subset(pfe, tepval) ? sp_fc_route_eligible : sp_fc_normal_eligible,
+                         tepval->mcp_stateless || sp_route_subset(pfe, tepval) ?
+                         (void *)&mcp_scope : (void *)tepval, &v);
   if (ep < 0) {
     sp_fc_h2_shed(pfe, stream, tepval, v, FC_ROLE_NORMAL);
     return -1;
@@ -3571,6 +3580,127 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
     }
   }
   return answered;
+}
+
+static int h2_client_end_claim(proxy_fd_ent_t *pfe, int reason, int err,
+                               const proxy_fd_ent_t *leg);
+
+void
+proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
+                         const proxy_fd_ent_t *leg)
+{
+  (void)h2_client_end_claim(pfe, reason, err, leg);
+}
+
+void
+proxy_h2_client_end_mark_deadline(proxy_fd_ent_t *pfe, int check,
+                                  int64_t age_s, uint32_t deadline_ms)
+{
+  if (!h2_client_end_claim(pfe, SP_H2_END_HDR_DEADLINE, 0, NULL))
+    return;
+  pfe->h2_end_hdr_check = (uint8_t)check;
+  pfe->h2_end_hdr_age_s = age_s;
+  pfe->h2_end_hdr_ms = deadline_ms;
+  /* The stream whose header block armed the clock (0: the preface). The
+   * session's last stream is read by the end line, on the connection's own
+   * worker: this may run on the health thread. */
+  pfe->h2_end_hdr_stream = __atomic_load_n(&pfe->l7_hdr.stream, __ATOMIC_RELAXED);
+}
+
+/* 1 when this call recorded the cause (and wrote the fields with it). */
+static int
+h2_client_end_claim(proxy_fd_ent_t *pfe, int reason, int err,
+                    const proxy_fd_ent_t *leg)
+{
+  uint8_t none = SP_H2_END_UNRECORDED;
+
+  if (!pfe || pfe->odir != 0 || !pfe->h2_session)
+    return 0;
+  /* Workers and the health thread both record causes, under no common
+   * lock: the first to claim the reason writes the rest. */
+  if (!__atomic_compare_exchange_n(&pfe->h2_end_reason, &none, (uint8_t)reason, 0,
+                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+    return 0;
+  pfe->h2_end_errno = err;
+  pfe->h2_end_leg_fd = -1;
+  pfe->h2_end_leg_ep = -1;
+  if (leg) {
+    struct sockaddr_in sa;
+    socklen_t sl = sizeof(sa);
+
+    pfe->h2_end_leg_fd = leg->fd;
+    pfe->h2_end_leg_ep = leg->ep_num;
+    /* The leg's socket is still open here: name its endpoint now. */
+    if (leg->fd > 0 && getpeername(leg->fd, (struct sockaddr *)&sa, &sl) == 0 &&
+        sa.sin_family == AF_INET) {
+      pfe->h2_end_leg_ip = sa.sin_addr.s_addr;
+      pfe->h2_end_leg_port = ntohs(sa.sin_port);
+    }
+  }
+  return 1;
+}
+
+void
+proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
+{
+  static const char *const reasons[] = {
+    "unrecorded", "client_eof", "client_error", "session_error",
+    "header_deadline", "idle_timeout", "backend_leg_ended",
+    "listener_deleted", "endpoint_teardown", "deferred_close", "reaper",
+  };
+  static const char *const xff[] = { "none", "replaced", "extended" };
+  static const char *const hdr_checks[] = { "-", "h2_read", "h1_read", "clock" };
+  proxy_h2_session_t *s;
+  unsigned int hc;
+  long long conn_age_s;
+  unsigned int r;
+  int err;
+  char leg_ip[INET_ADDRSTRLEN] = "-";
+  long long ago_ms = -1;
+
+  if (!pfe || pfe->odir != 0 || !(s = pfe->h2_session))
+    return;
+  r = __atomic_load_n(&pfe->h2_end_reason, __ATOMIC_RELAXED);
+  if (r >= sizeof(reasons) / sizeof(reasons[0]))
+    r = 0;
+  err = pfe->h2_end_errno;
+  if (r == SP_H2_END_UNRECORDED && pfe->fd > 0) {
+    socklen_t el = sizeof(err);
+    if (getsockopt(pfe->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0)
+      err = errno;
+  }
+  if (pfe->h2_end_leg_ip)
+    inet_ntop(AF_INET, &pfe->h2_end_leg_ip, leg_ip, sizeof(leg_ip));
+  if (pfe->h2_last_req_ms)
+    ago_ms = (long long)(proxy_mono_ms() - pfe->h2_last_req_ms);
+  hc = r == SP_H2_END_HDR_DEADLINE ? pfe->h2_end_hdr_check : 0;
+  if (hc >= sizeof(hdr_checks) / sizeof(hdr_checks[0]))
+    hc = 0;
+  conn_age_s = s->created_ts ? (long long)(time(NULL) - s->created_ts) : -1;
+
+#define H2_END_FMT "[HTTP/2] client connection ended: reason=%s fd=%d peer=%s " \
+  "open_streams=%d last_request_ms_ago=%lld leg_fd=%d leg_ep=%d leg_endpoint=%s:%u " \
+  "errno=%d xff=%s trusted_ranges=%u conn_age_s=%lld hdr_check=%s hdr_age_s=%lld " \
+  "hdr_deadline_ms=%u hdr_stream=%d last_stream=%d"
+#define H2_END_ARGS reasons[r], pfe->fd, pfe->l7_peer_ip[0] ? pfe->l7_peer_ip : "-", \
+  s->active_stream_count, ago_ms, \
+  r == SP_H2_END_LEG ? pfe->h2_end_leg_fd : -1, r == SP_H2_END_LEG ? pfe->h2_end_leg_ep : -1, \
+  leg_ip, (unsigned)pfe->h2_end_leg_port, err, \
+  xff[pfe->l7_xff_verdict <= SP_XFF_EXTENDED ? pfe->l7_xff_verdict : 0], \
+  (unsigned)pfe->l7_xff_ntrusted, conn_age_s, hdr_checks[hc], \
+  hc ? (long long)pfe->h2_end_hdr_age_s : -1LL, hc ? pfe->h2_end_hdr_ms : 0u, \
+  hc ? pfe->h2_end_hdr_stream : -1, hc && s->session ? \
+  nghttp2_session_get_last_proc_stream_id(s->session) : -1
+  /* The client leaving, and an end the gateway chose on schedule, are
+   * ordinary: info. An end that took requests with it, or came from an
+   * error, is a warning. */
+  if (r == SP_H2_END_CLIENT_EOF || r == SP_H2_END_IDLE ||
+      (r == SP_H2_END_LEG && s->active_stream_count == 0))
+    log_info(H2_END_FMT, H2_END_ARGS);
+  else
+    log_warn(H2_END_FMT, H2_END_ARGS);
+#undef H2_END_FMT
+#undef H2_END_ARGS
 }
 
 /**
@@ -4256,7 +4386,7 @@ static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     }
     if (!status && !sp_mcp_media_valid(&media)) status=400;
     if (!status) status=sp_mcp_validate(req,stream->method,(const char *)stream->data_buf,stream->data_len);
-    if (!status && ent->has_l7_policy) {
+    if (!status && l7_policy_on(ent)) {
       pfe->n_l7_headers=0;
       for (size_t i=0;i<stream->request_headers_count;i++) {
         const nghttp2_nv *h=&stream->request_headers[i];
@@ -4298,8 +4428,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     log_error("[HTTP/2] Invalid parameters for forward_to_backend");
     return -1;
   }
+  pfe->h2_last_req_ms = proxy_mono_ms();   /* for the connection's end line */
   
   ent = (proxy_map_ent_t *)pfe->head;
+  /* The streams of a connection share it: a route the last one's FORWARD
+   * named is not this one's. */
+  pfe->mcp_route_active = 0;
   proxy_epval_t *ent_pool0 = sp_pool_first(ent);  /* the listener's first pool, read once */
   if (ent_pool0 && ent_pool0->mcp_stateless &&
       sp_mcp_h2_gate(pfe,stream,ent)) return 0; /* this stream was refused */
@@ -4510,7 +4644,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   // live on the stream — so mirror them into pfe BEFORE dispatch (the contract
   // from -SUMMARY). The generic HEADER/COOKIE store (pfe->l7_headers) is
   // already H2-populated by Plan an earlier cycle's proxy_h2_on_header_callback.
-  if (ent && ent->has_l7_policy) {
+  if (ent && l7_policy_on(ent)) {
     proxy_epval_t *l7_tepval = NULL;
     int l7_rc;
 
@@ -4686,12 +4820,12 @@ h2_have_tepval:
   // returns L7_COOKIE_MISS and ep_idx stays -1 so the normal selection below runs
   // (: never an arbitrary backend). Nothing read/written on proxy_fd_ent
   // works identically on an HA peer that never saw the original request.
-  if (ent && ent->has_l7_policy && l7_cookie_persist_active(pfe, ent)) {
+  if (ent && l7_policy_on(ent) && l7_cookie_persist_active(pfe, ent)) {
     char presented[LB_COOKIE_TOKEN_MAX];
     if (l7_cookie_read_presented(pfe, presented, sizeof(presented)) == 0) {
       int cep = l7_cookie_node_match(ent, tepval, presented);
       if (cep != L7_COOKIE_MISS && cep >= 0 && cep < tepval->n_eps &&
-          is_endpoint_healthy(tepval, cep)) {
+          is_endpoint_healthy(tepval, cep) && sp_route_allows(pfe, cep)) {
         ep_idx = cep;
         log_debug("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
                  stream->stream_id, cep);
@@ -4713,8 +4847,8 @@ h2_have_tepval:
     if (conv_map) {
       ep_idx = conv_map->ep_idx;
       
-      // Validate endpoint is still healthy
-      if (is_endpoint_healthy(tepval, ep_idx)) {
+      // Validate endpoint is still healthy, and in the request's route
+      if (is_endpoint_healthy(tepval, ep_idx) && sp_route_allows(pfe, ep_idx)) {
         // Update conversation access time
         conv_map->last_access_ts = time(NULL);
         conv_map->request_count++;
@@ -4726,7 +4860,7 @@ h2_have_tepval:
   
 #ifdef HAVE_DP_GPU_ROUTING
   // CHWBL/WRR_HASH share the same configured hash identity and bounded-load selector.
-  if (ep_idx < 0 &&
+  if (ep_idx < 0 && !sp_route_subset(pfe, tepval) &&
       (tepval->select == PROXY_SEL_CHWBL || tepval->select == PROXY_SEL_WRR_HASH)) {
     llm_prefix_key_t empty_prefix = {0};
     llm_prefix_key_t *prefix_key = stream->prefix_key ?
@@ -4778,13 +4912,23 @@ h2_have_tepval:
         h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
         return 0;
       }
+    } else if (sp_route_subset(pfe, tepval)) {
+      /* A FORWARD route's members (l7_route_pool): healthy ones only. */
+      ep_idx = sp_mcp_request_select(tepval, pfe);
+      if (ep_idx < 0) {
+        fc_permit_release(&stream->fc);
+        proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "no_healthy_backend",
+                              "every endpoint of the route is down or circuit-broken");
+        return 0;
+      }
     } else {
       static int rr_counter = 0;
       int counter_val = rr_counter++;
       ep_idx = (counter_val % tepval->n_eps);
     }
   }
-  if (!(tepval->mcp_stateless))
+  /* A route's pick is healthy and its own; any other is checked here. */
+  if (!tepval->mcp_stateless && !(sp_route_subset(pfe, tepval) && sp_route_allows(pfe, ep_idx)))
     ep_idx = select_healthy_endpoint(tepval, ep_idx);
   if (ep_idx < 0) {
     log_error("[HTTP/2] stream %d: No healthy endpoint available", stream->stream_id);
@@ -4860,6 +5004,14 @@ h2_have_tepval:
     static const char body[]="{\"error\":\"mcp_backend_unavailable\"}";
     fc_permit_release(&stream->fc);
     h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
+    return 0;
+  }
+  /* A route's pick: the selector only looked at the breaker, the half-open
+   * probe is taken here. */
+  if (sp_route_subset(pfe, tepval) && !sp_mcp_reserve_probe(tepval, ep_idx)) {
+    fc_permit_release(&stream->fc);
+    proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "no_healthy_backend",
+                          "the route's endpoint is circuit-broken");
     return 0;
   }
   sp_pool_hold(&pfe->epv, tepval);
@@ -5178,7 +5330,7 @@ h2_have_tepval:
   nghttp2_nv *l7_headers_nv = NULL;
   l7h2_emit_ctx_t l7_hdr_ctx;
   int l7_hdr_built = 0;
-  if (ent && ent->has_l7_policy) {
+  if (ent && l7_policy_on(ent)) {
     size_t l7_n = 0;
     if (proxy_h2_build_l7_req_headers(pfe, ent, stream, headers, nheaders,
                                       pfe->fd, &l7_headers_nv, &l7_n,
