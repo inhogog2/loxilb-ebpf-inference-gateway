@@ -55,6 +55,7 @@
 #include "sockproxy_in_ifindex.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
+#include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
@@ -5948,8 +5949,11 @@ proxy_pdestroy(void *priv)
 
   /* A fatal HUP can bypass the read/EOF path. Refuse only this unfinished
    * bridge stream before entering PROXY_LOCK: framing and stream settling
-   * may re-enter control-plane locks through the client callbacks. */
+   * may re-enter control-plane locks through the client callbacks. An
+   * HTTP/2 leg answers the streams it carries here for the same reason;
+   * either way the leg is detached below and its client goes on. */
   proxy_h2_h1_backend_eof(pfe, 0);
+  proxy_h2_backend_leg_end(pfe);
 
   PROXY_LOCK();
   if (pfe) {
@@ -5975,7 +5979,7 @@ proxy_pdestroy(void *priv)
         }
       }
     }
-    proxy_h2_h1_backend_detach(pfe); /* isolate one bridge leg from its H2 client */
+    proxy_h2_h1_backend_detach(pfe); /* isolate one backend leg from its H2 client */
     ent = pfe->head;
     if (!ent) {
       assert(0);
@@ -5989,7 +5993,18 @@ proxy_pdestroy(void *priv)
       is_listener = 1;
       fd_ent = ent->val.fdlist;
       while (fd_ent) {
-        if (fd_ent->odir == 0) {
+        if (fd_ent->odir == 0 && fd_ent->h2_session &&
+            fd_ent->fd != ent->val.main_fd) {
+          /* An HTTP/2 client is ended by its own worker, which walks its
+           * session with no lock held: the hangup hands it its full teardown
+           * (settles, session, legs) there. sched_free keeps the rule until
+           * the last connection is gone. Recorded first: the owner sees only
+           * the hangup. */
+          proxy_h2_client_end_mark(fd_ent, SP_H2_END_LISTENER, 0, NULL);
+          if (fd_ent->fd > 0) {
+            shutdown(fd_ent->fd, SHUT_RDWR);
+          }
+        } else if (fd_ent->odir == 0) {
           /* Settle this connection's claims BEFORE anything frees them. The
            * rule is going away and it does take the endpoint pools with it —
            * but the token bucket is per-TENANT and outlives the rule, so a
@@ -10322,10 +10337,6 @@ handle_resp_message_complete(llhttp_t *parser)
  * still owed one. Observation only: nothing here changes what is relayed, and
  * no caller consults the counters yet.
  * ------------------------------------------------------------------------- */
-static llhttp_settings_t cresp_settings;   /* one for every connection */
-static int cresp_settings_inited;
-static llhttp_settings_t creq_settings;
-static int creq_settings_inited;
 
 /* The HEAD queue, written by both of a connection's workers: the client's when a
  * request is framed, the backend's when the matching response's headers are.
@@ -10462,20 +10473,24 @@ creq_on_headers_complete(llhttp_t *parser)
 }
 
 static void
+creq_settings_fill(llhttp_settings_t *s)
+{
+  s->on_message_begin = creq_on_message_begin;
+  s->on_header_field = creq_on_header_field;
+  s->on_header_field_complete = creq_on_header_field_complete;
+  s->on_header_value = creq_on_header_value;
+  s->on_header_value_complete = creq_on_header_value_complete;
+  s->on_headers_complete = creq_on_headers_complete;
+  s->on_message_complete = creq_on_message_complete;
+}
+
+/* One for every connection, filled once before the first parser uses it. */
+SP_PARSER_SETTINGS_ONCE(creq, creq_settings_fill)
+
+static void
 creq_parser_init(proxy_fd_ent_t *pfe)
 {
-  if (!creq_settings_inited) {
-    llhttp_settings_init(&creq_settings);
-    creq_settings.on_message_begin = creq_on_message_begin;
-    creq_settings.on_header_field = creq_on_header_field;
-    creq_settings.on_header_field_complete = creq_on_header_field_complete;
-    creq_settings.on_header_value = creq_on_header_value;
-    creq_settings.on_header_value_complete = creq_on_header_value_complete;
-    creq_settings.on_headers_complete = creq_on_headers_complete;
-    creq_settings.on_message_complete = creq_on_message_complete;
-    creq_settings_inited = 1;
-  }
-  llhttp_init(&pfe->creq_parser, HTTP_REQUEST, &creq_settings);
+  llhttp_init(&pfe->creq_parser, HTTP_REQUEST, creq_settings_get());
   pfe->creq_parser.data = pfe;
   pfe->creq_parser_inited = 1;
   creq_block_reset(&pfe->creq_blk);
@@ -10671,22 +10686,28 @@ cresp_note_local_answer(proxy_fd_ent_t *client)
   atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
 }
 
+static void
+cresp_settings_fill(llhttp_settings_t *s)
+{
+  s->on_message_begin = cresp_on_message_begin;
+  s->on_header_field = cresp_on_field;
+  s->on_header_value = cresp_on_value;
+  s->on_header_value_complete = cresp_on_value_done;
+  s->on_body = cresp_on_body;
+  s->on_headers_complete = cresp_on_headers_complete;
+  s->on_message_complete = cresp_on_message_complete;
+}
+
+/* One for every connection, filled once before the first parser uses it: the
+ * entry lock held here is per connection and does not order two workers'
+ * first connections. */
+SP_PARSER_SETTINGS_ONCE(cresp, cresp_settings_fill)
+
 /* Initialises the client entry's response framer. Called with the entry locked. */
 static void
 cresp_parser_init(proxy_fd_ent_t *pfe)
 {
-  if (!cresp_settings_inited) {
-    llhttp_settings_init(&cresp_settings);
-    cresp_settings.on_message_begin = cresp_on_message_begin;
-    cresp_settings.on_header_field = cresp_on_field;
-    cresp_settings.on_header_value = cresp_on_value;
-    cresp_settings.on_header_value_complete = cresp_on_value_done;
-    cresp_settings.on_body = cresp_on_body;
-    cresp_settings.on_headers_complete = cresp_on_headers_complete;
-    cresp_settings.on_message_complete = cresp_on_message_complete;
-    cresp_settings_inited = 1;
-  }
-  llhttp_init(&pfe->cresp_parser, HTTP_RESPONSE, &cresp_settings);
+  llhttp_init(&pfe->cresp_parser, HTTP_RESPONSE, cresp_settings_get());
   creq_block_reset(&pfe->cresp_blk);
   pfe->cresp_parser.data = pfe;
   pfe->cresp_parser_inited = 1;
@@ -12655,6 +12676,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       proxy_h2_h1_backend_eof(pfe,rc==0); /* reset is not a valid close delimiter */
       return -1;
     }
+    /* An HTTP/2 leg's end is answered for where it is seen, not only at the
+     * teardown that follows: from here no new stream is put on the leg. */
+    if (rc<=0 && pfe->backend_h2_session) {
+      proxy_h2_backend_leg_end(pfe);
+    }
 
     if (rc <= 0 && !pfe->odir && pfe->h2_session)
       proxy_h2_client_end_mark(pfe, rc == 0 ? SP_H2_END_CLIENT_EOF : SP_H2_END_CLIENT_ERROR,
@@ -13503,6 +13529,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // Process HTTP/2 frames from backend and forward to client
         if (proxy_h2_handle_backend_data(pfe) < 0) {
           log_error("[HTTP/2 Backend] fd=%d: Failed to handle backend response", fd);
+          proxy_h2_backend_leg_end(pfe);   /* the leg is done: answer for it now */
           return -1; // Restart
         }
 

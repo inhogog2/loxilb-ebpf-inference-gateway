@@ -2293,7 +2293,7 @@ int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe,int clean_eof)
 void proxy_h2_h1_backend_detach(proxy_fd_ent_t *pfe)
 {
   backend_h2_session_t *bs=pfe?pfe->backend_h2_session:NULL;
-  if (!bs || !bs->bridge_h1) return;
+  if (!bs || !bs->client_session) return;
   proxy_fd_ent_t *client=bs->client_session?bs->client_session->pfe:NULL;
   if (client && bs->slot>=0 && bs->slot<MAX_PROXY_EP && client->rfd_ent[bs->slot]==pfe) {
     client->rfd_ent[bs->slot]=NULL;client->rfd[bs->slot]=-1;
@@ -3469,8 +3469,6 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     fc_count(&tepval->fc, FC_R_DRAINING);
   else if (v == FC_TENANT_SHARE)
     fc_count(&tepval->fc, FC_R_TENANT_SHARE);
-  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
-                              limit, v == FC_DRAINING ? 5 : 1);
   ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
                              stream->svc_ident, stream->effective_model,
                              stream->tenant_id, stream->auth_key_id,
@@ -3489,6 +3487,10 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
            stream->stream_id, status, code, role, inflight, limit,
            stream->tenant_id, stream->effective_model);
   fc_permit_release(&stream->fc);
+  /* Last: with the request complete, the answer ends the stream and frees
+   * it before the send returns, so everything above reads it first. */
+  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
+                              limit, v == FC_DRAINING ? 5 : 1);
 }
 
 /* 0 = proceed; -1 = refused, terminal response framed on the stream. */
@@ -3553,25 +3555,51 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
 {
   backend_h2_session_t *bs;
   stream_mapping_t *mapping, *tmp;
-  int32_t ids[64];
-  int n = 0, answered = 0;
+  int32_t *ids;
+  unsigned int n = 0, cap;
+  int answered = 0;
 
   if (!client || !backend || !client->h2_session || !client->h2_session->session) {
     return 0;
   }
   bs = (backend_h2_session_t *)backend->backend_h2_session;
-  if (!bs) {
+  if (!bs || bs->leg_ended) {
+    return 0;
+  }
+  bs->leg_ended = 1;
+  cap = HASH_COUNT(bs->stream_map);
+  if (cap == 0) {
+    return 0;
+  }
+  ids = calloc(cap, sizeof(*ids));
+  if (!ids) {
+    /* Unanswered, these streams would wait for a response that cannot
+     * come: end the client connection instead, the way it ended before. */
+    log_error("[HTTP/2] fd=%d: cannot answer the %u streams of an ended backend leg",
+              client->fd, cap);
+    shutdown(client->fd, SHUT_RDWR);
     return 0;
   }
   HASH_ITER(hh, bs->stream_map, mapping, tmp) {
-    if (n < (int)(sizeof(ids) / sizeof(ids[0]))) {
+    if (n < cap) {
       ids[n++] = mapping->client_stream_id;
     }
   }
-  for (int i = 0; i < n; i++) {
+  for (unsigned int i = 0; i < n; i++) {
     proxy_h2_stream_t *stream = find_stream(client->h2_session, ids[i]);
 
-    if (!stream) {
+    /* A response the backend already ended is queued whole on the relay,
+     * which ends the stream by itself. */
+    if (!stream || stream->resp.reset_submitted || stream->resp.eos_sent ||
+        stream->resp.eos_pending) {
+      continue;
+    }
+    /* Answered here means answered: the client read path must not forward
+     * the stream again while the answer waits for the client's window. */
+    stream->response_sent = 1;
+    if (stream->resp.final_headers_sent) {
+      h2_resp_relay_reset(client->h2_session, stream, NGHTTP2_INTERNAL_ERROR);
+      answered++;
       continue;
     }
     if (proxy_h2_send_ai_deny(client, stream, 503, 0, 0, "backend_unreachable",
@@ -3579,6 +3607,8 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
       answered++;
     }
   }
+  free(ids);
+  nghttp2_session_send(client->h2_session->session);
   return answered;
 }
 
@@ -3630,9 +3660,13 @@ h2_client_end_claim(proxy_fd_ent_t *pfe, int reason, int err,
 
     pfe->h2_end_leg_fd = leg->fd;
     pfe->h2_end_leg_ep = leg->ep_num;
-    /* The leg's socket is still open here: name its endpoint now. */
-    if (leg->fd > 0 && getpeername(leg->fd, (struct sockaddr *)&sa, &sl) == 0 &&
-        sa.sin_family == AF_INET) {
+    /* An HTTP/2 leg kept its endpoint from creation; any other leg is named
+     * from its socket, while that is still connected. */
+    if (leg->leg_ep_xip) {
+      pfe->h2_end_leg_ip = leg->leg_ep_xip;
+      pfe->h2_end_leg_port = ntohs(leg->leg_ep_xport);
+    } else if (leg->fd > 0 && getpeername(leg->fd, (struct sockaddr *)&sa, &sl) == 0 &&
+               sa.sin_family == AF_INET) {
       pfe->h2_end_leg_ip = sa.sin_addr.s_addr;
       pfe->h2_end_leg_port = ntohs(sa.sin_port);
     }
@@ -3701,6 +3735,56 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
     log_warn(H2_END_FMT, H2_END_ARGS);
 #undef H2_END_FMT
 #undef H2_END_ARGS
+}
+
+/* See sockproxy_h2.h. */
+void
+proxy_h2_backend_leg_init(proxy_fd_ent_t *bpfe, int fd, void *ssl,
+                          proxy_map_ent_t *ent, int ep_idx,
+                          proxy_epval_t *tepval, backend_h2_session_t *bs)
+{
+  bpfe->fd = fd;
+  bpfe->ssl = ssl;
+  bpfe->odir = 1;                     // Backend direction (outbound from proxy)
+  bpfe->head = ent;                   // Link to proxy_map_ent_t
+  bpfe->protocol_version = 2;         // HTTP/2
+  bpfe->ep_num = ep_idx;              // Endpoint index INSIDE its pool —
+  sp_pool_hold(&bpfe->epv, tepval);   // with epv this pair IS the slot's
+                                      // reuse identity (see slot search)
+  /* The leg takes no P/D unit of its own. It holds a pool, so its teardown
+   * runs the P/D release (pd_cleanup), which releases on any index >= 0:
+   * left at the allocator's 0 it handed back endpoint 0's prefill and decode
+   * units and woke a request parked on it. The HTTP/1.1 leg clears the same
+   * index (and holds no pool). */
+  bpfe->pd_prefill_ep_idx = -1;
+  bpfe->pd_decode_ep_idx = -1;
+  bpfe->load_units_per_stream = 1;    // units live on the mappings, not here
+  bpfe->stype = PROXY_SOCK_ACTIVE;    // Active connection
+  bpfe->used = 1;                     // Mark as in use
+  bpfe->backend_h2_session = bs;      // For event handler lookup
+  if (tepval && ep_idx >= 0 && ep_idx < tepval->n_eps) {
+    bpfe->leg_ep_xip = tepval->eps[ep_idx].xip;      // the endpoint, for the
+    bpfe->leg_ep_xport = tepval->eps[ep_idx].xport;  // client's end line
+  }
+}
+
+/* See sockproxy_h2.h. */
+int
+proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe)
+{
+  backend_h2_session_t *bs = pfe ? pfe->backend_h2_session : NULL;
+  proxy_fd_ent_t *client;
+
+  if (!bs || bs->bridge_h1 || !bs->client_session) {
+    return 0;
+  }
+  client = bs->client_session->pfe;
+  if (!client || bs->slot < 0 || bs->slot >= MAX_PROXY_EP ||
+      client->rfd_ent[bs->slot] != pfe) {
+    return 0;
+  }
+  (void)proxy_h2_backend_leg_unanswered(client, pfe);
+  return 1;
 }
 
 /**
@@ -3793,27 +3877,41 @@ proxy_h2_handle_client_data(proxy_fd_ent_t *pfe)
     }
   }
   
-  // Check if we have complete requests to forward
+  /* Forward the complete requests. A forward can send: any frames queued
+   * go out with it, and another stream whose answer was waiting for the
+   * client's window can end and be freed there. So nothing holds a stream
+   * across a forward, not even the walk's next pointer: the ready streams
+   * are listed by id first, and each is found again before it goes. */
   proxy_h2_stream_t *stream, *tmp;
-  int total_streams = 0;
-  int ready_streams = 0;
-  HASH_ITER(hh, pfe->h2_session->streams, stream, tmp) {
-    total_streams++;
+  int32_t ready_local[64], *ready = ready_local;
+  unsigned int n_streams = HASH_COUNT(pfe->h2_session->streams), n_ready = 0;
 
-    if (stream->headers_complete && stream->data_complete && !stream->response_sent) {
-      ready_streams++;
-      
-      int32_t forwarded_id=stream->stream_id;
-      rv = proxy_h2_forward_to_backend(pfe, stream);
-      if (rv == 0) {
-        // A local terminal answer may have closed and freed this stream.
-        proxy_h2_stream_t *live=find_stream(pfe->h2_session,forwarded_id);
-        if (live) live->response_sent = 1;
-      } else {
-        log_error("[HTTP/2] ✗ Failed to forward stream %d to backend", forwarded_id);
-      }
+  if (n_streams > sizeof(ready_local) / sizeof(ready_local[0])) {
+    ready = malloc(n_streams * sizeof(*ready));
+    if (!ready) {
+      log_error("[HTTP/2] fd=%d: no memory to list %u streams", pfe->fd, n_streams);
+      return -1;
     }
   }
+  HASH_ITER(hh, pfe->h2_session->streams, stream, tmp) {
+    if (stream->headers_complete && stream->data_complete && !stream->response_sent)
+      ready[n_ready++] = stream->stream_id;
+  }
+  for (unsigned int i = 0; i < n_ready; i++) {
+    stream = find_stream(pfe->h2_session, ready[i]);
+    if (!stream || stream->response_sent)
+      continue;   /* ended or answered by an earlier forward's send */
+    rv = proxy_h2_forward_to_backend(pfe, stream);
+    if (rv == 0) {
+      // A local terminal answer may have closed and freed this stream.
+      proxy_h2_stream_t *live=find_stream(pfe->h2_session,ready[i]);
+      if (live) live->response_sent = 1;
+    } else {
+      log_error("[HTTP/2] ✗ Failed to forward stream %d to backend", ready[i]);
+    }
+  }
+  if (ready != ready_local)
+    free(ready);
   
   // Send any pending frames to client
   // ⚠️ CRITICAL FIX for gRPC streaming: Handle client disconnection gracefully
@@ -4099,11 +4197,20 @@ proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe)
  * Data source for buffered request body
  * Used when forwarding client request data to backend
  */
-typedef struct {
-  uint8_t *data;      // Buffered request body
-  size_t len;         // Total length
-  size_t offset;      // Current read position
-} h2_data_source_t;
+/* See sockproxy_h2.h. */
+h2_data_source_t *
+proxy_h2_body_source_new(const uint8_t *body, size_t len)
+{
+  h2_data_source_t *src = malloc(sizeof(*src) + len);
+
+  if (!src)
+    return NULL;
+  src->data = (uint8_t *)(src + 1);
+  memcpy(src->data, body, len);
+  src->len = len;
+  src->offset = 0;
+  return src;
+}
 
 /**
  * nghttp2 data read callback for forwarding buffered request body
@@ -4429,6 +4536,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     return -1;
   }
   pfe->h2_last_req_ms = proxy_mono_ms();   /* for the connection's end line */
+
+  /* An answer sent from here (a deny, an L7 reject or redirect) can end the
+   * stream at once when the client has already sent all of its request:
+   * nghttp2's close callback frees it before the send returns. Whatever is
+   * logged after such an answer reads the id from here, never the stream. */
+  const int32_t stream_id = stream->stream_id;
   
   ent = (proxy_map_ent_t *)pfe->head;
   /* The streams of a connection share it: a route the last one's FORWARD
@@ -4546,12 +4659,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       if (adm.net_identity[0])
         log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s net_identity=%s",
-                 stream->stream_id, adm.http_status, adm.stage,
+                 stream_id, adm.http_status, adm.stage,
                  adm.error_code, adm.key_id, adm.tenant_id, adm.net_identity);
       else
         log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s",
-                 stream->stream_id, adm.http_status, adm.stage,
+                 stream_id, adm.http_status, adm.stage,
                  adm.error_code, adm.key_id, adm.tenant_id);
       return 0;
     } else {
@@ -4678,7 +4791,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     // diagnostic ( H1/H2 parity): make the H2 L7 decision visible
     // in loxilbdp.log so a FORWARD-with-no-pool vs a no-match-REJECT is debuggable.
     log_debug("[HTTP/2][L7] stream=%d host='%s' path='%s' rc=%d tepval=%p",
-              stream->stream_id, pfe->host_url, pfe->request_path,
+              stream_id, pfe->host_url, pfe->request_path,
               l7_rc, (void *)l7_tepval);
 
     pfe->h2_session->l7_active_stream_id = 0;  // clear after dispatch
@@ -4734,11 +4847,12 @@ h2_have_tepval:
      * for which no pool exists gets a clean 503, not a bare RST — the
      * client can tell "model unavailable" from a transport failure. */
     if (lookup_model[0] && pfe && pfe->h2_session && pfe->h2_session->session) {
+      /* Logged first: lookup_model may point into the stream. */
+      log_info("[MODEL_ROUTING][HTTP/2] 503 for model='%s' stream=%d",
+               lookup_model, stream_id);
       proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0,
                             "model_unavailable",
                             "no backend pool for this model");
-      log_info("[MODEL_ROUTING][HTTP/2] 503 sent for model='%s' stream=%d",
-               lookup_model, stream->stream_id);
       return 0;
     }
 
@@ -4867,8 +4981,14 @@ h2_have_tepval:
         (llm_prefix_key_t *)stream->prefix_key : &empty_prefix;
     int policy_rc = chwbl_hash_and_select_runtime(tepval, prefix_key, &ep_idx);
     if (policy_rc == -2) {
-      proxy_h2_send_l7_synthetic(pfe, 400, NULL, NULL);
-      return -1;
+      /* The request's cache_salt is unusable: answered 400 on its own
+       * stream. The L7 responder used here before answers only during an
+       * L7 dispatch, so this stream was left unanswered. The permit goes
+       * first: the answer can free the stream. */
+      fc_permit_release(&stream->fc);
+      proxy_h2_send_ai_deny(pfe, stream, 400, 0, 0, "invalid_cache_salt",
+                            "cache_salt must be a non-empty JSON string of at most 63 bytes");
+      return 0;
     }
     if (policy_rc != 0) {
       ep_idx = -1;
@@ -4923,7 +5043,7 @@ h2_have_tepval:
       }
     } else {
       static int rr_counter = 0;
-      int counter_val = rr_counter++;
+      int counter_val = __atomic_fetch_add(&rr_counter, 1, __ATOMIC_RELAXED);
       ep_idx = (counter_val % tepval->n_eps);
     }
   }
@@ -5052,8 +5172,12 @@ h2_have_tepval:
     /* A connection made under a backend TLS policy the listener has since
      * replaced takes no new stream: the streams on it finish there, this one
      * gets a connection made with the context in service. */
+    /* Nor does a leg whose end was seen and answered for: its teardown is
+     * still to come, and a stream mapped on it now would never be answered. */
     if (!bridge_h1 && bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
-        pfe->rfd[i] > 0 && !proxy_leg_tls_stale(ent, bpfe)) {
+        pfe->rfd[i] > 0 && !proxy_leg_tls_stale(ent, bpfe) &&
+        !(bpfe->backend_h2_session &&
+          ((backend_h2_session_t *)bpfe->backend_h2_session)->leg_ended)) {
       slot = i;
       backend_fd = pfe->rfd[i];
       break;
@@ -5247,19 +5371,8 @@ h2_have_tepval:
       return -1;
     }
     
-    // Setup backend pfe metadata (same pattern as HTTP/1.1)
-    backend_pfe->fd = backend_fd;
-    backend_pfe->ssl = backend_ssl;
-    backend_pfe->odir = 1;                    // Backend direction (outbound from proxy)
-    backend_pfe->head = ent;                  // Link to proxy_map_ent_t
-    backend_pfe->protocol_version = 2;        // HTTP/2
-    backend_pfe->ep_num = ep_idx;             // Endpoint index INSIDE its pool —
-    sp_pool_hold(&backend_pfe->epv, tepval);  // with epv this pair IS the slot's
-                                              // reuse identity (see slot search)
-    backend_pfe->load_units_per_stream = 1;   // units live on the mappings, not here
-    backend_pfe->stype = PROXY_SOCK_ACTIVE;   // Active connection
-    backend_pfe->used = 1;                    // Mark as in use
-    backend_pfe->backend_h2_session = backend_session;  // For event handler lookup
+    proxy_h2_backend_leg_init(backend_pfe, backend_fd, backend_ssl, ent, ep_idx,
+                              tepval, backend_session);
     
     // Link backend pfe to client pfe (bidirectional)
     pfe->rfd_ent[slot] = backend_pfe;
@@ -5408,25 +5521,36 @@ h2_have_tepval:
     return 0;
   }
 
+  /* The stream mapping owns the body source once the request is submitted,
+   * and nothing may fail between the submit and that hand-over: nghttp2
+   * would keep reading a source nobody frees. So it is taken first. */
+  stream_mapping_t *mapping = calloc(1, sizeof(stream_mapping_t));
+  if (!mapping) {
+    log_error("[HTTP/2] stream %d: Failed to allocate stream mapping", stream->stream_id);
+    free(security_headers_nv);
+    if (l7_hdr_built)
+      proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
+    return -1;
+  }
+
   // Prepare data provider for request body (if present)
   nghttp2_data_provider data_prd;
   nghttp2_data_provider *data_prd_ptr = NULL;
   h2_data_source_t *data_src = NULL;
 
   if (stream->data_len > 0 && stream->data_buf) {
-    // Allocate data source wrapper (will be freed when stream closes)
-    data_src = malloc(sizeof(h2_data_source_t));
+    /* The backend reads the body on its own schedule (flow control), after
+     * the client stream may have been reset and freed: the source carries
+     * its own copy, freed with the mapping. */
+    data_src = proxy_h2_body_source_new(stream->data_buf, stream->data_len);
     if (!data_src) {
       log_error("[HTTP/2] stream %d: Failed to allocate data source", stream->stream_id);
+      free(mapping);
       free(security_headers_nv);
       if (l7_hdr_built)
         proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
       return -1;
     }
-
-    data_src->data = stream->data_buf;
-    data_src->len = stream->data_len;
-    data_src->offset = 0;
 
     data_prd.source.ptr = data_src;
     data_prd.read_callback = proxy_h2_data_read_callback;
@@ -5463,6 +5587,8 @@ h2_have_tepval:
   if (backend_stream_id < 0) {
     log_error("[HTTP/2] stream %d: nghttp2_submit_request failed: %s",
               stream->stream_id, nghttp2_strerror(backend_stream_id));
+    free(data_src);   /* nghttp2 took no reference to it */
+    free(mapping);
     
     // P2 Task 2.3: Record circuit breaker failure
     circuit_breaker_record_failure(tepval, ep_idx);
@@ -5477,13 +5603,7 @@ h2_have_tepval:
     return -1;
   }
   
-  // Create stream mapping (client_stream_id → backend_stream_id)
-  stream_mapping_t *mapping = calloc(1, sizeof(stream_mapping_t));
-  if (!mapping) {
-    log_error("[HTTP/2] stream %d: Failed to allocate stream mapping", stream->stream_id);
-    return -1;
-  }
-  
+  // Fill the stream mapping (client_stream_id → backend_stream_id)
   mapping->client_stream_id = stream->stream_id;
   mapping->backend_stream_id = backend_stream_id;
   mapping->ep_idx = ep_idx;

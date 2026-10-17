@@ -110,11 +110,57 @@ static void reap_pending_connects(uint64_t now_ms);
  * -ENOENT the worker owns proxy_pdestroy()+free for that fd — skip our free. We
  * still detach the cross-references first so the worker's proxy_release_rfd_ctx
  * cannot cascade back into the client. */
-static void
+/* Is this entry part of an HTTP/2 connection (its client, or one of its
+ * legs, bridge or HTTP/2)? Read under PROXY_LOCK; a worker sets h2_session
+ * without it, so a client switching right now reads as HTTP/1.1, the same
+ * exposure every HTTP/1.1 client has under the inline teardown below. */
+static int
+pd_h2_conn(const proxy_fd_ent_t *e)
+{
+  return e && (e->h2_session || (e->odir == 1 && e->backend_h2_session));
+}
+
+static int
 pd_teardown_conn(proxy_fd_ent_t *client)
 {
   if (client == NULL) {
-    return;
+    return 1;
+  }
+
+  /* Any entry of an HTTP/2 connection (the client, or one of its legs) is
+   * ended by its own worker, never here. That worker walks the client's
+   * HTTP/2 session with no lock held, so a teardown from this thread races
+   * it; and the inline free below knows nothing of the session: it skipped
+   * the streams' settles and left the session allocated. The shutdown wakes
+   * the owner with a hangup: a leg answers its streams and is detached from
+   * its client (the client goes on), a client goes through its own full
+   * teardown. Safe under PROXY_LOCK: the fd is closed only by that teardown,
+   * which needs the lock.
+   *
+   * Returns 1 when the entry passed in was freed here (the caller's list
+   * changed under it), 0 when it was not: handed off, or already claimed by
+   * a worker blocked on our lock, which frees it once we let go.
+   *
+   * The cause is recorded before the hangup, which the owner reads as the
+   * client leaving. A leg records nothing: its client goes on. */
+  if (pd_h2_conn(client)) {
+    proxy_h2_client_end_mark(client, SP_H2_END_TEARDOWN, 0, NULL);
+    if (client->fd > 0) {
+      shutdown(client->fd, SHUT_RDWR);
+    }
+    return 0;
+  }
+  /* Nor through a peer: an HTTP/1.1 leg whose client switched to HTTP/2 (the
+   * prior-knowledge preface after an HTTP/1.1 request) would free that
+   * client below. Its own worker tears the pair down instead. */
+  for (int i = 0; i < client->n_rfd && i < MAX_PROXY_EP; i++) {
+    if (pd_h2_conn(client->rfd_ent[i])) {
+      proxy_h2_client_end_mark(client->rfd_ent[i], SP_H2_END_TEARDOWN, 0, client);
+      if (client->fd > 0) {
+        shutdown(client->fd, SHUT_RDWR);
+      }
+      return 0;
+    }
   }
   proxy_h2_client_end_mark(client, SP_H2_END_TEARDOWN, 0, NULL);
 
@@ -170,6 +216,7 @@ pd_teardown_conn(proxy_fd_ent_t *client)
     proxy_try_free_fd_ctx(client);     /* used-- -> free (single owner) */
   }
   /* else: a notify worker owns the client's proxy_pdestroy()+free — skip. */
+  return client_owned;
 }
 
 /* The text of every response this thread owes a client it ends, by kind
@@ -636,7 +683,7 @@ void
 force_close_endpoint_connections(proxy_map_ent_t *ent, int ep_index)
 {
   proxy_fd_ent_t *fd_ent;
-  uint32_t closed_count = 0;
+  uint32_t closed_count = 0, handed_count = 0;
 
   if (!ent) return;
 
@@ -656,15 +703,30 @@ restart:
       continue;
     }
 
+    /* An HTTP/2 client's ep_num is only where its latest stream went: the
+     * endpoint going away ends the client's legs to it, matched below, and
+     * the client goes on over its other legs. */
+    if (fd_ent->h2_session) {
+      continue;
+    }
+
     /* Single-owner teardown (no pdestroy, no PROXY_LOCK re-entry). Frees fd_ent
-     * and its peer legs and unlinks them from fdlist, so re-scan from the head. */
-    pd_teardown_conn(fd_ent);
+     * and its peer legs and unlinks them from fdlist, so re-scan from the head.
+     * When fd_ent was not freed (an HTTP/2 entry handed to its worker, or an
+     * entry a worker already claimed) it is still linked and would match
+     * again: the scan goes on past it instead, its neighbours kept by the
+     * unlinks under this lock. */
+    if (!pd_teardown_conn(fd_ent)) {
+      handed_count++;
+      continue;
+    }
     closed_count++;
     goto restart;
   }
 
-  if (closed_count > 0) {
-    log_info("[DRAIN] ep[%d]: force-closed %u connection(s)", ep_index, closed_count);
+  if (closed_count > 0 || handed_count > 0) {
+    log_info("[DRAIN] ep[%d]: force-closed %u connection(s), %u handed to their worker",
+             ep_index, closed_count, handed_count);
   }
 }
 
