@@ -58,6 +58,7 @@ typedef struct pool_opts {
   uint32_t depth;
   uint8_t  wake;
   uint8_t  floor[FC_BANDS];      /* by band */
+  uint8_t  weight[FC_BANDS];     /* by band; read with the weighted wake */
   uint8_t  reserve;
   uint8_t  share_pct;
   uint8_t  adaptive;
@@ -79,6 +80,7 @@ pool_make(fc_state_t *fc, const pool_opts_t *o)
   cfg.tenant_share_pct = o->share_pct;
   cfg.adaptive = o->adaptive;
   memcpy(cfg.band_min_share_pct, o->floor, sizeof(cfg.band_min_share_pct));
+  memcpy(cfg.band_weight, o->weight, sizeof(cfg.band_weight));
   cfg.critical_reserve_pct = o->reserve;
   fc_state_apply(fc, &cfg);
 }
@@ -510,11 +512,12 @@ test_resume_order_policy_decides_at_floors(void)
 {
   static const struct { uint8_t wake; int want; } k[] = {
     { FC_WAKE_STRICT, 22 },            /* the highest band */
-    { FC_WAKE_WEIGHTED, 20 },          /* until it runs rounds: the oldest */
+    { FC_WAKE_WEIGHTED, 22 },          /* a fresh round: the highest band with credit */
   };
 
   for (unsigned i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
-    pool_opts_t o = { .cap = 4, .depth = 8, .wake = k[i].wake };
+    pool_opts_t o = { .cap = 4, .depth = 8, .wake = k[i].wake,
+                      .weight = { [C] = 8, [S] = 3, [B] = 1 } };
     fc_permit_t c1, c2, b1, s1, wb, ws, wc;
     fc_state_t fc;
 

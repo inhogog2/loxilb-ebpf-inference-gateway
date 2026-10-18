@@ -55,6 +55,11 @@ pool_with(fc_state_t *fc, uint32_t max_out, uint32_t depth, uint8_t wake,
   cfg.wake_policy = wake;
   cfg.shed_queue = shed_queue;
   cfg.tenant_share_pct = share_pct;
+  if (wake == FC_WAKE_WEIGHTED) {
+    cfg.band_weight[FC_BAND_CRITICAL] = 8;
+    cfg.band_weight[FC_BAND_STANDARD] = 3;
+    cfg.band_weight[FC_BAND_SHEDDABLE] = 1;
+  }
   fc_state_apply(fc, &cfg);
 }
 
@@ -256,7 +261,7 @@ test_strict_newcomer_rule(void)
   fc_permit_release(&run);
   fc_state_destroy(&fc);
 
-  /* Weighted (until it orders bands): behind anybody. */
+  /* Weighted: behind anybody. */
   pool_with(&fc, 2, 4, FC_WAKE_WEIGHTED, 0, 0);
   fc_permit_init(&run);
   fc_permit_init(&w);
@@ -362,12 +367,14 @@ test_strict_pick(void)
     for (int i = 0; i < 4; i++)
       assert(order[i] == i);
   }
-  /* Weighted until it runs its rounds: arrival order across bands. */
+  /* Weighted 8:3:1: a fresh round serves the highest band with credit
+   * first, then the next: critical, standard, sheddable. */
   {
     const uint8_t b[] = { S, B, C };
+    const int want[] = { 2, 0, 1 };
     wake_order(FC_WAKE_WEIGHTED, b, 3, order, 0);
     for (int i = 0; i < 3; i++)
-      assert(order[i] == i);
+      assert(order[i] == want[i]);
   }
   printf("  ok strict pick\n");
 }

@@ -424,6 +424,12 @@ typedef struct fc_queue {
   uint32_t used;
   uint32_t count;
   uint32_t band_count[FC_BANDS]; /* live entries per band; the standard slot is never written */
+  /* Weighted wake: the credits each band has left in the round in progress (spent one per wake,
+   * set again from the weights when no band that has a runnable waiter has any left, and reset
+   * when the policy or the weights change). Round-robin tenant wake: the tenant slot a band's
+   * next turn starts from, one past the slot it served last. Both under the lock. */
+  uint32_t drr_credit[FC_BANDS];
+  uint32_t rr_next[FC_BANDS];
   uint32_t dead;                 /* the pool's rule is gone: nothing may wait here again */
   fc_evicted_t evicted[FC_EVICT_PENDING]; /* evicted waiters owed their answer, oldest first */
   _Atomic uint32_t n_evicted;    /* written under the lock, read without it */

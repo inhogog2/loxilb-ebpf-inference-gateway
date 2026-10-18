@@ -708,6 +708,13 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
     for (int e = 0; e < FC_MAX_EP; e++)
       atomic_store_explicit(&fc->warm_since_ns[e], 0, memory_order_relaxed);
   fc_adapt_reset(fc, &old);
+  /* A new policy or new weights start a round of their own, and a new tenant
+   * order starts its turns again; waiters keep their places and bands. */
+  if (old.wake_policy != fc->cfg.wake_policy ||
+      memcmp(old.band_weight, fc->cfg.band_weight, sizeof(old.band_weight)) != 0)
+    memset(fc->queue.drr_credit, 0, sizeof(fc->queue.drr_credit));
+  if (old.tenant_wake != fc->cfg.tenant_wake)
+    memset(fc->queue.rr_next, 0, sizeof(fc->queue.rr_next));
   if (!fc->queue.dead && fc->cfg.max_queue_depth > fc->queue.cap)
     (void)fc_ring_grow(&fc->queue, fc->cfg.max_queue_depth);
   pthread_mutex_unlock(&fc->queue.lock);
@@ -1433,6 +1440,16 @@ fc_band_unit_give(fc_state_t *fc, const fc_permit_t *p)
 {
   if (fc_band_counted(p->band))
     fc_unit_give(&fc->band_inflight[p->band]);
+}
+
+/* Whether the pool follows its waiters by tenant: a tenant share bounds them, or the
+ * round-robin wake needs to tell them apart. */
+static inline int
+fc_tenants_tracked(const fc_state_t *fc)
+{
+  return fc_share_active(fc) ||
+         (fc != NULL && fc->cfg.mode != FC_MODE_OFF &&
+          fc->cfg.tenant_wake == FC_TENANT_WAKE_RR);
 }
 
 /* Whether the strict wake orders this pool's waiters by band. Weighted
@@ -2361,7 +2378,7 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   if (!band_full && !fc->queue.dead && fc_queue_enabled(fc) &&
       (front || fc->queue.count < fc->cfg.max_queue_depth ||
        evict != UINT32_MAX)) {
-    if (fc_share_active(fc)) {
+    if (fc_tenants_tracked(fc)) {
       uint32_t qbound = fc_tenant_queue_bound(fc);
       tslot = fc_tenant_get(fc, tkey, 0);
       /* A request going back to the head already held its place. */
@@ -2519,9 +2536,6 @@ fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out)
   return rc;
 }
 
-static int fc_ring_pop_floor(fc_state_t *fc, fc_queue_ent_t *out,
-                             const uint32_t pend[FC_BANDS]);
-
 /* Lock held. Take the live entry at ring index `at` out of the queue. */
 static void
 fc_ring_take_at(fc_queue_t *q, uint32_t at, fc_queue_ent_t *out)
@@ -2538,26 +2552,170 @@ fc_ring_take_at(fc_queue_t *q, uint32_t at, fc_queue_ent_t *out)
   }
 }
 
-/* Lock held. Take out the oldest live entry whose tenant could take a unit
- * now; the ones passed over keep their place. Under strict with a waiter of
- * a band other than standard, the oldest such entry of the highest band
- * that has one; with every waiter standard the walk is the plain one. Its
- * tenant's queue count is left for the caller to settle once the wake is
- * delivered: an entry put back keeps its slot counted, so the slot is never
- * reused under it. */
+/* What a pick spent, so a wake that cannot be delivered gives it back. */
+typedef struct fc_pick_undo {
+  int      band;                 /* -1: nothing was spent */
+  int      credit;               /* a weighted credit */
+  int      rr;                   /* the tenant order moved */
+  uint32_t rr_before;
+  uint32_t rr_after;
+} fc_pick_undo_t;
+
+/* The tenant slot an entry belongs to in the round-robin order; an entry
+ * with none is one more tenant, last. */
+static inline uint32_t
+fc_rr_key(const fc_queue_ent_t *e)
+{
+  return e->tslot < 0 ? 0x7fffffffu : (uint32_t)e->tslot;
+}
+
+/* Lock held. The entry of `band` to take out next, among those whose tenant
+ * could take a unit now: the oldest (fifo), or the oldest of the next tenant
+ * in turn (rr: the lowest tenant slot from the band's cursor round to the
+ * first one again; inside one tenant the oldest first). UINT32_MAX for none. */
+static uint32_t
+fc_ring_pick_in_band(const fc_state_t *fc, uint8_t band, uint32_t bound)
+{
+  const fc_queue_t *q = &fc->queue;
+  uint32_t i = q->head, first = UINT32_MAX, after = UINT32_MAX, wrap = UINT32_MAX;
+  uint32_t after_key = 0, wrap_key = 0;
+  int rr = fc->cfg.tenant_wake == FC_TENANT_WAKE_RR;
+
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+
+    if (e->live && fc_band_of(e->band) == band &&
+        fc_tenant_can_run(fc, e->tslot, bound)) {
+      uint32_t key;
+
+      if (!rr)
+        return i;
+      if (first == UINT32_MAX)
+        first = i;
+      key = fc_rr_key(e);
+      if (key >= q->rr_next[band] && (after == UINT32_MAX || key < after_key)) {
+        after = i;
+        after_key = key;
+      }
+      if (wrap == UINT32_MAX || key < wrap_key) {
+        wrap = i;
+        wrap_key = key;
+      }
+    }
+    i = fc_ring_wrap(q, i + 1);
+  }
+  return after != UINT32_MAX ? after : wrap;
+}
+
+/* Lock held. Deficit round robin over the bands that have an entry that can
+ * be taken (cand): the highest band with credit left is served and spends
+ * one; when no such band has credit left the round starts again, each band
+ * with a candidate getting its weight, a band with none forfeiting its turn.
+ * A band with a candidate and a zero weight is given one (the control plane
+ * refuses it; the pick never stalls on it). Returns the band, -1 for none. */
 static int
-fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC_BANDS])
+fc_drr_pick(fc_state_t *fc, const uint8_t cand[FC_BANDS], fc_pick_undo_t *u)
+{
+  fc_queue_t *q = &fc->queue;
+
+  for (int pass = 0; pass < 2; pass++) {
+    for (int r = 0; r < FC_BANDS; r++) {
+      uint8_t b = fc_band_at_rank(r);
+
+      if (cand[b] && q->drr_credit[b] > 0) {
+        q->drr_credit[b]--;
+        u->credit = 1;
+        return b;
+      }
+    }
+    if (pass == 0)
+      for (int b = 0; b < FC_BANDS; b++)
+        q->drr_credit[b] = cand[b] ? (fc->cfg.band_weight[b] ? fc->cfg.band_weight[b] : 1) : 0;
+  }
+  return -1;
+}
+
+/* Lock held. Take out the entry the wake gives the next unit to; its tenant's
+ * queue count is left for the caller to settle once the wake is delivered: an
+ * entry put back keeps its slot counted, so the slot is never reused under it.
+ *
+ * The plain pool (strict, fifo, no floor) takes the oldest entry whose tenant
+ * could take a unit now, or under strict with a waiter of a band other than
+ * standard the oldest such entry of the highest band that has one. Anything
+ * else goes through the bands: the band is chosen first (a band below its
+ * floor, then the policy: strict takes the highest, weighted runs its
+ * rounds), then the entry inside it (fifo or the tenants in turn). `pend`
+ * counts the units this wake loop has already promised. */
+static int
+fc_ring_pop_banded(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC_BANDS],
+                   int floors, fc_pick_undo_t *u)
+{
+  fc_queue_t *q = &fc->queue;
+  uint32_t bound = fc_tenant_svc_bound(fc);
+  uint8_t wait[FC_BANDS] = {0}, ok[FC_BANDS];
+  fc_floor_view_t v;
+  int pick = -1;
+  uint32_t idx, i = q->head;
+
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+
+    if (e->live && fc_tenant_can_run(fc, e->tslot, bound))
+      wait[fc_band_of(e->band)] = 1;
+    i = fc_ring_wrap(q, i + 1);
+  }
+  if (floors)
+    fc_floor_view_load(fc, &v, fc_svc_cap(fc), pend, wait);
+  for (int b = 0; b < FC_BANDS; b++)
+    ok[b] = wait[b] && (!floors || fc_floor_may_take(&v, (uint8_t)b));
+  for (int r = 0; r < FC_BANDS && pick < 0 && floors; r++) {
+    uint8_t b = fc_band_at_rank(r);
+
+    if (wait[b] && v.in[b] < v.claim[b] && fc_floor_may_take(&v, b))
+      pick = b;
+  }
+  if (pick < 0 && fc_wake_strict(fc)) {
+    for (int r = 0; r < FC_BANDS && pick < 0; r++) {
+      uint8_t b = fc_band_at_rank(r);
+
+      if (ok[b])
+        pick = b;
+    }
+  } else if (pick < 0) {
+    pick = fc_drr_pick(fc, ok, u);
+  }
+  if (pick < 0)
+    return 0;
+  idx = fc_ring_pick_in_band(fc, (uint8_t)pick, bound);
+  if (idx == UINT32_MAX)
+    return 0;
+  u->band = pick;
+  fc_ring_take_at(q, idx, out);
+  if (fc->cfg.tenant_wake == FC_TENANT_WAKE_RR) {
+    u->rr = 1;
+    u->rr_before = q->rr_next[pick];
+    q->rr_next[pick] = fc_rr_key(out) + 1;
+    u->rr_after = q->rr_next[pick];
+  }
+  return 1;
+}
+
+static int
+fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC_BANDS],
+                     fc_pick_undo_t *u)
 {
   fc_queue_t *q = &fc->queue;
   uint32_t bound = fc_tenant_svc_bound(fc);
   uint32_t i = q->head, best = UINT32_MAX;
-  int banded = fc_wake_strict(fc) && (q->band_count[FC_BAND_CRITICAL] ||
-                                      q->band_count[FC_BAND_SHEDDABLE]);
+  int banded = q->band_count[FC_BAND_CRITICAL] || q->band_count[FC_BAND_SHEDDABLE];
   int best_rank = FC_BANDS;
+  int floors = fc_floors_apply(fc, fc_svc_cap(fc));
   fc_queue_ent_t *e;
 
-  if (fc_floors_apply(fc, fc_svc_cap(fc)))
-    return fc_ring_pop_floor(fc, out, pend);
+  u->band = -1;
+  u->credit = u->rr = 0;
+  if (floors || !fc_wake_strict(fc) || fc->cfg.tenant_wake == FC_TENANT_WAKE_RR)
+    return fc_ring_pop_banded(fc, out, pend, floors, u);
   for (uint32_t k = 0; k < q->used; k++) {
     e = &q->ring[i];
     if (e->live && fc_tenant_can_run(fc, e->tslot, bound)) {
@@ -2575,62 +2733,6 @@ fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC
   if (best == UINT32_MAX)
     return 0;
   fc_ring_take_at(q, best, out);
-  return 1;
-}
-
-/* Lock held. The wake on a pool that runs a floor or the reserve. The
- * entries that could take a unit now are the oldest runnable one of each
- * band whose band may take one (fc_floor_may_take). The highest-ranked band
- * below its floor that has such an entry takes the unit; when no band is
- * below its floor, the wake policy chooses: strict takes the highest band,
- * otherwise the oldest entry. `pend` counts the units this wake loop has
- * already promised and is moved by the caller when the wake is delivered. */
-static int
-fc_ring_pop_floor(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC_BANDS])
-{
-  fc_queue_t *q = &fc->queue;
-  uint32_t bound = fc_tenant_svc_bound(fc);
-  uint32_t first[FC_BANDS], dist[FC_BANDS];
-  uint8_t wait[FC_BANDS] = {0};
-  fc_floor_view_t v;
-  int pick = -1;
-  uint32_t i = q->head;
-
-  for (int b = 0; b < FC_BANDS; b++)
-    first[b] = UINT32_MAX;
-  for (uint32_t k = 0; k < q->used; k++) {
-    const fc_queue_ent_t *e = &q->ring[i];
-
-    if (e->live && first[fc_band_of(e->band)] == UINT32_MAX &&
-        fc_tenant_can_run(fc, e->tslot, bound)) {
-      first[fc_band_of(e->band)] = i;
-      dist[fc_band_of(e->band)] = k;
-      wait[fc_band_of(e->band)] = 1;
-    }
-    i = fc_ring_wrap(q, i + 1);
-  }
-  fc_floor_view_load(fc, &v, fc_svc_cap(fc), pend, wait);
-  for (int r = 0; r < FC_BANDS && pick < 0; r++) {
-    uint8_t b = fc_band_at_rank(r);
-
-    if (wait[b] && v.in[b] < v.claim[b] && fc_floor_may_take(&v, b))
-      pick = b;
-  }
-  for (int r = 0; r < FC_BANDS && pick < 0 && fc_wake_strict(fc); r++) {
-    uint8_t b = fc_band_at_rank(r);
-
-    if (wait[b] && fc_floor_may_take(&v, b))
-      pick = b;
-  }
-  if (pick < 0 && !fc_wake_strict(fc)) {
-    for (int b = 0; b < FC_BANDS; b++)
-      if (wait[b] && fc_floor_may_take(&v, (uint8_t)b) &&
-          (pick < 0 || dist[b] < dist[pick]))
-        pick = b;
-  }
-  if (pick < 0)
-    return 0;
-  fc_ring_take_at(q, first[pick], out);
   return 1;
 }
 
@@ -2675,10 +2777,11 @@ static int
 fc_queue_wake_head(fc_state_t *fc, uint32_t pend[FC_BANDS])
 {
   fc_queue_ent_t e;
+  fc_pick_undo_t u;
   int rc;
 
   pthread_mutex_lock(&fc->queue.lock);
-  rc = fc_ring_pop_runnable(fc, &e, pend);
+  rc = fc_ring_pop_runnable(fc, &e, pend, &u);
   fc_queue_publish(fc);
   pthread_mutex_unlock(&fc->queue.lock);
   if (!rc)
@@ -2690,6 +2793,13 @@ fc_queue_wake_head(fc_state_t *fc, uint32_t pend[FC_BANDS])
     pthread_mutex_lock(&fc->queue.lock);
     if (fc_ring_insert(&fc->queue, &e, 1, NULL) != 0)
       fc_tenant_dec(fc, e.tslot, 1);
+    /* What the pick spent is given back, if nothing moved it since. */
+    if (u.band >= 0) {
+      if (u.credit && fc->queue.drr_credit[u.band] < FC_BAND_WEIGHT_MAX + 2)
+        fc->queue.drr_credit[u.band]++;
+      if (u.rr && fc->queue.rr_next[u.band] == u.rr_after)
+        fc->queue.rr_next[u.band] = u.rr_before;
+    }
     fc_queue_publish(fc);
     pthread_mutex_unlock(&fc->queue.lock);
     return 0;
