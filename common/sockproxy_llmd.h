@@ -47,14 +47,17 @@ sp_llmd_forwarded_name(const char *name, size_t len)
 
 /* A TTL of a day or more is no shorter than any window a rule can hold. */
 #define SP_LLMD_TTL_MAX_MS     86400000ULL
+/* The longest duration Go's time.ParseDuration accepts, in nanoseconds. */
+#define SP_LLMD_GO_MAX_NS      ((unsigned __int128)9223372036854775807ULL)
 
 /*
  * Go duration syntax (time.ParseDuration), positive values only: a decimal
  * number with an optional fraction and a unit, one or more times, units
  * ns, us, µs, ms, s, m, h. A sign, an empty text, a number without a unit
- * (except "0") or an unknown unit is not a duration. Returns 1 and the whole
- * milliseconds rounded up (at least 1, at most SP_LLMD_TTL_MAX_MS) when the
- * text is one and is not zero; 0 otherwise, and *ms is left alone.
+ * (except "0"), an unknown unit or a total beyond what Go holds (2^63 - 1
+ * ns, as time.ParseDuration refuses it) is not a duration. Returns 1 and the
+ * whole milliseconds rounded up (at least 1, at most SP_LLMD_TTL_MAX_MS) when
+ * the text is one and is not zero; 0 otherwise, and *ms is left alone.
  */
 static inline int
 sp_llmd_parse_ttl_ms(const char *s, size_t len, uint32_t *ms)
@@ -74,7 +77,7 @@ sp_llmd_parse_ttl_ms(const char *s, size_t len, uint32_t *ms)
 
     while (i < len && s[i] >= '0' && s[i] <= '9') {
       whole = whole * 10 + (unsigned)(s[i] - '0');
-      if (whole > ((unsigned __int128)1 << 100))
+      if (whole > SP_LLMD_GO_MAX_NS)
         return 0;
       i++; digits++;
     }
@@ -108,7 +111,10 @@ sp_llmd_parse_ttl_ms(const char *s, size_t len, uint32_t *ms)
     } else {
       return 0;
     }
+    /* whole <= 2^63 and unit_ns < 2^42: the product fits in 128 bits. */
     total_ns += whole * unit_ns + frac * unit_ns / scale;
+    if (total_ns > SP_LLMD_GO_MAX_NS)
+      return 0;
     any = 1;
   }
   if (!any || total_ns == 0)

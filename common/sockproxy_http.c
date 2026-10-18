@@ -9502,6 +9502,11 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
       queue_full = 1;
     retry_after = fc_retry_after_s(fc);
   }
+  /* A woken request refused here (a sheddable one whose pool stopped
+   * letting it wait while it waited) ends its park: its wait is observed
+   * once, as an admission or an expiry would. Nothing for a request that
+   * never parked. */
+  fc_queue_wait_end(fc, &pfe->fc, qos_now_ns());
   if (v == FC_NO_CAPACITY) {
     status = 503;
     code = "admission_no_capacity";

@@ -65,6 +65,11 @@ test_parse(void)
   CHECK(ttl(".5s") == 500, ".5s is Go syntax for 500ms");
   CHECK(ttl("5s5") == 0, "a trailing number is none");
   CHECK(ttl("99999999999999999999999999999999999999h") == 0, "overflow is none, not wrapped");
+  CHECK(ttl("340282366920938463463374607432s") == 0, "a total past 128 bits is none, not wrapped");
+  CHECK(ttl("2562047h") == 86400000, "the longest whole hours Go holds: held at one day");
+  CHECK(ttl("2562048h") == 0, "past Go's range (2^63 - 1 ns) is none");
+  CHECK(ttl("2562047h47m16.854775807s") == 86400000, "Go's longest duration exactly: held at one day");
+  CHECK(ttl("2562047h47m16.854775808s") == 0, "one nanosecond past it is none");
 }
 
 static void
