@@ -519,11 +519,21 @@ enum fc_permit_state {
   FC_P_EXECUTING,                /* units held */
   FC_P_RELEASED,                 /* units handed back */
   FC_P_QUEUED,                   /* waiting in the pool's queue, nothing held */
+  FC_P_EVICTED,                  /* evicted, and the 1 Hz pass decided its answer */
+  FC_P_ENDED,                    /* the wait was ended by the deadline, a drain or a cancel */
 };
+
+/* A waiting request leaves FC_P_QUEUED exactly once, by one compare-and-swap
+ * on the state it already has: its owner's resume (to FC_P_NONE: its turn,
+ * or its eviction claimed by the owner) or one of the paths that end a wait
+ * from elsewhere (FC_P_EVICTED, FC_P_ENDED). Whoever swaps decides what
+ * happens to the request; the other does nothing, so no request is answered
+ * twice, and an owner's resume that comes after another path decided is
+ * dropped. */
 
 typedef struct fc_permit {
   fc_state_t *fc;                /* the service the units were taken from */
-  uint8_t state;                 /* enum fc_permit_state */
+  _Atomic uint8_t state;         /* enum fc_permit_state; leaves QUEUED by fc_permit_settle */
   uint8_t svc_held;
   uint8_t woken;                 /* popped from the queue: may not be made to queue again behind newcomers */
   uint8_t band;                  /* FC_BAND_*: set at the service acquire, kept while queued */
@@ -540,6 +550,18 @@ typedef struct fc_permit {
   uint64_t tkey;                 /* the tenant the request is admitted as */
   int16_t  tslot;                /* tenant slot whose inflight count this permit holds, -1 = none */
 } fc_permit_t;
+
+/* QUEUED -> `to`, once: 1 when this caller made the transition (and so
+ * decides the request), 0 when the permit had already left QUEUED. */
+static inline int
+fc_permit_settle(fc_permit_t *p, uint8_t to)
+{
+  uint8_t from = FC_P_QUEUED;
+
+  return atomic_compare_exchange_strong_explicit(&p->state, &from, to,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire);
+}
 
 typedef enum fc_verdict {
   FC_ADMIT = 0,
@@ -853,18 +875,23 @@ fc_queue_evicted(const fc_state_t *fc)
   return fc ? atomic_load_explicit(&fc->queue.n_evicted, memory_order_relaxed) : 0;
 }
 
-/* Take off the evicted list every waiter evicted at or before `before_ns`
- * and hand each to `fn` (the entry's fd and gen, band sheddable), outside
- * the queue lock. For the 1 Hz pass (a wake that was lost) and the drain of
- * a pool (UINT64_MAX: all). Returns the number handed over. */
+/* Every waiter evicted at or before `before_ns` is handed to `fn` (the
+ * entry's fd and gen, band sheddable) outside the queue lock, and taken off
+ * the evicted list after `fn` returned. `fn` decides the request with
+ * fc_permit_settle(..., FC_P_EVICTED) and answers it only when it wins, so a
+ * late resume of the owner that claims the entry meanwhile and a pass that
+ * answers it are never both: one of them swaps the state. For the 1 Hz pass
+ * (a wake that was lost or came late) and the drain of a pool (UINT64_MAX:
+ * all). Returns the number `fn` answered (returned nonzero for). */
 uint32_t fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,
                                 int (*fn)(void *ctx, const fc_queue_ent_t *ent),
                                 void *ctx);
 
-/* Take the permit's own entry out of the queue, wherever it sits. Returns 1
- * when the entry was still live (the caller now owns the terminal action),
- * 0 when a pop, a cancellation, the deadline or a drain got there first. Not
- * counted here: the caller says why. */
+/* Take the permit's own entry out of the queue, wherever it sits: under the
+ * queue lock the permit is moved QUEUED -> FC_P_ENDED and only then its entry
+ * removed. Returns 1 when it was (the caller now owns the terminal action),
+ * 0 when a pop, a cancellation, the deadline, a drain or the owner got there
+ * first. Not counted here: the caller says why. */
 int fc_queue_take(fc_state_t *fc, fc_permit_t *p);
 
 /* Pop the oldest live entry. Returns 1 and fills *out, 0 when nothing waits. */
@@ -874,9 +901,25 @@ int fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out);
  * permit whose entry was never popped did not come from its turn. */
 int fc_queue_holds(fc_state_t *fc, const fc_permit_t *p);
 
-/* The woken request is back at its gate: the wait is recorded, the permit
- * leaves the QUEUED state and is marked woken. */
-void fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
+/* The woken request is back at its gate: the permit leaves QUEUED (to
+ * FC_P_NONE, by fc_permit_settle) and is marked woken. Returns 1 when it did,
+ * 0 when another path had already decided the request. */
+int fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
+
+/* What the owner's resume of a parked connection is, for a request in the
+ * capacity queue (pd_resume_parked). */
+enum fc_resume {
+  FC_RESUME_NOT_QUEUED = 0,      /* not in the capacity queue: some other park */
+  FC_RESUME_WAIT,                /* still waiting: not its turn, stays parked */
+  FC_RESUME_TURN,                /* its turn: woken, back to its gate */
+  FC_RESUME_EVICTED,             /* evicted, the answer is the owner's: 429 admission_shed */
+  FC_RESUME_DECIDED,             /* another path decided it first: do nothing */
+};
+
+/* The owner's half of the one transition out of QUEUED: claims an eviction
+ * owed to it, leaves a request still waiting where it is, takes its turn, or
+ * finds that the 1 Hz pass, the deadline or a drain decided first. */
+int fc_queue_owner_resume(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
 /* A park ends: the queue-wait histogram takes its whole wait, from the first
  * park, once (admitted, expired, cancelled; an evicted waiter is observed
  * where it is evicted). A woken request that goes back to its place is the

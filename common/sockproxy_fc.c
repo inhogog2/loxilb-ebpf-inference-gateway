@@ -2061,12 +2061,21 @@ fc_permit_release__(fc_permit_t *p, int wake)
       fc_queue_wait_end(fc, p, fc_now_ns());
       fc = NULL;
     } else if (fc && fc_queue_evicted_claim(fc, p->q_fd, p->q_gen)) {
+      (void)fc_permit_settle(p, FC_P_RELEASED);
       p->q_parked = 0;             /* observed where it was evicted */
       fc = NULL;
+    } else if (!fc_permit_settle(p, FC_P_RELEASED)) {
+      fc = NULL;                   /* another path ended the wait: no turn to pass on */
     }
     p->state = FC_P_RELEASED;
     if (fc && wake)
       fc_queue_wake_one(fc);
+    return;
+  case FC_P_EVICTED:
+  case FC_P_ENDED:
+    /* Decided by the path that ended the wait, which answers it; nothing
+     * is held. */
+    p->state = FC_P_RELEASED;
     return;
   case FC_P_EXECUTING:
     break;
@@ -2266,27 +2275,39 @@ fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,
 {
   fc_evicted_t take[FC_EVICT_PENDING];
   fc_queue_t *q;
-  uint32_t n = 0, i = 0;
+  uint32_t n = 0, i, answered = 0;
 
   if (!fc || fc_queue_evicted(fc) == 0)
     return 0;
   q = &fc->queue;
+  /* The entries stay on the list while `fn` decides them: an owner's resume
+   * meanwhile still finds its entry, claims it and swaps the state, and `fn`
+   * then loses the swap and answers nothing. Only one sweep runs at a time
+   * (PROXY_LOCK). */
   pthread_mutex_lock(&q->lock);
-  while (i < atomic_load_explicit(&q->n_evicted, memory_order_relaxed)) {
-    if (q->evicted[i].at_ns <= before_ns) {
+  for (i = 0; i < atomic_load_explicit(&q->n_evicted, memory_order_relaxed); i++)
+    if (q->evicted[i].at_ns <= before_ns)
       take[n++] = q->evicted[i];
-      fc_evicted_drop(q, i);
-    } else {
-      i++;
+  pthread_mutex_unlock(&q->lock);
+  for (i = 0; i < n; i++) {
+    fc_queue_ent_t e = { .fd = take[i].fd, .band = FC_BAND_SHEDDABLE,
+                         .tslot = -1, .gen = take[i].gen };
+    if (fn && fn(ctx, &e))
+      answered++;
+  }
+  /* Decided either way now (answered here, claimed by its owner, or its
+   * connection gone): off the list, whatever is still on it. */
+  pthread_mutex_lock(&q->lock);
+  for (i = 0; i < n; i++) {
+    for (uint32_t k = 0; k < atomic_load_explicit(&q->n_evicted, memory_order_relaxed); k++) {
+      if (q->evicted[k].fd == take[i].fd && q->evicted[k].gen == take[i].gen) {
+        fc_evicted_drop(q, k);
+        break;
+      }
     }
   }
   pthread_mutex_unlock(&q->lock);
-  for (i = 0; i < n && fn; i++) {
-    fc_queue_ent_t e = { .fd = take[i].fd, .band = FC_BAND_SHEDDABLE,
-                         .tslot = -1, .gen = take[i].gen };
-    (void)fn(ctx, &e);
-  }
-  return n;
+  return answered;
 }
 
 int
@@ -2466,7 +2487,9 @@ fc_queue_take(fc_state_t *fc, fc_permit_t *p)
     return 0;
   pthread_mutex_lock(&fc->queue.lock);
   slot = fc_ring_find(&fc->queue, p->q_fd, p->q_gen, p->q_slot);
-  if (slot != UINT32_MAX) {
+  /* The request is decided here, before its entry goes: an owner's resume
+   * that finds the entry gone then finds the permit out of QUEUED too. */
+  if (slot != UINT32_MAX && fc_permit_settle(p, FC_P_ENDED)) {
     fc->queue.ring[slot].live = 0;
     fc->queue.count--;
     fc_ring_band_sub(&fc->queue, fc->queue.ring[slot].band);
@@ -2749,17 +2772,48 @@ fc_note_wait(fc_state_t *fc, uint64_t wait_ms)
   atomic_fetch_add_explicit(&fc->qwait_count, 1, memory_order_relaxed);
 }
 
-void
+int
 fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
 {
   (void)fc;
   (void)now_ns;
-  if (!p || p->state != FC_P_QUEUED)
-    return;
+  if (!p || !fc_permit_settle(p, FC_P_NONE))
+    return 0;
   /* Not the end of the park: the woken request may go back to its place.
    * Its wait is observed when the park ends (fc_queue_wait_end). */
-  p->state = FC_P_NONE;
   p->woken = 1;
+  return 1;
+}
+
+int
+fc_queue_owner_resume(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
+{
+  uint8_t st;
+
+  if (!p)
+    return FC_RESUME_NOT_QUEUED;
+  st = atomic_load_explicit(&p->state, memory_order_acquire);
+  if (st == FC_P_EVICTED || st == FC_P_ENDED)
+    return FC_RESUME_DECIDED;
+  if (st != FC_P_QUEUED || !fc)
+    return FC_RESUME_NOT_QUEUED;
+  /* Evicted for a higher band: the answer is the owner's if it takes the
+   * entry off the evicted list and swaps the state before the 1 Hz pass
+   * does; the pass swaps first only when it has the entry in hand. */
+  if (fc_queue_evicted_claim(fc, p->q_fd, p->q_gen)) {
+    if (!fc_permit_settle(p, FC_P_NONE))
+      return FC_RESUME_DECIDED;
+    p->woken = 0;
+    p->q_parked = 0;               /* observed where it was evicted */
+    return FC_RESUME_EVICTED;
+  }
+  /* The queue pops an entry before it wakes the connection: an entry still
+   * waiting means this resume is not its turn. */
+  if (fc_queue_holds(fc, p))
+    return FC_RESUME_WAIT;
+  /* Popped for its turn, unless a path that ends a wait took it first: then
+   * that path swapped the state already and this resume is late. */
+  return fc_queue_resumed(fc, p, now_ns) ? FC_RESUME_TURN : FC_RESUME_DECIDED;
 }
 
 void

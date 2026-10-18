@@ -1746,7 +1746,8 @@ check_draining_endpoints(void)
                    fc_band_wait_ms(pfe->fc.fc, pfe->fc.band), fc_inflight(pfe->fc.fc),
                    fc_queued(pfe->fc.fc),
                    ttl_end ? "429 (the client's x-llm-d-inference-ttl)" : "504");
-          pfe->fc.state = FC_P_NONE;
+          /* fc_queue_take moved the permit out of QUEUED (FC_P_ENDED) before
+           * it took the entry: a late resume of the owner does nothing. */
           pfe->pd_phase = PD_PHASE_ERROR;
           pd_reap_respond(pfe, ttl_end ? SP_REAP_FC_TTL : SP_REAP_FC_QUEUE_TIMEOUT);
         }

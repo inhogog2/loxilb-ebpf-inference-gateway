@@ -775,7 +775,7 @@ static int
 stress_note(void *ctx, const fc_queue_ent_t *e)
 {
   (void)ctx;
-  if (__atomic_load_n(&stress_permit[e->fd].state, __ATOMIC_RELAXED) != FC_P_QUEUED)
+  if (atomic_load_explicit(&stress_permit[e->fd].state, memory_order_relaxed) != FC_P_QUEUED)
     atomic_fetch_add(&stress_seen_not_queued, 1);
   atomic_fetch_add(&stress_drained, 1);
   return 1;

@@ -5285,11 +5285,14 @@ sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
 
   pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
   if (!pfe || pfe->fd != e->fd || reg_gen != e->gen ||
-      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen ||
-      pfe->fc.state != FC_P_QUEUED) {
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen) {
     return 0;
   }
-  pfe->fc.state = FC_P_NONE;
+  /* One swap decides the request: if the owner's resume made it first (its
+   * turn, or its eviction claimed), this path answers nothing. */
+  if (!fc_permit_settle(&pfe->fc, d->kind == SP_REAP_FC_SHED ? FC_P_EVICTED : FC_P_ENDED)) {
+    return 0;
+  }
   if (d->detach) {
     fc_permit_unbind(&pfe->fc);
   }
@@ -12993,11 +12996,15 @@ pd_resume_parked(int fd)
    * first owns the answer: this resume, the 1 Hz pass for a wake that was
    * lost (it cannot drive the connection on, so it closes), a drain, or the
    * client's own departure, which drops it. */
-  if (pfe->fc.state == FC_P_QUEUED &&
-      fc_queue_evicted_claim(pfe->fc.fc, pfe->fc.q_fd, pfe->fc.q_gen)) {
-    pfe->fc.state = FC_P_NONE;
-    pfe->fc.woken = 0;
-    pfe->fc.q_parked = 0;          /* observed where it was evicted */
+  /* One compare-and-swap on the permit's state decides a request in the
+   * capacity queue (fc_queue_owner_resume): a resume that comes after the
+   * 1 Hz pass, the deadline or a drain decided it does nothing, and the
+   * answer that path owes arrives on its own. */
+  int fc_resume = fc_queue_owner_resume(pfe->fc.fc, &pfe->fc, qos_now_ns());
+  if (fc_resume == FC_RESUME_DECIDED || fc_resume == FC_RESUME_WAIT) {
+    return;
+  }
+  if (fc_resume == FC_RESUME_EVICTED) {
     if (sp_h1_refusal_keeps_connection(pfe)) {
       if (sp_fc_shed_answer_kept(pfe) == 0) {
         pfe->park_ep_idx   = -1;
@@ -13018,14 +13025,9 @@ pd_resume_parked(int fd)
     return;
   }
 
-  /* A request waiting in the capacity queue is resumed only for its turn,
-   * and the queue pops an entry before it wakes the connection: an entry
-   * still waiting means this resume is not its turn. It stays parked as it
-   * is (reads paused, hang-up armed) until its turn, its deadline or its
-   * client's departure. */
-  if (pfe->fc.state == FC_P_QUEUED && fc_queue_holds(pfe->fc.fc, &pfe->fc)) {
-    return;
-  }
+  /* A request waiting in the capacity queue is resumed only for its turn
+   * (FC_RESUME_WAIT returned above): it stays parked as it is (reads paused,
+   * hang-up armed) until its turn, its deadline or its client's departure. */
 
   /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
   pfe->read_paused = 0;
@@ -13037,12 +13039,11 @@ pd_resume_parked(int fd)
    * the unit ahead of newcomers. Ordered after the reaper's and the
    * shaper's resumes above and before the prefill park below: a connection
    * is in at most one of these states at a time. */
-  if (pfe->fc.state == FC_P_QUEUED) {
+  if (fc_resume == FC_RESUME_TURN) {
     uint64_t q_now = qos_now_ns();
     log_debug("[AIGateway] fd=%d woken after %llu ms in the queue", fd,
               (unsigned long long)((q_now > pfe->fc.q_enqueue_ns ?
                                     q_now - pfe->fc.q_enqueue_ns : 0) / 1000000ULL));
-    fc_queue_resumed(pfe->fc.fc, &pfe->fc, q_now);
   }
 
   /* Clear park markers; the conn re-enters dispatch as a fresh request. pd_phase back
