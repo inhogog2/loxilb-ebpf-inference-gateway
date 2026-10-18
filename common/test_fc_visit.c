@@ -100,6 +100,7 @@ test_nothing_to_visit(void)
   assert(fc_queue_visit(&fc, NULL, &s) == 0);
   assert(fc_queue_visit(&fc, note, &s) == 0);
   assert(s.n == 0);
+  fc_state_destroy(&fc);
 
   /* A pool with no queue configured has no ring: nothing, and no fault. */
   pool_with(&fc, 1, 0, 0);
