@@ -770,6 +770,8 @@ fc_permit_reset(fc_permit_t *p)
   p->woken = 0;
   p->band = FC_BAND_STANDARD;
   p->q_parked = 0;
+  p->q_ttl_cut = 0;
+  p->q_ttl_ms = 0;
   for (int r = 0; r < FC_ROLES; r++)
     p->ep[r] = -1;
   p->q_fd = -1;
@@ -875,6 +877,29 @@ fc_tenant_queue_bound(const fc_state_t *fc)
   if (!fc_share_active(fc))
     return 0;
   return fc_share_of(fc->cfg.max_queue_depth, fc->cfg.tenant_share_pct);
+}
+
+uint32_t
+fc_band_queue_bound(const fc_state_t *fc, uint8_t band)
+{
+  if (!fc)
+    return 0;
+  band = fc_band_of(band);
+  if (!fc->cfg.band_queue_pct[band])
+    return 0;
+  return fc_share_of(fc->cfg.max_queue_depth, fc->cfg.band_queue_pct[band]);
+}
+
+/* Lock held. The live waiters of one band; the standard slot is the rest. */
+static uint32_t
+fc_band_live(const fc_queue_t *q, uint8_t band)
+{
+  uint32_t crit = q->band_count[FC_BAND_CRITICAL];
+  uint32_t shed = q->band_count[FC_BAND_SHEDDABLE];
+
+  if (fc_band_counted(band))
+    return q->band_count[band];
+  return q->count > crit + shed ? q->count - crit - shed : 0;
 }
 
 uint32_t
@@ -1763,9 +1788,12 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
   uint64_t deadline = woken ? p->q_deadline_ns : 0;
   /* A new request is in no park; a woken one is still in its first. */
   uint8_t parked = woken ? p->q_parked : 0;
+  /* ... and its deadline is still the one it was given. */
+  uint8_t ttl_cut = woken ? p->q_ttl_cut : 0;
 
   fc_permit_bind(p, fc);
   p->q_parked = parked;
+  p->q_ttl_cut = ttl_cut;
   /* A woken request keeps the wait it was first given, should it go back. */
   p->q_enqueue_ns = enq;
   p->q_deadline_ns = deadline;
@@ -2259,12 +2287,20 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   fc_evicted_t gone = { .fd = -1 };
   uint64_t gone_enq_ns = 0;
   int evicted = 0;
+  int band_full = 0;
   uint8_t parked;
+  uint8_t ttl_cut;
+  uint32_t ttl_ms;
 
   if (!fc || !p || fd < 0)
     return -1;
   tkey = p->tkey;
   band = p->band;
+  /* The client's TTL is asked of this push only (the bind below clears it);
+   * a request going back to its place keeps the deadline it was first given
+   * and whose it was. */
+  ttl_ms = p->q_ttl_ms;
+  ttl_cut = front ? p->q_ttl_cut : 0;
   /* A request going back to its place is still in its first park. */
   parked = front ? p->q_parked : 1;
   /* A woken request going back is still bounded by its first window, and
@@ -2295,16 +2331,34 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   p->q_parked = parked;
 
   pthread_mutex_lock(&fc->queue.lock);
-  e.deadline_ns = first_deadline ? first_deadline
-                 : now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
+  if (!first_deadline) {
+    /* The band's window, held inside the rule's; a client's TTL (with
+     * fc_llmd_headers on) only ever shortens it. */
+    uint32_t window_ms = fc_band_wait_ms(fc, band);
+
+    if (fc->cfg.llmd_headers && ttl_ms && ttl_ms < window_ms) {
+      window_ms = ttl_ms;
+      ttl_cut = 1;
+    }
+    first_deadline = now_ns + (uint64_t)window_ms * 1000000ULL;
+  }
+  e.deadline_ns = first_deadline;
   p->q_deadline_ns = e.deadline_ns;
+  p->q_ttl_cut = ttl_cut;
+  /* A band at its own share of the depth is refused as a full queue: no
+   * other band's waiter makes room in it, so nobody is evicted for it. */
+  if (!front && !fc->queue.dead && fc_queue_enabled(fc)) {
+    uint32_t bound = fc_band_queue_bound(fc, band);
+
+    band_full = bound && fc_band_live(&fc->queue, band) >= bound;
+  }
   /* At its depth, a request above sheddable may take the place of a
    * sheddable waiter (fc_shed_queue): one is chosen now, and evicted only
    * once this request is sure to take its place. */
   if (!front && !fc->queue.dead && fc_queue_enabled(fc) &&
       fc->queue.count >= fc->cfg.max_queue_depth)
     evict = fc_ring_evict_pick(fc, band);
-  if (!fc->queue.dead && fc_queue_enabled(fc) &&
+  if (!band_full && !fc->queue.dead && fc_queue_enabled(fc) &&
       (front || fc->queue.count < fc->cfg.max_queue_depth ||
        evict != UINT32_MAX)) {
     if (fc_share_active(fc)) {

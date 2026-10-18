@@ -940,6 +940,7 @@ inject_request_id_header(void *msg, size_t *len, size_t bufsize,
 /* The three header-block edits (strip a header, strip a family, splice a
  * line) live in sockproxy_h1_hdr.h, where the unit test reaches them. */
 #include "sockproxy_h1_hdr.h"
+#include "sockproxy_llmd_fwd.h"
 
 /* Emit-callback context for the H1 path: the mutable request buffer. */
 typedef struct {
@@ -1184,6 +1185,33 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
                                  pfe->auth_user_id);
     }
   }
+  return cur;
+}
+
+/*
+ * sp_llmd_forward_headers — with fc_llmd_headers on, the objective and the
+ * fairness identity that leave the gateway for the backend are the ones the
+ * gateway resolved. A client's copy of either name (the new and the
+ * deprecated one) is removed whatever the request is; the resolved values
+ * are written only at the gate, and not on a chunked request (an insertion
+ * needs room, as ai_strip_upstream_api_key's identity injection does).
+ * The objective is the class the admission gate resolved (standard when it
+ * resolved none); the fairness identity is the authenticated tenant, and
+ * none is written for a request without one.
+ */
+static size_t
+sp_llmd_forward_headers(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
+                        size_t bufsize, int at_gate)
+{
+  size_t cur = buflen;
+
+  if (!pfe || !buf || pfe->odir || !pfe->fc.fc || !pfe->fc.fc->cfg.llmd_headers)
+    return buflen;
+  if (sp_llmd_rewrite_head(buf, &cur, bufsize,
+                           sp_class_name(pfe->adm_class_set ? pfe->adm_class : 0),
+                           sp_class_hdr_value_ok(pfe->tenant_id) ? pfe->tenant_id : NULL,
+                           at_gate) != 0)
+    return buflen;   /* terminator lost: leave the buffer as it was */
   return cur;
 }
 
@@ -9169,6 +9197,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->auth_jwt_capable = 0;
     pfe->auth_netid_fwd = 0;
     sp_obj_hint_reset(&pfe->obj_hint);
+    sp_ttl_hint_reset(&pfe->ttl_hint);
     pfe->adm_priority = 0;
     pfe->adm_class = 0;
     pfe->adm_class_set = 0;
@@ -9258,11 +9287,13 @@ int
 sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                          const char *msg, uint32_t inflight, uint32_t queued,
                          uint32_t limit, uint32_t retry_after, int keep,
-                         const char *cls, uint32_t band_wait_ms)
+                         const char *cls, uint32_t band_wait_ms,
+                         const char *dropped_reason)
 {
   char body[256];
-  char resp_buf[896];
+  char resp_buf[960];
   char band_hdrs[128] = "";
+  char reason_hdr[64] = "";
   const char *status_line = status == 503 ? "503 Service Unavailable"
                                           : "429 Too Many Requests";
   int blen, n, rc = -1;
@@ -9284,6 +9315,9 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     snprintf(band_hdrs, sizeof(band_hdrs),
              "X-Loxilb-Admission-Class: %s\r\n"
              "X-Loxilb-Admission-Band-Wait-Ms: %u\r\n", cls, band_wait_ms);
+  if (dropped_reason)
+    snprintf(reason_hdr, sizeof(reason_hdr), SP_LLMD_REASON_HDR ": %s\r\n",
+             dropped_reason);
   n = snprintf(resp_buf, sizeof(resp_buf),
     "HTTP/1.1 %s\r\n"
     "Content-Type: application/json\r\n"
@@ -9292,12 +9326,12 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     "X-Loxilb-Admission-Inflight: %u\r\n"
     "X-Loxilb-Admission-Queued: %u\r\n"
     "X-Loxilb-Admission-Limit: %u\r\n"
-    "%s"
+    "%s%s"
     "Connection: %s\r\n"
     "\r\n"
     "%s",
     status_line, blen, retry_after, inflight, queued, limit, band_hdrs,
-    keep ? "keep-alive" : "close", body);
+    reason_hdr, keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     /* The request record is the caller's (ai_gw_record_capacity_deny). */
     proxy_note_local_refusal(pfe, (uint16_t)status);
@@ -9388,6 +9422,7 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->has_custom_session_header = 0;
   pfe->x_model_header[0] = '\0';
   sp_obj_hint_reset(&pfe->obj_hint);
+  sp_ttl_hint_reset(&pfe->ttl_hint);
   l7_origin_reset(pfe);
   pfe->vllm_request_id[0] = '\0';
   pfe->has_vllm_request_id = 0;
@@ -9448,6 +9483,8 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
    * may not wait here (a role leg, a stream) takes the refusal below. */
   if ((v == FC_QUEUE || v == FC_SHED) && may_wait && fc_queue_enabled(fc) &&
       !pfe->h2_session) {
+    /* The client's TTL rides this push (read only with fc_llmd_headers on). */
+    pfe->fc.q_ttl_ms = fc->cfg.llmd_headers ? sp_ttl_hint_ms(&pfe->ttl_hint) : 0;
     int prc = fc_queue_push(fc, &pfe->fc, pfe->fd,
                             atomic_load_explicit(&pfe->gen, memory_order_acquire),
                             qos_now_ns(), woken);
@@ -9498,7 +9535,8 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
   if (sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, queued, limit,
                                retry_after, keep,
                                pfe->adm_class_set ? sp_class_name(pfe->adm_class) : NULL,
-                               fc_band_wait_ms(fc, pfe->fc.band)) != 0 && keep) {
+                               fc_band_wait_ms(fc, pfe->fc.band),
+                               fc->cfg.llmd_headers ? sp_llmd_reason_of(code) : NULL) != 0 && keep) {
     /* A refusal cut short leaves the connection mid-response: it cannot
      * carry the next request. */
     shutdown(pfe->fd, SHUT_RDWR);
@@ -11474,6 +11512,7 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
   // accumulation (handle_header_val appends across value fragments).
   pfe->bearer_capturing = 0;
   sp_obj_hint_name(&pfe->obj_hint);
+  sp_ttl_hint_name(&pfe->ttl_hint);
 
   if (strncasecmp("Host", str, length) == 0) {
     pfe->http_hok = 1;
@@ -11695,6 +11734,12 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
                     sp_obj_hint_which(pfe->last_header_name,
                                       strlen(pfe->last_header_name)),
                     at, length);
+
+  // The client's TTL, kept whole; it is read at the park and only when the
+  // rule runs with fc_llmd_headers on.
+  if (!pfe->odir &&
+      sp_ttl_hint_which(pfe->last_header_name, strlen(pfe->last_header_name)))
+    sp_ttl_hint_val(&pfe->ttl_hint, at, length);
 
   // AI Gateway: Extract X-Api-Key header for data-plane enforcement
   if (!strncasecmp("X-Api-Key", pfe->last_header_name, 9)) {
@@ -12564,6 +12609,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * header policy so an operator-configured rule cannot re-add it. */
     pfe->rcv_off = ai_strip_upstream_api_key(pfe, pfe->rcvbuf, pfe->rcv_off,
                                              SP_SOCK_MSG_LEN, 1);
+    pfe->rcv_off = sp_llmd_forward_headers(pfe, pfe->rcvbuf, pfe->rcv_off,
+                                           SP_SOCK_MSG_LEN, 1);
 
     /* P/D request-ID override — generate with prefill/decode addresses
  * so vllm-router can route correctly. Must happen BEFORE normal path. */
@@ -12768,6 +12815,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->has_custom_session_header = 0;
     pfe->x_model_header[0] = '\0';  // Reset X-Model header for next request
     sp_obj_hint_reset(&pfe->obj_hint);
+    sp_ttl_hint_reset(&pfe->ttl_hint);
 
 
     /* Snapshot the correlation key BEFORE the reset below clears it, for the
@@ -14490,6 +14538,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       if (!pfe->odir && pfe->creq_blk.hdr_block) {
         rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc,
                                                 SP_SOCK_MSG_LEN, 0);
+        rc = (ssize_t)sp_llmd_forward_headers(pfe, pfe->rcvbuf, (size_t)rc,
+                                              SP_SOCK_MSG_LEN, 0);
       }
 
       PROXY_ENT_LOCK(pfe);

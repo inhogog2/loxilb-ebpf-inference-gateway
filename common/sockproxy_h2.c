@@ -3304,7 +3304,7 @@ proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
 /* The caller's headers a refusal frame holds. A list built in a fixed array
  * is checked against it at compile time (H2_DENY_EXTRA_FITS); a longer list
  * at run time is a defect, never sent short. */
-#define H2_DENY_EXTRA_MAX 5
+#define H2_DENY_EXTRA_MAX 6
 #define H2_DENY_EXTRA_FITS(arr)                                           \
   _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= H2_DENY_EXTRA_MAX,      \
                  "an HTTP/2 refusal's header list is longer than its frame")
@@ -3357,7 +3357,7 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   snprintf(clen_str, sizeof(clen_str), "%d", ctx ? blen : 0);
 
   /* :status, content-type, retry-after, content-length, then at most
-   * H2_DENY_EXTRA_MAX of the caller's (the capacity refusal sends five). */
+   * H2_DENY_EXTRA_MAX of the caller's (the capacity refusal sends six). */
   nghttp2_nv hdrs[4 + H2_DENY_EXTRA_MAX];
   size_t nvlen = 0;
   if (n_extra > H2_DENY_EXTRA_MAX) {
@@ -3506,7 +3506,8 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                             int status_code, const char *error_code,
                             const char *error_msg, uint32_t inflight,
                             uint32_t queued, uint32_t limit, int retry_after,
-                            const char *cls, uint32_t band_wait_ms)
+                            const char *cls, uint32_t band_wait_ms,
+                            const char *dropped_reason)
 {
   char body[512];
   char inflight_str[16], queued_str[16], limit_str[16], wait_str[16];
@@ -3527,7 +3528,7 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   snprintf(queued_str, sizeof(queued_str), "%u", queued);
   snprintf(limit_str, sizeof(limit_str), "%u", limit);
   snprintf(wait_str, sizeof(wait_str), "%u", band_wait_ms);
-  nghttp2_nv extra[5] = {
+  nghttp2_nv extra[6] = {
     { (uint8_t *)"x-loxilb-admission-inflight", (uint8_t *)inflight_str,
       27, strlen(inflight_str), NGHTTP2_NV_FLAG_NONE },
     { (uint8_t *)"x-loxilb-admission-queued", (uint8_t *)queued_str,
@@ -3538,10 +3539,19 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
       sizeof(SP_CLASS_HDR_CLASS) - 1, cls ? strlen(cls) : 0, NGHTTP2_NV_FLAG_NONE },
     { (uint8_t *)"x-loxilb-admission-band-wait-ms", (uint8_t *)wait_str,
       31, strlen(wait_str), NGHTTP2_NV_FLAG_NONE },
+    /* Last, so the three that every refusal carries stay first. */
+    { (uint8_t *)SP_LLMD_REASON_HDR, (uint8_t *)(dropped_reason ? dropped_reason : ""),
+      sizeof(SP_LLMD_REASON_HDR) - 1, dropped_reason ? strlen(dropped_reason) : 0,
+      NGHTTP2_NV_FLAG_NONE },
   };
   H2_DENY_EXTRA_FITS(extra);
+  /* The class pair is dropped when no class was resolved; the reason is
+   * dropped when the rule does not speak the llm-d convention. The list is
+   * contiguous, so the reason moves up over a dropped pair. */
+  if (dropped_reason && !cls)
+    extra[3] = extra[5];
   return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
-                            extra, cls ? 5 : 3);
+                            extra, (cls ? 5 : 3) + (dropped_reason ? 1 : 0));
 }
 
 /* ---- capacity admission at the HTTP/2 stream site ---------------------------
@@ -3576,6 +3586,8 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   /* Read before the release below and the send that frees the stream. */
   const char *cls = stream->adm_class_set ? sp_class_name(stream->adm_class) : NULL;
   uint32_t band_wait_ms = fc_band_wait_ms(&tepval->fc, stream->fc.band);
+  const char *dropped_reason =
+    tepval->fc.cfg.llmd_headers ? sp_llmd_reason_of(code) : NULL;
 
   /* A stream never waits: over a ceiling is a refusal on the stream, and
    * the decision is counted here, where it is written. */
@@ -3609,7 +3621,7 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
    * it before the send returns, so everything above reads it first. */
   proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
                               limit, v == FC_DRAINING ? 5 : 1,
-                              cls, band_wait_ms);
+                              cls, band_wait_ms, dropped_reason);
 }
 
 /* 0 = proceed; -1 = refused, terminal response framed on the stream. */
@@ -5627,6 +5639,44 @@ h2_have_tepval:
         stream->tenant_id, stream->auth_user_id);
     headers = security_headers_nv;
     security_headers_built = 1;
+  }
+
+  /* With fc_llmd_headers on, the objective and the fairness identity that
+   * leave for the backend are the gateway's resolved ones, as on HTTP/1.1:
+   * the client's copy of any of the four names is dropped and the class the
+   * stream was admitted as and its tenant are written. The list is rebuilt
+   * from shallow copies, so the strings it points at stay with their owners
+   * until the request is submitted. */
+  if (tepval && tepval->fc.cfg.llmd_headers) {
+    size_t cap = nheaders + 2, n = 0;
+    nghttp2_nv *out = calloc(cap, sizeof(*out));
+
+    if (!out) {
+      free(security_headers_nv);
+      if (l7_hdr_built)
+        proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
+      log_error("[AIGateway][HTTP/2] cannot allocate the forwarded-header set");
+      return -1;
+    }
+    for (size_t i = 0; i < nheaders; i++)
+      if (!sp_llmd_forwarded_name((const char *)headers[i].name, headers[i].namelen))
+        out[n++] = headers[i];
+    {
+      const char *objective = sp_class_name(stream->adm_class_set ? stream->adm_class : 0);
+
+      out[n++] = (nghttp2_nv){ (uint8_t *)SP_LLMD_OBJECTIVE_HDR, (uint8_t *)objective,
+                               sizeof(SP_LLMD_OBJECTIVE_HDR) - 1, strlen(objective),
+                               NGHTTP2_NV_FLAG_NONE };
+    }
+    if (sp_class_hdr_value_ok(stream->tenant_id))
+      out[n++] = (nghttp2_nv){ (uint8_t *)SP_LLMD_FAIRNESS_HDR, (uint8_t *)stream->tenant_id,
+                               sizeof(SP_LLMD_FAIRNESS_HDR) - 1, strlen(stream->tenant_id),
+                               NGHTTP2_NV_FLAG_NONE };
+    free(security_headers_nv);
+    security_headers_nv = out;
+    security_headers_built = 1;
+    headers = out;
+    nheaders = n;
   }
 
   if (bridge_h1) {

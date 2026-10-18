@@ -314,6 +314,13 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"admission_shed\"}", 1, 0),
+  [SP_REAP_FC_TTL] =
+      SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Retry-After: 1\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"admission_ttl_expired\"}", 1, 0),
 };
 
 /* Whether the answer this client is being sent is chunked, read from the
@@ -484,10 +491,13 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
   uint32_t limit = fc ? fc_svc_cap(fc) : 0;
   uint32_t retry_after = kind == SP_REAP_FC_DRAINED ? 5 : fc_retry_after_s(fc);
   int status = kind == SP_REAP_FC_DRAINED ? 503
-             : kind == SP_REAP_FC_SHED ? 429 : 504;
+             : (kind == SP_REAP_FC_SHED || kind == SP_REAP_FC_TTL) ? 429 : 504;
   const char *code = kind == SP_REAP_FC_DRAINED ? "admission_drained"
                    : kind == SP_REAP_FC_SHED ? "admission_shed"
+                   : kind == SP_REAP_FC_TTL ? "admission_ttl_expired"
                    : "admission_queue_timeout";
+  const char *reason = fc && fc->cfg.llmd_headers ? sp_llmd_reason_of(code) : NULL;
+  char reason_hdr[64] = "";
   const char *status_line = status == 503 ? "503 Service Unavailable"
                           : status == 429 ? "429 Too Many Requests"
                           : "504 Gateway Timeout";
@@ -504,6 +514,8 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
              "X-Loxilb-Admission-Class: %s\r\n"
              "X-Loxilb-Admission-Band-Wait-Ms: %u\r\n",
              sp_class_name(pfe->adm_class), fc_band_wait_ms(fc, pfe->fc.band));
+  if (reason)
+    snprintf(reason_hdr, sizeof(reason_hdr), SP_LLMD_REASON_HDR ": %s\r\n", reason);
   if (status == 429)
     blen = snprintf(body, sizeof(body),
                     "{\"error\":\"%s\",\"retry_after\":%u,\"jitter_hint_ms\":250,"
@@ -524,12 +536,12 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
                  "X-Loxilb-Admission-Inflight: %u\r\n"
                  "X-Loxilb-Admission-Queued: %u\r\n"
                  "X-Loxilb-Admission-Limit: %u\r\n"
-                 "%s"
+                 "%s%s"
                  "Connection: %s\r\n"
                  "\r\n"
                  "%s",
                  status_line, blen, retry_after, inflight, queued, limit,
-                 band_hdrs, keep ? "keep-alive" : "close", body);
+                 band_hdrs, reason_hdr, keep ? "keep-alive" : "close", body);
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
   ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
                              svc_ident, proxy_effective_model(pfe),
@@ -659,7 +671,7 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
   buf = t->text;
   len = t->len;
   if (kind == SP_REAP_FC_QUEUE_TIMEOUT || kind == SP_REAP_FC_DRAINED ||
-      kind == SP_REAP_FC_SHED) {
+      kind == SP_REAP_FC_SHED || kind == SP_REAP_FC_TTL) {
     size_t fl = sp_reap_fc_format(pfe, kind, 0, framed, sizeof(framed));
     if (fl > 0) {
       buf = framed;
@@ -1721,17 +1733,22 @@ check_draining_endpoints(void)
         if (pfe->odir == 0 && pfe->fc.state == FC_P_QUEUED && pfe->fc.fc &&
             pfe->fc.q_deadline_ns > 0 && q_now_ns >= pfe->fc.q_deadline_ns &&
             fc_queue_take(pfe->fc.fc, &pfe->fc)) {
+          /* The client's own TTL ended this wait and the rule speaks the
+           * llm-d convention: 429. A window of the rule's stays 504. */
+          int ttl_end = pfe->fc.q_ttl_cut && pfe->fc.fc->cfg.llmd_headers;
+
           fc_count_band(pfe->fc.fc, FC_R_QUEUE_TIMEOUT, pfe->fc.band);
           fc_queue_wait_end(pfe->fc.fc, &pfe->fc, q_now_ns);
           log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
-                   "with the pool still full (inflight=%u queued=%u) — 504",
+                   "with the pool still full (inflight=%u queued=%u) — %s",
                    pfe->fd,
                    (unsigned long long)((q_now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL),
-                   pfe->fc.fc->cfg.max_queue_wait_ms, fc_inflight(pfe->fc.fc),
-                   fc_queued(pfe->fc.fc));
+                   fc_band_wait_ms(pfe->fc.fc, pfe->fc.band), fc_inflight(pfe->fc.fc),
+                   fc_queued(pfe->fc.fc),
+                   ttl_end ? "429 (the client's x-llm-d-inference-ttl)" : "504");
           pfe->fc.state = FC_P_NONE;
           pfe->pd_phase = PD_PHASE_ERROR;
-          pd_reap_respond(pfe, SP_REAP_FC_QUEUE_TIMEOUT);
+          pd_reap_respond(pfe, ttl_end ? SP_REAP_FC_TTL : SP_REAP_FC_QUEUE_TIMEOUT);
         }
         pfe = pfe_next;
       }

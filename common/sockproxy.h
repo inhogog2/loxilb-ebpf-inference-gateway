@@ -23,6 +23,7 @@
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
 #include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
 #include "sockproxy_obj_hint.h"     /* the objective a request asks for by header (proxy_fd_ent member) */
+#include "sockproxy_llmd.h"         /* the llm-d TTL a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
 
 // Forward declaration for HTTP/2 support
@@ -1593,6 +1594,7 @@ struct proxy_fd_ent {
   // obj_hint is what the request's header asked for; the rest is the
   // admission gate's answer, zero while no class is configured.
   sp_obj_hint_t obj_hint;
+  sp_ttl_hint_t ttl_hint;             // x-llm-d-inference-ttl, read only by a rule with fc_llmd_headers on
   int32_t  adm_priority;              // the priority in force, after the cap
   uint8_t  adm_class;                 // AI_GW_CLASS_*
   uint8_t  adm_class_set;             // 1 = the class stage ran for this request

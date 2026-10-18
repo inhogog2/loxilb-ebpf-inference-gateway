@@ -220,8 +220,12 @@ typedef struct fc_cfg {
   uint8_t  band_weight[FC_BANDS];        /* weighted wake: 1..62 each, 0 = not set */
   uint8_t  band_min_share_pct[FC_BANDS]; /* floor, % of the ceiling in force: a guarantee under contention, binding only while the band has a waiter */
   uint8_t  critical_reserve_pct; /* % of the ceiling in force that no other band may take, even while critical is idle */
-  uint32_t band_wait_ms[FC_BANDS];       /* a band's wait window; 0 = max_queue_wait_ms */
-  uint8_t  band_queue_pct[FC_BANDS];     /* most of max_queue_depth a band may hold; 0 = the shared depth */
+  /* A band's wait window is a cap inside the rule's window (max_queue_wait_ms), never above it; 0 = the rule's window. */
+  uint32_t band_wait_ms[FC_BANDS];
+  /* A band's queue share bounds that band's own occupancy of max_queue_depth, a ceiling and not a reservation: what a
+   * band does not use stays open to every other band, and the queue as a whole never holds more than max_queue_depth;
+   * 0 = the shared depth. */
+  uint8_t  band_queue_pct[FC_BANDS];
   uint8_t  shed_queue;           /* 1: a sheddable request at the ceiling waits in its band instead of 429 */
   uint8_t  tenant_wake;          /* enum fc_tenant_wake */
   uint8_t  llmd_headers;         /* 1: refusals carry x-llm-d-request-dropped-reason; x-llm-d-inference-ttl shortens a wait */
@@ -518,6 +522,8 @@ typedef struct fc_permit {
   uint8_t woken;                 /* popped from the queue: may not be made to queue again behind newcomers */
   uint8_t band;                  /* FC_BAND_*: set at the service acquire, kept while queued */
   uint8_t q_parked;              /* in a park whose wait is not yet observed (fc_queue_wait_end) */
+  uint8_t q_ttl_cut;             /* the park's deadline is the client's x-llm-d-inference-ttl, not a window of the rule's */
+  uint32_t q_ttl_ms;             /* the client's TTL for the next fc_queue_push, 0 = none; read only with llmd_headers on */
   int8_t  ep[FC_ROLES];          /* endpoint holding this role's unit, -1 = none */
   int      q_fd;                 /* the queue entry this permit sits in, while QUEUED */
   uint32_t q_slot;
@@ -1009,16 +1015,23 @@ fc_ep_inflight(const fc_state_t *fc, int ep, int role)
   return atomic_load_explicit(&fc->ep_inflight[ep][role], memory_order_relaxed);
 }
 
-/* A band's wait window in force: its own, else the queue's. */
+/* A band's wait window in force: its own, held inside the rule's window
+ * (max_queue_wait_ms), else the rule's. */
 static inline uint32_t
 fc_band_wait_ms(const fc_state_t *fc, uint8_t band)
 {
+  uint32_t own;
+
   if (!fc)
     return 0;
   band = fc_band_of(band);
-  return fc->cfg.band_wait_ms[band] ? fc->cfg.band_wait_ms[band]
-                                    : fc->cfg.max_queue_wait_ms;
+  own = fc->cfg.band_wait_ms[band];
+  return own && own < fc->cfg.max_queue_wait_ms ? own : fc->cfg.max_queue_wait_ms;
 }
+
+/* The most live waiters a band may hold: its share of max_queue_depth
+ * (rounded up, at least one); 0 = no bound of its own. */
+uint32_t fc_band_queue_bound(const fc_state_t *fc, uint8_t band);
 
 /* The ceiling a shed response reports beside the inflight count. */
 static inline uint32_t

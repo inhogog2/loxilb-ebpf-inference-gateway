@@ -221,7 +221,8 @@ void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
 int sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                              const char *msg, uint32_t inflight, uint32_t queued,
                              uint32_t limit, uint32_t retry_after, int keep,
-                             const char *cls, uint32_t band_wait_ms);
+                             const char *cls, uint32_t band_wait_ms,
+                             const char *dropped_reason);
 /* Service identity "VIP:port" from the connection's rule head ("" when the
  * head is gone). */
 void proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len);
@@ -243,6 +244,7 @@ enum sp_reap_resp {
   SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
   SP_REAP_SSE_STALL,            /* SSE error event: client stopped reading; shutdown */
   SP_REAP_FC_SHED,              /* 429 admission_shed: evicted from the queue; teardown */
+  SP_REAP_FC_TTL,               /* 429 admission_ttl_expired: the client's own TTL ended the wait (fc_llmd_headers on); teardown */
   SP_REAP_KINDS,
 };
 
