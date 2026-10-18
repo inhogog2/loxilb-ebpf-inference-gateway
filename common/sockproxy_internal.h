@@ -220,7 +220,8 @@ void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
  * was not written whole. */
 int sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                              const char *msg, uint32_t inflight, uint32_t queued,
-                             uint32_t limit, uint32_t retry_after, int keep);
+                             uint32_t limit, uint32_t retry_after, int keep,
+                             const char *cls, uint32_t band_wait_ms);
 /* Service identity "VIP:port" from the connection's rule head ("" when the
  * head is gone). */
 void proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len);
@@ -241,6 +242,7 @@ enum sp_reap_resp {
   SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
   SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
   SP_REAP_SSE_STALL,            /* SSE error event: client stopped reading; shutdown */
+  SP_REAP_FC_SHED,              /* 429 admission_shed: evicted from the queue; teardown */
   SP_REAP_KINDS,
 };
 
@@ -250,6 +252,10 @@ enum sp_reap_resp {
  * gateway (sockproxy_abandon.h). */
 uint32_t sp_sse_stall_abort_sec(void);
 void sp_reap_finish(proxy_fd_ent_t *pfe);
+/* The 429 admission_shed an evicted request's own worker writes on a
+ * connection it keeps (Connection: keep-alive); 0 = written, kept; -1 = the
+ * connection was ended (answered with a close, or cut short). */
+int sp_fc_shed_answer_kept(proxy_fd_ent_t *pfe);
 /* Hand a response of `kind` to the connection's owner worker and end the
  * connection there (sockproxy_health.c; the reaper's own entry point). The
  * caller holds PROXY_LOCK. */
@@ -294,6 +300,10 @@ int sp_fc_route_eligible(void *ctx, int ep);
  * (SP_REAP_FC_DRAINED): the pool is going away, or the process drains.
  * The caller holds PROXY_LOCK. */
 void sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach);
+/* Answer, through the same path, every waiter evicted from the pool's queue
+ * at or before `before_ns` whose owner has not claimed its answer (its wake
+ * was lost). The caller holds PROXY_LOCK. */
+void sp_fc_evicted_sweep(proxy_epval_t *tepval, uint64_t before_ns);
 /* The adaptive ceiling's signal for one pool at the 1 Hz pass: fresh
  * scraped depths and TTFT estimates within the pool's telemetry window.
  * The caller holds PROXY_LOCK. */

@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <assert.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>   /* sockaddr_in / AF_INET ( real-peer-IP for XFF) */
@@ -3300,6 +3301,14 @@ proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
   return (ssize_t)to_copy;
 }
 
+/* The caller's headers a refusal frame holds. A list built in a fixed array
+ * is checked against it at compile time (H2_DENY_EXTRA_FITS); a longer list
+ * at run time is a defect, never sent short. */
+#define H2_DENY_EXTRA_MAX 5
+#define H2_DENY_EXTRA_FITS(arr)                                           \
+  _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= H2_DENY_EXTRA_MAX,      \
+                 "an HTTP/2 refusal's header list is longer than its frame")
+
 /* Frame a terminal refusal on ONE stream: :status, content-type, an
  * optional retry-after, the caller's extra headers, and the body. The
  * multiplexed connection stays alive. */
@@ -3347,10 +3356,32 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 
   snprintf(clen_str, sizeof(clen_str), "%d", ctx ? blen : 0);
 
-  nghttp2_nv hdrs[4 + 3];
+  /* :status, content-type, retry-after, content-length, then at most
+   * H2_DENY_EXTRA_MAX of the caller's (the capacity refusal sends five). */
+  nghttp2_nv hdrs[4 + H2_DENY_EXTRA_MAX];
   size_t nvlen = 0;
-  if (n_extra > 3)
-    n_extra = 3;
+  if (n_extra > H2_DENY_EXTRA_MAX) {
+    /* Never a refusal with headers missing. A debug build stops here; a
+     * product build resets the stream, so its client is not left waiting,
+     * and the anomaly counter says a defect ran. */
+#ifdef SP_DEBUG_ASSERTS
+    assert(n_extra <= H2_DENY_EXTRA_MAX);
+#endif
+    atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_H2_DENY_HEADERS], 1,
+                              memory_order_relaxed);
+    log_error("[HTTP/2] stream %d: refusal %d has %zu headers, the frame holds %d: reset",
+              stream_id, status_code, n_extra, H2_DENY_EXTRA_MAX);
+    stream->deny_body_ctx = NULL;
+    if (ctx) {
+      free(ctx->data);
+      free(ctx);
+    }
+    stream->response_sent = 1;
+    nghttp2_submit_rst_stream(pfe->h2_session->session, NGHTTP2_FLAG_NONE,
+                              stream_id, NGHTTP2_INTERNAL_ERROR);
+    nghttp2_session_send(pfe->h2_session->session);
+    return -1;
+  }
   hdrs[nvlen].name = (uint8_t *)":status";
   hdrs[nvlen].value = (uint8_t *)status_str;
   hdrs[nvlen].namelen = 7;
@@ -3467,15 +3498,18 @@ h2_send_local_outage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 
 /* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
  * with the same admission headers an upstream router reads and the same
- * Retry-After (5 s for a drain, 1 s otherwise: a stream never queues). */
+ * Retry-After (5 s for a drain, 1 s otherwise: a stream never queues), and
+ * for a stream whose class was resolved (`cls`) its class and its band's
+ * wait window in force. */
 static int
 proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                             int status_code, const char *error_code,
                             const char *error_msg, uint32_t inflight,
-                            uint32_t queued, uint32_t limit, int retry_after)
+                            uint32_t queued, uint32_t limit, int retry_after,
+                            const char *cls, uint32_t band_wait_ms)
 {
   char body[512];
-  char inflight_str[16], queued_str[16], limit_str[16];
+  char inflight_str[16], queued_str[16], limit_str[16], wait_str[16];
   int blen;
 
   if (status_code == 503) {
@@ -3492,16 +3526,22 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   snprintf(inflight_str, sizeof(inflight_str), "%u", inflight);
   snprintf(queued_str, sizeof(queued_str), "%u", queued);
   snprintf(limit_str, sizeof(limit_str), "%u", limit);
-  nghttp2_nv extra[3] = {
+  snprintf(wait_str, sizeof(wait_str), "%u", band_wait_ms);
+  nghttp2_nv extra[5] = {
     { (uint8_t *)"x-loxilb-admission-inflight", (uint8_t *)inflight_str,
       27, strlen(inflight_str), NGHTTP2_NV_FLAG_NONE },
     { (uint8_t *)"x-loxilb-admission-queued", (uint8_t *)queued_str,
       25, strlen(queued_str), NGHTTP2_NV_FLAG_NONE },
     { (uint8_t *)"x-loxilb-admission-limit", (uint8_t *)limit_str,
       24, strlen(limit_str), NGHTTP2_NV_FLAG_NONE },
+    { (uint8_t *)SP_CLASS_HDR_CLASS, (uint8_t *)(cls ? cls : ""),
+      sizeof(SP_CLASS_HDR_CLASS) - 1, cls ? strlen(cls) : 0, NGHTTP2_NV_FLAG_NONE },
+    { (uint8_t *)"x-loxilb-admission-band-wait-ms", (uint8_t *)wait_str,
+      31, strlen(wait_str), NGHTTP2_NV_FLAG_NONE },
   };
+  H2_DENY_EXTRA_FITS(extra);
   return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
-                            extra, 3);
+                            extra, cls ? 5 : 3);
 }
 
 /* ---- capacity admission at the HTTP/2 stream site ---------------------------
@@ -3515,22 +3555,34 @@ static void
 sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
               proxy_epval_t *tepval, fc_verdict_t v, int role)
 {
-  int status = (v == FC_NO_CAPACITY || v == FC_DRAINING) ? 503 : 429;
-  const char *code = v == FC_NO_CAPACITY ? "admission_no_capacity"
-                   : v == FC_DRAINING ? "gateway_draining"
-                   : v == FC_TENANT_SHARE ? "admission_tenant_share"
-                   : "admission_capacity";
+  int status;
+  const char *code;
+
+  /* A sheddable stream is shed at whichever ceiling it met (the service
+   * gate already says so for its own). */
+  v = fc_band_verdict(&tepval->fc, &stream->fc, v);
+  status = (v == FC_NO_CAPACITY || v == FC_DRAINING) ? 503 : 429;
+  code = v == FC_NO_CAPACITY ? "admission_no_capacity"
+       : v == FC_DRAINING ? "gateway_draining"
+       : v == FC_TENANT_SHARE ? "admission_tenant_share"
+       : v == FC_BAND_SHED ? "admission_shed"
+       : "admission_capacity";
   const char *msg = v == FC_NO_CAPACITY ? "no healthy endpoint has capacity"
                   : v == FC_DRAINING ? "the gateway is draining for maintenance"
                   : "";
   uint32_t inflight = fc_inflight(&tepval->fc);
   uint32_t queued = fc_queued(&tepval->fc);
   uint32_t limit = fc_limit_for(&tepval->fc, role);
+  /* Read before the release below and the send that frees the stream. */
+  const char *cls = stream->adm_class_set ? sp_class_name(stream->adm_class) : NULL;
+  uint32_t band_wait_ms = fc_band_wait_ms(&tepval->fc, stream->fc.band);
 
   /* A stream never waits: over a ceiling is a refusal on the stream, and
    * the decision is counted here, where it is written. */
   if (v == FC_SHED)
     fc_count(&tepval->fc, FC_R_CAPACITY_SHED);
+  else if (v == FC_BAND_SHED)
+    fc_count_band(&tepval->fc, FC_R_SHED, stream->fc.band);
   else if (v == FC_DRAINING)
     fc_count(&tepval->fc, FC_R_DRAINING);
   else if (v == FC_TENANT_SHARE)
@@ -3556,7 +3608,8 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   /* Last: with the request complete, the answer ends the stream and frees
    * it before the send returns, so everything above reads it first. */
   proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
-                              limit, v == FC_DRAINING ? 5 : 1);
+                              limit, v == FC_DRAINING ? 5 : 1,
+                              cls, band_wait_ms);
 }
 
 /* 0 = proceed; -1 = refused, terminal response framed on the stream. */
@@ -3583,7 +3636,8 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     fc_verdict_t v = fc_service_acquire_band(&tepval->fc, &stream->fc,
                                              fc_tenant_key(stream->tenant_id),
                                              fc_band_of(stream->adm_class));
-    if (v == FC_SHED || v == FC_DRAINING || v == FC_TENANT_SHARE) {
+    if (v == FC_SHED || v == FC_DRAINING || v == FC_TENANT_SHARE ||
+        v == FC_BAND_SHED) {
       sp_fc_h2_shed(pfe, stream, tepval, v, -1);
       return -1;
     }

@@ -148,13 +148,17 @@ test_fifo_order_and_depth(void)
   assert(h1_gate(&fc, &extra, 30, 1, now, 0) == FC_QUEUE);
   assert(fc_queued(&fc) == 3);
 
-  /* The woken request takes the free unit ahead of the newcomer. */
+  /* The woken request takes the free unit ahead of the newcomer. Its wait
+   * is one sample, taken when it is admitted on the gate's clock: the park
+   * is dated 40 ms back on that clock. */
   fc_queue_resumed(&fc, &wait[0], now + MS(40));
   assert(wait[0].state == FC_P_NONE && wait[0].woken);
+  assert(atomic_load(&fc.qwait_count) == 0);       /* a resume is not the end */
+  wait[0].q_enqueue_ns = fc_now_ns() - MS(40);
   assert(h1_gate(&fc, &wait[0], 20, 1, now, 1) == FC_ADMIT);
   assert(fc_inflight(&fc) == 2);
   assert(atomic_load(&fc.qwait_count) == 1);
-  assert(atomic_load(&fc.qwait_sum_ms) == 40);
+  assert(atomic_load(&fc.qwait_sum_ms) >= 40 && atomic_load(&fc.qwait_sum_ms) < 50);
   assert(atomic_load(&fc.qwait_bucket[1]) == 1);   /* 40 ms: (10, 50] */
 
   /* Releases keep popping in order: 21, 22, then the newcomer. */

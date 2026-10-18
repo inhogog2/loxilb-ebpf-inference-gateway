@@ -42,12 +42,31 @@ static const char *const fc_reason_names[FC_R_COUNT] = {
   [FC_R_OBSERVE_WOULD_QUEUE] = "observe_would_queue",
   [FC_R_DRAINING] = "draining",
   [FC_R_TENANT_SHARE] = "tenant_share",
+  [FC_R_SHED] = "shed",
+};
+
+static const char *const fc_band_outcome_names[FC_BO_COUNT] = {
+  [FC_BO_ADMITTED] = "admitted",
+  [FC_BO_QUEUED] = "queued",
+  [FC_BO_SHED] = "shed",
+  [FC_BO_EXPIRED] = "expired",
+  [FC_BO_CANCELLED] = "cancelled",
+};
+
+/* The decision each band outcome splits. */
+static const uint8_t fc_band_outcome_reason[FC_BO_COUNT] = {
+  [FC_BO_ADMITTED] = FC_R_ADMITTED,
+  [FC_BO_QUEUED] = FC_R_QUEUED,
+  [FC_BO_SHED] = FC_R_SHED,
+  [FC_BO_EXPIRED] = FC_R_QUEUE_TIMEOUT,
+  [FC_BO_CANCELLED] = FC_R_CANCELLED,
 };
 
 static const char *const fc_anomaly_names[FC_A_COUNT] = {
   [FC_A_UNDERFLOW] = "underflow",
   [FC_A_UNKNOWN_PERMIT] = "unknown_permit",
   [FC_A_TENANT_TABLE_FULL] = "tenant_table_full",
+  [FC_A_H2_DENY_HEADERS] = "h2_deny_headers",
 };
 
 static const char *const fc_adapt_state_names[FC_AS_COUNT] = {
@@ -750,6 +769,7 @@ fc_permit_reset(fc_permit_t *p)
   p->svc_held = 0;
   p->woken = 0;
   p->band = FC_BAND_STANDARD;
+  p->q_parked = 0;
   for (int r = 0; r < FC_ROLES; r++)
     p->ep[r] = -1;
   p->q_fd = -1;
@@ -1189,6 +1209,91 @@ fc_count(fc_state_t *fc, enum fc_reason reason)
   atomic_fetch_add_explicit(&fc->decisions[reason], 1, memory_order_relaxed);
 }
 
+static int
+fc_band_outcome_of(enum fc_reason reason)
+{
+  for (int o = 0; o < FC_BO_COUNT; o++)
+    if (fc_band_outcome_reason[o] == reason)
+      return o;
+  return -1;
+}
+
+void
+fc_count_band(fc_state_t *fc, enum fc_reason reason, uint8_t band)
+{
+  int o;
+
+  fc_count(fc, reason);
+  if (!fc || !fc_band_counted(band))
+    return;
+  o = fc_band_outcome_of(reason);
+  if (o >= 0)
+    atomic_fetch_add_explicit(&fc->band_outcome[band][o], 1, memory_order_relaxed);
+}
+
+uint64_t
+fc_band_outcome(fc_state_t *fc, uint8_t band, int outcome)
+{
+  uint64_t total, crit, shed, std, seen;
+
+  if (!fc || outcome < 0 || outcome >= FC_BO_COUNT)
+    return 0;
+  band = fc_band_of(band);
+  if (fc_band_counted(band))
+    return atomic_load_explicit(&fc->band_outcome[band][outcome], memory_order_relaxed);
+  /* The two counted bands first: each moves with the decision, after it,
+   * so read after the decision they are never ahead of it. */
+  total = atomic_load_explicit(&fc->decisions[fc_band_outcome_reason[outcome]],
+                               memory_order_relaxed);
+  crit = atomic_load_explicit(&fc->band_outcome[FC_BAND_CRITICAL][outcome],
+                              memory_order_relaxed);
+  shed = atomic_load_explicit(&fc->band_outcome[FC_BAND_SHEDDABLE][outcome],
+                              memory_order_relaxed);
+  std = total > crit + shed ? total - crit - shed : 0;
+  /* A critical or sheddable request counted between the loads reads in its
+   * band but not yet in the total: the difference can only read low, by
+   * the requests in that window, and the next read has them back. A counter
+   * must not step back, so a reader returns the larger of this and the
+   * last value read; neither is ever above the true count. */
+  seen = atomic_load_explicit(&fc->band_std_read[outcome], memory_order_relaxed);
+  while (std > seen &&
+         !atomic_compare_exchange_weak_explicit(&fc->band_std_read[outcome], &seen,
+                                                std, memory_order_relaxed,
+                                                memory_order_relaxed))
+    ;
+  return std > seen ? std : seen;
+}
+
+const char *
+fc_band_outcome_name(int outcome)
+{
+  if (outcome < 0 || outcome >= FC_BO_COUNT)
+    return "unknown";
+  return fc_band_outcome_names[outcome];
+}
+
+int
+fc_band_may_wait(const fc_state_t *fc, const fc_permit_t *p)
+{
+  return !fc || !p || fc->cfg.mode != FC_MODE_ENFORCE ||
+         p->band != FC_BAND_SHEDDABLE || fc->cfg.shed_queue;
+}
+
+fc_verdict_t
+fc_band_verdict(const fc_state_t *fc, const fc_permit_t *p, fc_verdict_t v)
+{
+  if ((v == FC_QUEUE || v == FC_SHED) && !fc_band_may_wait(fc, p))
+    return FC_BAND_SHED;
+  return v;
+}
+
+int
+fc_band_triple_fmt(char *out, size_t cap, const uint32_t v[FC_BANDS])
+{
+  return snprintf(out, cap, "%u:%u:%u", v[fc_band_at_rank(0)],
+                  v[fc_band_at_rank(1)], v[fc_band_at_rank(2)]);
+}
+
 void
 fc_drain_set(int on)
 {
@@ -1305,6 +1410,82 @@ fc_band_unit_give(fc_state_t *fc, const fc_permit_t *p)
     fc_unit_give(&fc->band_inflight[p->band]);
 }
 
+/* Whether the strict wake orders this pool's waiters by band. Weighted
+ * keeps one order across bands until it runs its own rounds. */
+static inline int
+fc_wake_strict(const fc_state_t *fc)
+{
+  return fc->cfg.wake_policy == FC_WAKE_STRICT;
+}
+
+/* Whether a newcomer of `band` waits behind the queue, read from the
+ * lock-free mirrors: under strict, behind a waiter of its own band or a
+ * higher one; otherwise behind anybody. With every waiter standard both
+ * are "anybody waiting", today's test. */
+static int
+fc_waiters_ahead(const fc_state_t *fc, uint8_t band)
+{
+  int rank = fc_band_rank(band);
+
+  if (fc_queued(fc) == 0)
+    return 0;
+  if (!fc_wake_strict(fc) || rank == FC_BANDS - 1)
+    return 1;
+  for (int r = 0; r <= rank; r++)
+    if (fc_band_queued(fc, fc_band_at_rank(r)) > 0)
+      return 1;
+  return 0;
+}
+
+/* Lock held. Live entries of one band (standard is the rest). */
+static uint32_t
+fc_ring_band_n(const fc_queue_t *q, uint8_t band)
+{
+  uint32_t crit = q->band_count[FC_BAND_CRITICAL];
+  uint32_t shed = q->band_count[FC_BAND_SHEDDABLE];
+
+  return fc_band_derive(q->count, crit, shed, band);
+}
+
+/* Lock held. The same on a pool with a share: a newcomer of `band` waits
+ * when a waiter that could take the unit now is ahead of it. The tenant
+ * count answers it whenever every waiter is ahead of the newcomer; only a
+ * queue that holds both bands ahead of it and bands below it is walked. */
+static int
+fc_band_waiter_can_run(fc_state_t *fc, uint8_t band, uint32_t bound)
+{
+  const fc_queue_t *q = &fc->queue;
+  int rank = fc_band_rank(band);
+  int ahead = 0, below = 0;
+  uint32_t i;
+
+  if (!fc_tenant_waiter_can_run(fc, bound))
+    return 0;
+  if (!fc_wake_strict(fc) || rank == FC_BANDS - 1)
+    return 1;
+  for (int r = 0; r < FC_BANDS; r++) {
+    if (fc_ring_band_n(q, fc_band_at_rank(r)) == 0)
+      continue;
+    if (r <= rank)
+      ahead = 1;
+    else
+      below = 1;
+  }
+  if (!ahead)
+    return 0;
+  if (!below)
+    return 1;
+  i = q->head;
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+    if (e->live && fc_band_rank(e->band) <= rank &&
+        fc_tenant_can_run(fc, e->tslot, bound))
+      return 1;
+    i = fc_ring_wrap(q, i + 1);
+  }
+  return 0;
+}
+
 /* The service unit on a pool with a tenant share: the tenant's own count
  * is checked and moved under the queue lock, with the service unit. */
 static fc_verdict_t
@@ -1325,8 +1506,10 @@ fc_service_acquire_shared(fc_state_t *fc, fc_permit_t *p, int can_queue,
   if (t && bound && t->inflight >= bound) {
     if (enforce) {
       /* At its share: it waits for one of its own units when it may, and
-       * everyone else still admits. */
-      v = can_queue && fc_queue_enabled(fc) ? FC_QUEUE : FC_TENANT_SHARE;
+       * everyone else still admits. A sheddable request that may not wait
+       * takes the share's refusal: the pool is not at its ceiling. */
+      v = can_queue && fc_queue_enabled(fc) && fc_band_may_wait(fc, p)
+          ? FC_QUEUE : FC_TENANT_SHARE;
       goto refused;
     }
     fc_count(fc, FC_R_OBSERVE_WOULD_SHED);
@@ -1334,16 +1517,18 @@ fc_service_acquire_shared(fc_state_t *fc, fc_permit_t *p, int can_queue,
     goto admitted;
   }
   /* Waiters come first, but only those that could take the unit: a queue
-   * full of tenants held back by their share is no reason to wait. A woken
-   * request IS the head. */
+   * full of tenants held back by their share is no reason to wait, and
+   * under strict neither is a queue of lower bands. A woken request IS the
+   * head. */
   if (enforce && fc_queue_enabled(fc) && !woken &&
-      fc_tenant_waiter_can_run(fc, bound))
+      fc_band_waiter_can_run(fc, p->band, bound))
     over = 1;
   if (!over && fc_unit_take(&fc->inflight, fc_svc_cap(fc)) != 0)
     over = 1;
   if (over) {
     if (enforce) {
-      v = can_queue && fc_queue_enabled(fc) ? FC_QUEUE : FC_SHED;
+      v = fc_band_verdict(fc, p, can_queue && fc_queue_enabled(fc) ? FC_QUEUE
+                                                                   : FC_SHED);
       goto refused;
     }
     fc_count(fc, fc->cfg.max_queue_depth > 0 ? FC_R_OBSERVE_WOULD_QUEUE
@@ -1377,8 +1562,11 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
   int over = 0;
   uint64_t enq = woken ? p->q_enqueue_ns : 0;
   uint64_t deadline = woken ? p->q_deadline_ns : 0;
+  /* A new request is in no park; a woken one is still in its first. */
+  uint8_t parked = woken ? p->q_parked : 0;
 
   fc_permit_bind(p, fc);
+  p->q_parked = parked;
   /* A woken request keeps the wait it was first given, should it go back. */
   p->q_enqueue_ns = enq;
   p->q_deadline_ns = deadline;
@@ -1396,17 +1584,19 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
     return fc_service_acquire_shared(fc, p, can_queue, woken);
   /* A queue with someone in it: a newcomer waits behind them (or, on a
    * path that cannot wait, is refused), whatever the counters say, so a
-   * unit freed for the head of the queue is not taken from under it. A
+   * unit freed for the head of the queue is not taken from under it. Under
+   * strict only a waiter of its own band or a higher one is ahead of it. A
    * woken request IS the head. */
   if (fc->cfg.mode == FC_MODE_ENFORCE && fc_queue_enabled(fc) && !woken &&
-      fc_queued(fc) > 0)
+      fc_waiters_ahead(fc, p->band))
     over = 1;
   if (!over && fc_unit_take(&fc->inflight, fc_svc_cap(fc)) != 0)
     over = 1;
   if (over) {
     if (fc->cfg.mode == FC_MODE_ENFORCE) {
       p->state = FC_P_NONE;
-      return can_queue && fc_queue_enabled(fc) ? FC_QUEUE : FC_SHED;
+      return fc_band_verdict(fc, p, can_queue && fc_queue_enabled(fc) ? FC_QUEUE
+                                                                      : FC_SHED);
     }
     fc_count(fc, fc->cfg.max_queue_depth > 0 ? FC_R_OBSERVE_WOULD_QUEUE
                                              : FC_R_OBSERVE_WOULD_SHED);
@@ -1474,6 +1664,8 @@ fc_ep_over_cap(const fc_state_t *fc, int ep, int role)
   return cap && fc_ep_inflight(fc, ep, role) >= cap;
 }
 
+static void fc_note_wait(fc_state_t *fc, uint64_t wait_ms);
+
 fc_verdict_t
 fc_ep_acquire(fc_state_t *fc, fc_permit_t *p, int ep, int role)
 {
@@ -1503,8 +1695,9 @@ fc_ep_acquire(fc_state_t *fc, fc_permit_t *p, int ep, int role)
      * leg of a request that opens two. Its time is the dispatch a TTFT
      * sample is measured from, so a wait at the gate is not the engine's. */
     if (!had_leg) {
-      fc_count(fc, FC_R_ADMITTED);
+      fc_count_band(fc, FC_R_ADMITTED, p->band);
       p->admit_ns = fc_now_ns();
+      fc_queue_wait_end(fc, p, p->admit_ns);
     }
   }
   return FC_ADMIT;
@@ -1613,12 +1806,18 @@ fc_permit_release__(fc_permit_t *p, int wake)
     /* The request is gone while it waited: its entry leaves the queue
      * without a wake. The deadline and a drain move the permit out of
      * QUEUED when they take the entry, so a QUEUED permit whose entry is
-     * no longer there was popped for its turn: the wake is on its way to a
+     * no longer there was popped for its turn, or evicted. Evicted, it was
+     * counted shed and freed no unit: its owed answer is dropped with the
+     * connection and nobody is woken. Popped, the wake is on its way to a
      * connection that will not use it, and the turn goes to the next
      * waiting request instead of being lost. */
     fc = p->fc;
     if (fc && fc_queue_take(fc, p)) {
-      fc_count(fc, FC_R_CANCELLED);
+      fc_count_band(fc, FC_R_CANCELLED, p->band);
+      fc_queue_wait_end(fc, p, fc_now_ns());
+      fc = NULL;
+    } else if (fc && fc_queue_evicted_claim(fc, p->q_fd, p->q_gen)) {
+      p->q_parked = 0;             /* observed where it was evicted */
       fc = NULL;
     }
     p->state = FC_P_RELEASED;
@@ -1735,6 +1934,117 @@ fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
   return 0;
 }
 
+/* Lock held. The waiter an arrival of `band` would evict at the queue's
+ * depth: the youngest sheddable entry, when the pool lets sheddable wait
+ * (fc_shed_queue), the arrival is above sheddable and the evicted list has
+ * room for one more answer. UINT32_MAX for none. */
+static uint32_t
+fc_ring_evict_pick(const fc_state_t *fc, uint8_t band)
+{
+  const fc_queue_t *q = &fc->queue;
+  uint32_t i;
+
+  if (!fc->cfg.shed_queue || fc_band_of(band) == FC_BAND_SHEDDABLE ||
+      q->band_count[FC_BAND_SHEDDABLE] == 0 ||
+      atomic_load_explicit(&q->n_evicted, memory_order_relaxed) >= FC_EVICT_PENDING ||
+      q->used == 0)
+    return UINT32_MAX;
+  i = fc_ring_wrap(q, q->head + q->used - 1);
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+    if (e->live && e->band == FC_BAND_SHEDDABLE)
+      return i;
+    i = i == 0 ? q->cap - 1 : i - 1;
+  }
+  return UINT32_MAX;
+}
+
+/* Lock held. Take the entry at `slot` out as evicted: its place, its band
+ * and its tenant's queue count go now, its answer goes on the evicted list
+ * (fc_ring_evict_pick checked the room). Returns what was evicted. */
+static fc_evicted_t
+fc_ring_evict(fc_state_t *fc, uint32_t slot, uint64_t now_ns)
+{
+  fc_queue_t *q = &fc->queue;
+  fc_queue_ent_t *e = &q->ring[slot];
+  uint32_t n = atomic_load_explicit(&q->n_evicted, memory_order_relaxed);
+  fc_evicted_t gone = { .fd = e->fd, .gen = e->gen, .at_ns = now_ns };
+
+  e->live = 0;
+  q->count--;
+  fc_ring_band_sub(q, e->band);
+  fc_tenant_dec(fc, e->tslot, 1);
+  while (q->used > 0 && !q->ring[q->head].live) {
+    q->head = fc_ring_wrap(q, q->head + 1);
+    q->used--;
+  }
+  q->evicted[n] = gone;
+  atomic_store_explicit(&q->n_evicted, n + 1, memory_order_relaxed);
+  return gone;
+}
+
+/* Lock held. Drop entry `i` of the evicted list, keeping the order. */
+static void
+fc_evicted_drop(fc_queue_t *q, uint32_t i)
+{
+  uint32_t n = atomic_load_explicit(&q->n_evicted, memory_order_relaxed);
+
+  for (uint32_t k = i + 1; k < n; k++)
+    q->evicted[k - 1] = q->evicted[k];
+  atomic_store_explicit(&q->n_evicted, n - 1, memory_order_relaxed);
+}
+
+int
+fc_queue_evicted_claim(fc_state_t *fc, int fd, uint64_t gen)
+{
+  fc_queue_t *q;
+  int claimed = 0;
+
+  if (!fc || fd < 0 || fc_queue_evicted(fc) == 0)
+    return 0;
+  q = &fc->queue;
+  pthread_mutex_lock(&q->lock);
+  for (uint32_t i = 0; i < atomic_load_explicit(&q->n_evicted, memory_order_relaxed); i++) {
+    if (q->evicted[i].fd == fd && q->evicted[i].gen == gen) {
+      fc_evicted_drop(q, i);
+      claimed = 1;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&q->lock);
+  return claimed;
+}
+
+uint32_t
+fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,
+                       int (*fn)(void *ctx, const fc_queue_ent_t *ent),
+                       void *ctx)
+{
+  fc_evicted_t take[FC_EVICT_PENDING];
+  fc_queue_t *q;
+  uint32_t n = 0, i = 0;
+
+  if (!fc || fc_queue_evicted(fc) == 0)
+    return 0;
+  q = &fc->queue;
+  pthread_mutex_lock(&q->lock);
+  while (i < atomic_load_explicit(&q->n_evicted, memory_order_relaxed)) {
+    if (q->evicted[i].at_ns <= before_ns) {
+      take[n++] = q->evicted[i];
+      fc_evicted_drop(q, i);
+    } else {
+      i++;
+    }
+  }
+  pthread_mutex_unlock(&q->lock);
+  for (i = 0; i < n && fn; i++) {
+    fc_queue_ent_t e = { .fd = take[i].fd, .band = FC_BAND_SHEDDABLE,
+                         .tslot = -1, .gen = take[i].gen };
+    (void)fn(ctx, &e);
+  }
+  return n;
+}
+
 int
 fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
               uint64_t now_ns, int front)
@@ -1746,11 +2056,18 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   uint8_t band;
   int tslot = -1;
   int rc = -1;
+  uint32_t evict = UINT32_MAX;
+  fc_evicted_t gone = { .fd = -1 };
+  uint64_t gone_enq_ns = 0;
+  int evicted = 0;
+  uint8_t parked;
 
   if (!fc || !p || fd < 0)
     return -1;
   tkey = p->tkey;
   band = p->band;
+  /* A request going back to its place is still in its first park. */
+  parked = front ? p->q_parked : 1;
   /* A woken request going back is still bounded by its first window, and
    * takes its place among the waiters by when it first arrived. */
   if (front && p->q_deadline_ns) {
@@ -1774,13 +2091,23 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   p->q_enqueue_ns = now_ns;
   p->tkey = tkey;
   p->band = band;
+  /* Set before the entry is published, like the state: a deadline on
+   * another thread may end the park at once. */
+  p->q_parked = parked;
 
   pthread_mutex_lock(&fc->queue.lock);
   e.deadline_ns = first_deadline ? first_deadline
                  : now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
   p->q_deadline_ns = e.deadline_ns;
+  /* At its depth, a request above sheddable may take the place of a
+   * sheddable waiter (fc_shed_queue): one is chosen now, and evicted only
+   * once this request is sure to take its place. */
+  if (!front && !fc->queue.dead && fc_queue_enabled(fc) &&
+      fc->queue.count >= fc->cfg.max_queue_depth)
+    evict = fc_ring_evict_pick(fc, band);
   if (!fc->queue.dead && fc_queue_enabled(fc) &&
-      (front || fc->queue.count < fc->cfg.max_queue_depth)) {
+      (front || fc->queue.count < fc->cfg.max_queue_depth ||
+       evict != UINT32_MAX)) {
     if (fc_share_active(fc)) {
       uint32_t qbound = fc_tenant_queue_bound(fc);
       tslot = fc_tenant_get(fc, tkey, 0);
@@ -1789,6 +2116,11 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
           fc->tenants[tslot].queued >= qbound)
         rc = -2;
       e.tslot = (int16_t)tslot;
+    }
+    if (rc != -2 && evict != UINT32_MAX) {
+      gone_enq_ns = fc->queue.ring[evict].enqueue_ns;
+      gone = fc_ring_evict(fc, evict, now_ns);
+      evicted = 1;
     }
     if (rc != -2)
       rc = fc_ring_insert(&fc->queue, &e, front, &slot);
@@ -1801,20 +2133,33 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
       }
     }
   }
-  if (rc == 0) {
+  if (rc == 0)
     p->q_slot = slot;
+  if (rc == 0 || evicted)
     fc_queue_publish(fc);
-  }
   pthread_mutex_unlock(&fc->queue.lock);
 
+  if (evicted) {
+    /* Counted where it was decided; answered on its own connection by its
+     * owner worker, which claims it on this wake. A wake that cannot be
+     * queued leaves it to the 1 Hz pass. */
+    fc_count_band(fc, FC_R_SHED, FC_BAND_SHEDDABLE);
+    /* Its park ends here (its owner only answers it): observed here. */
+    fc_note_wait(fc, now_ns > gone_enq_ns ? (now_ns - gone_enq_ns) / 1000000ULL : 0);
+    if (fc_wake_hook)
+      (void)fc_wake_hook(gone.fd, gone.gen);
+  }
   if (rc != 0) {
     fc_permit_bind(p, fc);
     p->tkey = tkey;
     p->band = band;
+    p->q_parked = front ? parked : 0;
     fc_count(fc, rc == -2 ? FC_R_TENANT_SHARE : FC_R_QUEUE_FULL);
     return rc == -2 ? -2 : -1;
   }
-  fc_count(fc, FC_R_QUEUED);
+  /* A request going back to the head is the same park. */
+  if (!front)
+    fc_count_band(fc, FC_R_QUEUED, band);
   return 0;
 }
 
@@ -1922,32 +2267,49 @@ fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out)
 }
 
 /* Lock held. Take out the oldest live entry whose tenant could take a unit
- * now; the ones passed over keep their place. Its tenant's queue count is
- * left for the caller to settle once the wake is delivered: an entry put
- * back keeps its slot counted, so the slot is never reused under it. */
+ * now; the ones passed over keep their place. Under strict with a waiter of
+ * a band other than standard, the oldest such entry of the highest band
+ * that has one; with every waiter standard the walk is the plain one. Its
+ * tenant's queue count is left for the caller to settle once the wake is
+ * delivered: an entry put back keeps its slot counted, so the slot is never
+ * reused under it. */
 static int
 fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out)
 {
   fc_queue_t *q = &fc->queue;
   uint32_t bound = fc_tenant_svc_bound(fc);
-  uint32_t i = q->head;
+  uint32_t i = q->head, best = UINT32_MAX;
+  int banded = fc_wake_strict(fc) && (q->band_count[FC_BAND_CRITICAL] ||
+                                      q->band_count[FC_BAND_SHEDDABLE]);
+  int best_rank = FC_BANDS;
+  fc_queue_ent_t *e;
 
   for (uint32_t k = 0; k < q->used; k++) {
-    fc_queue_ent_t *e = &q->ring[i];
+    e = &q->ring[i];
     if (e->live && fc_tenant_can_run(fc, e->tslot, bound)) {
-      *out = *e;
-      e->live = 0;
-      q->count--;
-      fc_ring_band_sub(q, e->band);
-      while (q->used > 0 && !q->ring[q->head].live) {
-        q->head = fc_ring_wrap(q, q->head + 1);
-        q->used--;
+      int r = banded ? fc_band_rank(e->band) : 0;
+
+      if (r < best_rank) {
+        best = i;
+        best_rank = r;
+        if (r == 0)
+          break;
       }
-      return 1;
     }
     i = fc_ring_wrap(q, i + 1);
   }
-  return 0;
+  if (best == UINT32_MAX)
+    return 0;
+  e = &q->ring[best];
+  *out = *e;
+  e->live = 0;
+  q->count--;
+  fc_ring_band_sub(q, e->band);
+  while (q->used > 0 && !q->ring[q->head].live) {
+    q->head = fc_ring_wrap(q, q->head + 1);
+    q->used--;
+  }
+  return 1;
 }
 
 static void
@@ -1966,16 +2328,23 @@ fc_note_wait(fc_state_t *fc, uint64_t wait_ms)
 void
 fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
 {
-  uint64_t wait_ms = 0;
-
+  (void)fc;
+  (void)now_ns;
   if (!p || p->state != FC_P_QUEUED)
     return;
-  if (fc && now_ns > p->q_enqueue_ns)
-    wait_ms = (now_ns - p->q_enqueue_ns) / 1000000ULL;
-  if (fc)
-    fc_note_wait(fc, wait_ms);
+  /* Not the end of the park: the woken request may go back to its place.
+   * Its wait is observed when the park ends (fc_queue_wait_end). */
   p->state = FC_P_NONE;
   p->woken = 1;
+}
+
+void
+fc_queue_wait_end(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
+{
+  if (!fc || !p || !p->q_parked)
+    return;
+  p->q_parked = 0;
+  fc_note_wait(fc, now_ns > p->q_enqueue_ns ? (now_ns - p->q_enqueue_ns) / 1000000ULL : 0);
 }
 
 /* Pop the head and wake its owner. 0 when nobody was popped or the wake

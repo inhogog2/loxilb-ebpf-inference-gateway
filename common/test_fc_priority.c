@@ -52,6 +52,9 @@ pool_with(fc_state_t *fc, uint8_t mode, uint32_t max_out, uint32_t depth,
   cfg.max_queue_depth = depth;
   cfg.max_queue_wait_ms = depth ? 5000 : 0;
   cfg.tenant_share_pct = share_pct;
+  /* Sheddable requests wait here as the others do: these cases count the
+   * bands through every exit; the shed itself is test_fc_band_shed's. */
+  cfg.shed_queue = 1;
   fc_state_apply(fc, &cfg);
 }
 

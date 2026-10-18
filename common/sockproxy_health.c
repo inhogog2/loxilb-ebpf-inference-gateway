@@ -288,9 +288,9 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"pd_idle_timeout\"}", 1, 0),
-  /* The two capacity-queue endings are formatted on the owner worker with
-   * the wait and the admission headers (sp_reap_finish); these are the
-   * plain fallbacks for a socket the reaper has to end itself. */
+  /* The capacity-queue endings are formatted on the owner worker with the
+   * wait and the admission headers (sp_reap_finish); these are the plain
+   * fallbacks for a socket the reaper has to end itself. */
   [SP_REAP_FC_QUEUE_TIMEOUT] =
       SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
                    "Content-Type: application/json\r\n"
@@ -307,6 +307,13 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "{\"error\":\"admission_drained\"}", 1, 0),
   [SP_REAP_SSE_STALL] =
       SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
+  [SP_REAP_FC_SHED] =
+      SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Retry-After: 1\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"admission_shed\"}", 1, 0),
 };
 
 /* Whether the answer this client is being sent is chunked, read from the
@@ -455,44 +462,74 @@ sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind)
  * thread would have ended it: the single-owner teardown under PROXY_LOCK for
  * a request, a shutdown for a stream the event loop cleans up. The kind is
  * cleared first, so a second wake for the same fd finds nothing to do. */
-/* A request ended while it waited in the capacity queue (the deadline, or
- * a drain): the response says how long it waited and what the pool looks
- * like, and the refusal is recorded on the trail like every other decision
- * of the gate. Returns the length written into `out`, 0 to use the plain
- * text. */
+/* A request ended while it waited in the capacity queue (the deadline, a
+ * drain, or an eviction for a higher band): the response says how long it
+ * waited and what the pool looks like, and the refusal is recorded on the
+ * trail like every other decision of the gate. An eviction is answered
+ * like any shed, 429 admission_shed with its body shape and the wait. The
+ * response is framed with its length; `keep` says whether the connection
+ * stays open for its next request (only an eviction answered by the
+ * request's own worker keeps it, sp_fc_shed_answer_kept). Returns the
+ * length written into `out`, 0 to use the plain text. */
 static size_t
-sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
+sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
+                  size_t cap)
 {
   char svc_ident[64];
+  char body[160];
   fc_state_t *fc = pfe->fc.fc;
   struct timespec ts;
   uint64_t now_ns, queued_ms = 0;
   uint32_t inflight = fc_inflight(fc), queued = fc_queued(fc);
   uint32_t limit = fc ? fc_svc_cap(fc) : 0;
   uint32_t retry_after = kind == SP_REAP_FC_DRAINED ? 5 : fc_retry_after_s(fc);
-  int status = kind == SP_REAP_FC_DRAINED ? 503 : 504;
+  int status = kind == SP_REAP_FC_DRAINED ? 503
+             : kind == SP_REAP_FC_SHED ? 429 : 504;
   const char *code = kind == SP_REAP_FC_DRAINED ? "admission_drained"
-                                                : "admission_queue_timeout";
-  int n;
+                   : kind == SP_REAP_FC_SHED ? "admission_shed"
+                   : "admission_queue_timeout";
+  const char *status_line = status == 503 ? "503 Service Unavailable"
+                          : status == 429 ? "429 Too Many Requests"
+                          : "504 Gateway Timeout";
+  char band_hdrs[128] = "";
+  int blen, n;
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
   now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   if (pfe->fc.q_enqueue_ns > 0 && now_ns > pfe->fc.q_enqueue_ns) {
     queued_ms = (now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL;
   }
-  n = snprintf(out, cap,
-               "HTTP/1.1 %s\r\n"
-               "Content-Type: application/json\r\n"
-               "Retry-After: %u\r\n"
-               "X-Loxilb-Admission-Inflight: %u\r\n"
-               "X-Loxilb-Admission-Queued: %u\r\n"
-               "X-Loxilb-Admission-Limit: %u\r\n"
-               "Connection: close\r\n"
-               "\r\n"
-               "{\"error\":\"%s\",\"queued_ms\":%llu,\"retry_after\":%u}\r\n",
-               status == 503 ? "503 Service Unavailable" : "504 Gateway Timeout",
-               retry_after, inflight, queued, limit, code,
-               (unsigned long long)queued_ms, retry_after);
+  if (pfe->adm_class_set)
+    snprintf(band_hdrs, sizeof(band_hdrs),
+             "X-Loxilb-Admission-Class: %s\r\n"
+             "X-Loxilb-Admission-Band-Wait-Ms: %u\r\n",
+             sp_class_name(pfe->adm_class), fc_band_wait_ms(fc, pfe->fc.band));
+  if (status == 429)
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"retry_after\":%u,\"jitter_hint_ms\":250,"
+                    "\"queued_ms\":%llu}\r\n",
+                    code, retry_after, (unsigned long long)queued_ms);
+  else
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"queued_ms\":%llu,\"retry_after\":%u}\r\n",
+                    code, (unsigned long long)queued_ms, retry_after);
+  if (blen < 0 || blen >= (int)sizeof(body))
+    n = 0;
+  else
+    n = snprintf(out, cap,
+                 "HTTP/1.1 %s\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %d\r\n"
+                 "Retry-After: %u\r\n"
+                 "X-Loxilb-Admission-Inflight: %u\r\n"
+                 "X-Loxilb-Admission-Queued: %u\r\n"
+                 "X-Loxilb-Admission-Limit: %u\r\n"
+                 "%s"
+                 "Connection: %s\r\n"
+                 "\r\n"
+                 "%s",
+                 status_line, blen, retry_after, inflight, queued, limit,
+                 band_hdrs, keep ? "keep-alive" : "close", body);
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
   ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
                              svc_ident, proxy_effective_model(pfe),
@@ -507,9 +544,10 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
                                               pfe->adm_hint_not_applied),
                              pfe->adm_objective);
   log_info("[AIGateway] fd=%d ended while queued: status=%d code=%s "
-           "queued_ms=%llu inflight=%u queued=%u tenant=%s model=%s",
+           "queued_ms=%llu inflight=%u queued=%u tenant=%s model=%s%s",
            pfe->fd, status, code, (unsigned long long)queued_ms, inflight,
-           queued, pfe->tenant_id, proxy_effective_model(pfe));
+           queued, pfe->tenant_id, proxy_effective_model(pfe),
+           keep ? " (connection kept)" : "");
   return (n > 0 && n < (int)cap) ? (size_t)n : 0;
 }
 
@@ -571,6 +609,39 @@ sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
   }
 }
 
+/* An evicted request answered by its own worker (pd_resume_parked) on a
+ * connection that may carry its next request: the 429 admission_shed goes
+ * out with Connection: keep-alive, as the queue-full 429 does. A 429 is a
+ * retry signal; closing on it would make every shed client reconnect while
+ * the gateway is shedding. Returns 0 when the whole answer went out and the
+ * connection is kept. Otherwise the client was answered with a close (or
+ * the write was cut short) and the connection is ended here, as
+ * sp_reap_finish ends it. */
+int
+sp_fc_shed_answer_kept(proxy_fd_ent_t *pfe)
+{
+  const sp_reap_text_t *t = &sp_reap_texts[SP_REAP_FC_SHED];
+  char framed[512];
+  size_t len = sp_reap_fc_format(pfe, SP_REAP_FC_SHED, 1, framed, sizeof(framed));
+
+  if (len > 0 && proxy_send_local_response(pfe, framed, len) == 0)
+    return 0;
+  if (len == 0) {
+    if (proxy_send_local_response_and_shutdown(pfe, t->text, t->len) != 0)
+      log_error("[AIGateway] fd=%d failed to send complete bounded shed "
+                "answer", pfe->fd);
+  } else {
+    log_error("[AIGateway] fd=%d failed to send complete bounded shed "
+              "answer", pfe->fd);
+    shutdown(pfe->fd, SHUT_RDWR);
+  }
+  pfe->pd_phase = PD_PHASE_ERROR;
+  PROXY_LOCK();
+  pd_teardown_conn(pfe);
+  PROXY_UNLOCK();
+  return -1;
+}
+
 void
 sp_reap_finish(proxy_fd_ent_t *pfe)
 {
@@ -587,8 +658,9 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
   t = &sp_reap_texts[kind];
   buf = t->text;
   len = t->len;
-  if (kind == SP_REAP_FC_QUEUE_TIMEOUT || kind == SP_REAP_FC_DRAINED) {
-    size_t fl = sp_reap_fc_format(pfe, kind, framed, sizeof(framed));
+  if (kind == SP_REAP_FC_QUEUE_TIMEOUT || kind == SP_REAP_FC_DRAINED ||
+      kind == SP_REAP_FC_SHED) {
+    size_t fl = sp_reap_fc_format(pfe, kind, 0, framed, sizeof(framed));
     if (fl > 0) {
       buf = framed;
       len = fl;
@@ -1649,7 +1721,8 @@ check_draining_endpoints(void)
         if (pfe->odir == 0 && pfe->fc.state == FC_P_QUEUED && pfe->fc.fc &&
             pfe->fc.q_deadline_ns > 0 && q_now_ns >= pfe->fc.q_deadline_ns &&
             fc_queue_take(pfe->fc.fc, &pfe->fc)) {
-          fc_count(pfe->fc.fc, FC_R_QUEUE_TIMEOUT);
+          fc_count_band(pfe->fc.fc, FC_R_QUEUE_TIMEOUT, pfe->fc.band);
+          fc_queue_wait_end(pfe->fc.fc, &pfe->fc, q_now_ns);
           log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
                    "with the pool still full (inflight=%u queued=%u) — 504",
                    pfe->fd,
@@ -1680,6 +1753,27 @@ check_draining_endpoints(void)
       HASH_ITER(hh, k_node->val.ephash, k_ep, k_tmp) {
         if (k_ep->ai_gw_mode && fc_queued(&k_ep->fc) > 0)
           fc_queue_wake_one(&k_ep->fc);
+      }
+    }
+  }
+
+  /* Evicted waiters (fc_shed_queue) whose owner never claimed the answer:
+   * the wake that carried it was lost (the resume ring was full, or the
+   * owner was gone). One pass after the eviction, the 429 goes out through
+   * pd_reap_respond like the deadline's 504, so an evicted client is
+   * always answered. A pool with nobody owed costs one atomic read. */
+  {
+    proxy_map_ent_t *e_node;
+    proxy_epval_t *e_ep, *e_tmp;
+    struct timespec e_ts;
+    uint64_t e_now_ns;
+
+    clock_gettime(CLOCK_MONOTONIC, &e_ts);
+    e_now_ns = (uint64_t)e_ts.tv_sec * 1000000000ULL + (uint64_t)e_ts.tv_nsec;
+    for (e_node = proxy_struct->head; e_node; e_node = e_node->next) {
+      HASH_ITER(hh, e_node->val.ephash, e_ep, e_tmp) {
+        if (fc_queue_evicted(&e_ep->fc) > 0 && e_now_ns > 1000000000ULL)
+          sp_fc_evicted_sweep(e_ep, e_now_ns - 1000000000ULL);
       }
     }
   }

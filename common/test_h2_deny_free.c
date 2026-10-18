@@ -22,7 +22,10 @@
  *     refusal and releases the stream's permit: it used to do both AFTER
  *     the answer, a write into the freed stream);
  *   - a CHWBL pool refusing the request's cache_salt: 400 (it used to send
- *     nothing and leave the stream open).
+ *     nothing and leave the stream open);
+ *   - a sheddable request at the ceiling: 429 admission_shed with every
+ *     admission header, the class and its band wait included (the frame
+ *     builder used to keep three of the five and drop the rest unsaid).
  * And the walk over the ready streams (proxy_h2_handle_client_data): a
  * forward's send can end and free ANOTHER stream whose answer was waiting
  * for the client's window; the walk must not hold that stream.
@@ -47,7 +50,8 @@
 #include "sockproxy_l7policy.h"
 
 /* What the cases set for the product's seams (the fixture's hooks). */
-enum { CASE_NO_POOL, CASE_ADMIT_DENY, CASE_L7_REJECT, CASE_CAPACITY, CASE_BAD_SALT };
+enum { CASE_NO_POOL, CASE_ADMIT_DENY, CASE_L7_REJECT, CASE_CAPACITY, CASE_BAD_SALT,
+       CASE_SHED_CLASS };
 static int the_case;
 static proxy_epval_t *lpm_pool;   /* what the lookup finds, CASE_CAPACITY */
 
@@ -60,9 +64,11 @@ admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
     res->http_status = 401;
     snprintf(res->error_code, sizeof(res->error_code), "invalid_api_key");
     snprintf(res->error_msg, sizeof(res->error_msg), "the key is not known");
-  } else if (the_case == CASE_CAPACITY) {
+  } else if (the_case == CASE_CAPACITY || the_case == CASE_SHED_CLASS) {
     res->verdict = AI_GW_ADMIT_ALLOW;
     snprintf(res->tenant_id, sizeof(res->tenant_id), "t1");
+    if (the_case == CASE_SHED_CLASS)
+      res->priority_class = AI_GW_CLASS_SHEDDABLE;
   } else {
     res->verdict = AI_GW_ADMIT_UNMETERED;
   }
@@ -95,7 +101,8 @@ static void
 set_case(int which)
 {
   the_case = which;
-  h2fx_lpm = which == CASE_CAPACITY || which == CASE_BAD_SALT ? lpm_pool : NULL;
+  h2fx_lpm = which == CASE_CAPACITY || which == CASE_BAD_SALT || which == CASE_SHED_CLASS ?
+             lpm_pool : NULL;
 }
 
 static ssize_t
@@ -109,6 +116,8 @@ small_body(nghttp2_session *s, int32_t id, uint8_t *buf, size_t len,
   return 2;
 }
 
+static int32_t last_id;
+
 static void
 run(int which, int want_status, const char *what)
 {
@@ -118,6 +127,7 @@ run(int which, int want_status, const char *what)
 
   set_case(which);
   id = h2fx_submit("m-gone", NULL, 0);
+  last_id = id;
   h2fx_to_gateway();
   st = h2fx_stream(id);
   CHECK(st && st->headers_complete && st->data_complete && !st->response_sent,
@@ -226,6 +236,32 @@ main(void)
     CHECK(fc_inflight(&lpm_pool->fc) == 1,
           "only the other request's unit is in flight (inflight %u)",
           fc_inflight(&lpm_pool->fc));
+
+    /* With classes on, a sheddable request at the same ceiling: every
+     * admission header reaches the client, the class and its band wait
+     * after the three counts. */
+    {
+      char want_wait[16];
+      const char *v;
+
+      h2fx_class_on = 1;
+      snprintf(want_wait, sizeof(want_wait), "%u",
+               fc_band_wait_ms(&lpm_pool->fc, FC_BAND_SHEDDABLE));
+      run(CASE_SHED_CLASS, 429, "sheddable at the ceiling");
+      h2fx_class_on = 0;
+      v = h2fx_header(last_id, "x-loxilb-admission-inflight");
+      CHECK(v && !strcmp(v, "1"), "the refusal names the units in flight (got %s)", v ? v : "none");
+      v = h2fx_header(last_id, "x-loxilb-admission-limit");
+      CHECK(v && !strcmp(v, "1"), "and the ceiling (got %s)", v ? v : "none");
+      v = h2fx_header(last_id, "x-loxilb-admission-queued");
+      CHECK(v != NULL, "and the queue (got %s)", v ? v : "none");
+      v = h2fx_header(last_id, "x-loxilb-admission-class");
+      CHECK(v && !strcmp(v, "sheddable"), "and the request's class (got %s)", v ? v : "none");
+      v = h2fx_header(last_id, "x-loxilb-admission-band-wait-ms");
+      CHECK(v && !strcmp(v, want_wait), "and its band's wait, %s ms (got %s)", want_wait,
+            v ? v : "none");
+      CHECK(fc_inflight(&lpm_pool->fc) == 1, "the refused stream took no unit");
+    }
     fc_permit_release(&other);
     CHECK(fc_inflight(&lpm_pool->fc) == 0, "and none after it ends");
     fc_permit_unbind(&other);

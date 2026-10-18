@@ -420,8 +420,11 @@ test_fc_priority: test_fc_priority.c sockproxy_fc.c sockproxy_fc.h
 test_fc_band_cfg: test_fc_band_cfg.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_band_cfg.c sockproxy_fc.c -I. -lpthread
 
+test_fc_band_shed: test_fc_band_shed.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_shed.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
@@ -431,6 +434,7 @@ test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose 
 	./test_fc_visit
 	./test_fc_priority
 	./test_fc_band_cfg
+	./test_fc_band_shed
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.
@@ -646,7 +650,7 @@ test_h2leg: test_h2_leg_end
 # gateway object itself is built with ASan here: a read after the free inside
 # sockproxy_h2.c is what this test must see.
 sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
-	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) -DSP_DEBUG_ASSERTS \
 		-ffunction-sections -fdata-sections -c -o $@ $<
 
 # The shared HTTP/2 fixture (test_h2_fixture.h): the gateway object with ASan,

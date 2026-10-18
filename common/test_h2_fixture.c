@@ -29,6 +29,22 @@ proxy_map_ent_t h2fx_ent;
 proxy_fd_ent_t *h2fx_pfe;
 nghttp2_session *h2fx_cl;
 int h2fx_status[H2FX_MAX_STREAMS];
+#define H2FX_MAX_HDRS 16
+static struct { char name[48]; char value[48]; } h2fx_hdrs[H2FX_MAX_STREAMS][H2FX_MAX_HDRS];
+static int h2fx_nhdrs[H2FX_MAX_STREAMS];
+
+const char *
+h2fx_header(int32_t id, const char *name)
+{
+  int i = id / 2;
+
+  if (i < 0 || i >= H2FX_MAX_STREAMS)
+    return NULL;
+  for (int k = 0; k < h2fx_nhdrs[i]; k++)
+    if (!strcmp(h2fx_hdrs[i][k].name, name))
+      return h2fx_hdrs[i][k].value;
+  return NULL;
+}
 
 proxy_epval_t *h2fx_lpm;
 int h2fx_lpm_calls;
@@ -89,6 +105,17 @@ cl_on_header(nghttp2_session *s, const nghttp2_frame *f, const uint8_t *name,
     char v[8] = { 0 };
     memcpy(v, value, valuelen < 7 ? valuelen : 7);
     h2fx_status[f->hd.stream_id / 2] = atoi(v);
+  } else if (f->hd.type == NGHTTP2_HEADERS && namelen && name[0] != ':' &&
+             f->hd.stream_id / 2 < H2FX_MAX_STREAMS) {
+    int i = f->hd.stream_id / 2, k = h2fx_nhdrs[i];
+
+    if (k < H2FX_MAX_HDRS && namelen < 48 && valuelen < 48) {
+      memcpy(h2fx_hdrs[i][k].name, name, namelen);
+      h2fx_hdrs[i][k].name[namelen] = 0;
+      memcpy(h2fx_hdrs[i][k].value, value, valuelen);
+      h2fx_hdrs[i][k].value[valuelen] = 0;
+      h2fx_nhdrs[i] = k + 1;
+    }
   }
   return 0;
 }
