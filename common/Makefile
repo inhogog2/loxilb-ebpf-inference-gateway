@@ -433,7 +433,7 @@ test_fc_band_wrr: test_fc_band_wrr.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_band_wrr.c sockproxy_fc.c -I. -lpthread
 
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr
+test_fc: test_fc_resume_handoff test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
@@ -1188,3 +1188,8 @@ test_cb_tsan:
 
 test_cb_mutation:
 	CC="$(CC)" python3 test_sockproxy_cb_concurrent.py --mutation-check
+
+# Production owner-worker / eviction-sweep handoff, deterministic lock orders.
+.PHONY: test_fc_resume_handoff
+test_fc_resume_handoff:
+	CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" python3 test_fc_resume_handoff.py

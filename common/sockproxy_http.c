@@ -12962,10 +12962,19 @@ pd_resume_parked(int fd)
     return;
   }
 
+  /* Serialize the queue-to-owner handoff with the health thread's sweep
+   * and pool drain (both hold PROXY_LOCK). The queue lock alone is not
+   * enough: a sweep removes the eviction before it publishes reap_resp.
+   * Keep the read lock through the decision and the transition out of
+   * PARKED, but never through answering, teardown or backend dispatch,
+   * which can themselves need the write lock. Lock order: proxy, queue. */
+  PROXY_RDLOCK();
+
   /* A response the reaper thread owes this client (pd_reap_respond): it is
    * written here, on the socket's owner, and the connection ends. Before the
    * park gate, because the reaper ends parked clients too. */
   if (pfe->reap_resp) {
+    PROXY_UNLOCK();
     sp_reap_finish(pfe);
     return;
   }
@@ -12976,11 +12985,13 @@ pd_resume_parked(int fd)
    * refilled bucket. Handled before the P/D-park gate below (a QoS-parked
    * fd is not in PD_PHASE_PARKED). */
   if (qos_resume_reader(fd, pfe)) {
+    PROXY_UNLOCK();
     return;
   }
 
   if (pfe->pd_phase != PD_PHASE_PARKED) {
     /* Already resumed/reaped/torn down by another edge — idempotent no-op. */
+    PROXY_UNLOCK();
     return;
   }
 
@@ -12998,6 +13009,7 @@ pd_resume_parked(int fd)
     pfe->fc.state = FC_P_NONE;
     pfe->fc.woken = 0;
     pfe->fc.q_parked = 0;          /* observed where it was evicted */
+    PROXY_UNLOCK();
     if (sp_h1_refusal_keeps_connection(pfe)) {
       if (sp_fc_shed_answer_kept(pfe) == 0) {
         pfe->park_ep_idx   = -1;
@@ -13024,12 +13036,9 @@ pd_resume_parked(int fd)
    * is (reads paused, hang-up armed) until its turn, its deadline or its
    * client's departure. */
   if (pfe->fc.state == FC_P_QUEUED && fc_queue_holds(pfe->fc.fc, &pfe->fc)) {
+    PROXY_UNLOCK();
     return;
   }
-
-  /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
-  pfe->read_paused = 0;
-  sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
   /* A request parked by the capacity gate: its turn came (a unit was
    * released and its entry popped). The wait is recorded and the permit
@@ -13050,6 +13059,11 @@ pd_resume_parked(int fd)
   pfe->park_ep_idx   = -1;
   pfe->park_start_ts = 0;
   pfe->pd_phase      = PD_PHASE_NONE;
+  PROXY_UNLOCK();
+
+  /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
+  pfe->read_paused = 0;
+  sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
   /* Reconstruct the dispatch from the pfe alone (see Resumability note). */
   struct llb_sockmap_key key = { 0 };
