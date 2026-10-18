@@ -218,7 +218,8 @@ typedef struct fc_cfg {
   /* Priority bands. Every triple is indexed by band (FC_BAND_*). */
   uint8_t  wake_policy;          /* enum fc_wake_policy */
   uint8_t  band_weight[FC_BANDS];        /* weighted wake: 1..62 each, 0 = not set */
-  uint8_t  band_min_share_pct[FC_BANDS]; /* hard floor, % of the ceiling in force; the critical reserve is folded in */
+  uint8_t  band_min_share_pct[FC_BANDS]; /* floor, % of the ceiling in force: a guarantee under contention, binding only while the band has a waiter */
+  uint8_t  critical_reserve_pct; /* % of the ceiling in force that no other band may take, even while critical is idle */
   uint32_t band_wait_ms[FC_BANDS];       /* a band's wait window; 0 = max_queue_wait_ms */
   uint8_t  band_queue_pct[FC_BANDS];     /* most of max_queue_depth a band may hold; 0 = the shared depth */
   uint8_t  shed_queue;           /* 1: a sheddable request at the ceiling waits in its band instead of 429 */
@@ -295,7 +296,7 @@ typedef struct fc_rule_cfg {
   uint8_t  wake_policy;          /* enum fc_rule_wake */
   uint8_t  band_weight[FC_BANDS];
   uint8_t  band_min_share_pct[FC_BANDS];
-  uint8_t  critical_reserve_pct; /* the critical floor under its own name; folded into band_min_share_pct */
+  uint8_t  critical_reserve_pct; /* the reservation: units no other band may take; not a floor */
   uint32_t band_wait_ms[FC_BANDS];
   uint8_t  band_queue_pct[FC_BANDS];
   uint8_t  shed_queue;           /* enum fc_rule_switch */
@@ -757,6 +758,41 @@ const char *fc_band_outcome_name(int outcome);
  * sheddable request only with fc_shed_queue on. Enforce mode only; anything
  * else may. */
 int fc_band_may_wait(const fc_state_t *fc, const fc_permit_t *p);
+
+/* ---- floors and the reserve ------------------------------------------------
+ * A floor (fc_band_min_share_pct) is a guarantee under contention, not a
+ * reservation: it binds only while its band has a waiter, so with no demand
+ * in a band the other bands take every unit. The reserve
+ * (fc_critical_reserve_pct) is the one true reservation: units no other band
+ * may take even while critical is idle. Both are a share of the ceiling in
+ * force, in units fc_floor_units.
+ *
+ * The rule the code implements: when a unit frees, the highest-ranked band
+ * that is below its floor and has a runnable waiter takes it; when no band
+ * is below its floor, the wake policy chooses. A request of a band at or
+ * above its own floor takes a unit only if the units left after it still
+ * cover what every other band with a waiter is short of its floor, and what
+ * critical is short of its reserve. */
+
+/* Whether the pool runs a floor or the reserve. */
+static inline int
+fc_floors_on(const fc_cfg_t *c)
+{
+  return (c->band_min_share_pct[0] | c->band_min_share_pct[1] |
+          c->band_min_share_pct[2] | c->critical_reserve_pct) != 0;
+}
+
+/* A share of a ceiling in whole units, rounded in the band's favour (up) but
+ * never to the whole ceiling for a share under 100: 0 without a ceiling or
+ * a share. */
+uint32_t fc_floor_units(uint32_t cap, uint8_t pct);
+
+/* The floors and the reserve of a configuration against a ceiling, in units
+ * as the gate enforces them: the three together never exceed the ceiling
+ * (rounding is clamped in rank order, critical first), and critical holds
+ * the larger of its floor and its reserve. floor[] is indexed by band. */
+void fc_floor_claims(const fc_cfg_t *c, uint32_t cap, uint32_t floor[FC_BANDS],
+                     uint32_t *reserve);
 
 /* The band's say over a capacity verdict: a sheddable request that would
  * wait (FC_QUEUE) or that met a ceiling (FC_SHED) and may not wait is shed,

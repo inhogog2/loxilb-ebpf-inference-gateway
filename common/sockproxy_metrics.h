@@ -383,7 +383,7 @@ typedef struct proxy_fc_svc_stat {
     uint8_t  tenant_wake;                  /* enum fc_tenant_wake: 0 fifo, 1 rr */
     uint8_t  llmd_headers;                 /* 1: llm-d headers on */
     uint8_t  band_weight[PROXY_FC_BANDS];        /* weighted wake weights, 0 = not set */
-    uint8_t  band_min_share_pct[PROXY_FC_BANDS]; /* hard floors, the critical reserve folded in */
+    uint8_t  band_min_share_pct[PROXY_FC_BANDS]; /* floors, binding while the band has a waiter */
     uint8_t  band_queue_pct[PROXY_FC_BANDS];     /* a band's share of the queue depth, 0 = shared */
     uint8_t  bands;                        /* 1 when a band knob differs from its default */
     uint8_t  src_band[PROXY_FC_BAND_LIMITS];     /* enum fc_src per band knob, in enum fc_limit order */
@@ -391,7 +391,8 @@ typedef struct proxy_fc_svc_stat {
     uint8_t  wake_policy_cfg;              /* the switches as configured (rule, else environment); the ones above run */
     uint8_t  shed_queue_cfg;
     uint8_t  tenant_wake_cfg;
-    uint8_t  band_pad[5];
+    uint8_t  critical_reserve_pct;          /* units no other band may take, % of the ceiling in force */
+    uint8_t  band_pad[4];
     /* Per band and outcome (enum fc_band_outcome), standard derived:
      * same lockstep, offset pinned below. */
     uint64_t band_outcome[PROXY_FC_BANDS][PROXY_FC_BAND_OUTCOMES];

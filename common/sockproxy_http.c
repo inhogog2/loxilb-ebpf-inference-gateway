@@ -5079,6 +5079,7 @@ sp_fc_fill_queue_stat(fc_state_t *fc, proxy_fc_svc_stat_t *st)
     st->band_min_share_pct[b] = fc->cfg.band_min_share_pct[b];
     st->band_queue_pct[b] = fc->cfg.band_queue_pct[b];
   }
+  st->critical_reserve_pct = fc->cfg.critical_reserve_pct;
   st->wake_policy = fc->cfg.wake_policy;
   st->shed_queue = fc->cfg.shed_queue;
   st->tenant_wake = fc->cfg.tenant_wake;
@@ -9805,12 +9806,12 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
       t[b] = c->band_queue_pct[b];
     fc_band_triple_fmt(queue_share, sizeof(queue_share), t);
     log_info("[AIGateway] %s:%u (%s) admission bands: wake=%s weights=%s "
-             "min_share=%s%% wait=%sms queue_share=%s%% "
+             "min_share=%s%% reserve=%u%% wait=%sms queue_share=%s%% "
              "shed_queue=%s tenant_wake=%s llmd_headers=%s",
              inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
              tepval->ephash_key,
              c->wake_policy == FC_WAKE_WEIGHTED ? "weighted" : "strict",
-             weights, min_share, wait, queue_share,
+             weights, min_share, c->critical_reserve_pct, wait, queue_share,
              c->shed_queue ? "on" : "off",
              c->tenant_wake == FC_TENANT_WAKE_RR ? "rr" : "fifo",
              c->llmd_headers ? "on" : "off");

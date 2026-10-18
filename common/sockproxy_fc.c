@@ -200,7 +200,7 @@ fc_cfg_bands(const fc_cfg_t *c)
     if (c->band_weight[b] || c->band_min_share_pct[b] || c->band_wait_ms[b] ||
         c->band_queue_pct[b])
       return 1;
-  return 0;
+  return c->critical_reserve_pct != 0;
 }
 
 /* The configured switches equal the effective ones until fc_cfg_band_guard
@@ -350,14 +350,12 @@ fc_cfg_resolve_bands(fc_cfg_t *out, const fc_rule_cfg_t *rule)
                     rule->band_weight, FC_BAND_WEIGHT_MAX);
   fc_band_triple_u8(out->band_min_share_pct, &out->src[FC_L_BAND_MIN_SHARE],
                     rule->band_min_share_pct, 100);
-  /* The reserve is the critical floor under another name: one mechanism.
-   * The control plane refuses both set; here the reserve wins. */
-  out->src[FC_L_CRITICAL_RESERVE] = FC_SRC_DEFAULT;
-  if (rule->critical_reserve_pct) {
-    out->band_min_share_pct[FC_BAND_CRITICAL] =
-      rule->critical_reserve_pct > 100 ? 100 : rule->critical_reserve_pct;
-    out->src[FC_L_CRITICAL_RESERVE] = FC_SRC_RULE;
-  }
+  /* The reserve is not a floor: it holds units back from the other bands
+   * whether or not critical has a waiter. It is kept beside the floors. */
+  out->critical_reserve_pct = rule->critical_reserve_pct > 100
+                              ? 100 : rule->critical_reserve_pct;
+  out->src[FC_L_CRITICAL_RESERVE] = out->critical_reserve_pct ? FC_SRC_RULE
+                                                              : FC_SRC_DEFAULT;
   for (int b = 0; b < FC_BANDS; b++) {
     out->band_wait_ms[b] = rule->band_wait_ms[b] > FC_QUEUE_WAIT_MS_MAX
                            ? FC_QUEUE_WAIT_MS_MAX : rule->band_wait_ms[b];
@@ -459,6 +457,7 @@ fc_cfg_band_guard(fc_cfg_t *c, int gate_bypassed)
     c->tenant_wake = FC_TENANT_WAKE_FIFO;
     memset(c->band_weight, 0, sizeof(c->band_weight));
     memset(c->band_min_share_pct, 0, sizeof(c->band_min_share_pct));
+    c->critical_reserve_pct = 0;
     memset(c->band_wait_ms, 0, sizeof(c->band_wait_ms));
     memset(c->band_queue_pct, 0, sizeof(c->band_queue_pct));
     c->band_fallback = FC_BAND_FB_SOCKMAP;
@@ -518,6 +517,7 @@ fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b)
       a->wake_policy != b->wake_policy || a->shed_queue != b->shed_queue ||
       a->tenant_wake != b->tenant_wake || a->llmd_headers != b->llmd_headers ||
       a->bands != b->bands || a->wake_policy_cfg != b->wake_policy_cfg ||
+      a->critical_reserve_pct != b->critical_reserve_pct ||
       a->shed_queue_cfg != b->shed_queue_cfg ||
       a->tenant_wake_cfg != b->tenant_wake_cfg ||
       a->band_fallback != b->band_fallback)
@@ -1418,6 +1418,180 @@ fc_wake_strict(const fc_state_t *fc)
   return fc->cfg.wake_policy == FC_WAKE_STRICT;
 }
 
+/* ---- floors and the reserve ----------------------------------------------- */
+
+uint32_t
+fc_floor_units(uint32_t cap, uint8_t pct)
+{
+  uint64_t u;
+
+  if (cap == 0 || pct == 0)
+    return 0;
+  if (pct >= 100)
+    return cap;
+  u = ((uint64_t)cap * pct + 99) / 100;
+  return u >= cap ? cap - 1 : (uint32_t)u;
+}
+
+void
+fc_floor_claims(const fc_cfg_t *c, uint32_t cap, uint32_t floor[FC_BANDS],
+                uint32_t *reserve)
+{
+  uint32_t left = cap, res = fc_floor_units(cap, c->critical_reserve_pct);
+  uint32_t crit = fc_floor_units(cap, c->band_min_share_pct[FC_BAND_CRITICAL]);
+  uint32_t claim = res > crit ? res : crit;
+
+  /* Critical first: it holds the larger of its floor and its reserve (each
+   * at most the ceiling, so the claim always fits). */
+  floor[FC_BAND_CRITICAL] = crit;
+  if (reserve)
+    *reserve = res;
+  left -= claim;
+  for (int r = 1; r < FC_BANDS; r++) {
+    uint8_t b = fc_band_at_rank(r);
+    uint32_t u = fc_floor_units(cap, c->band_min_share_pct[b]);
+
+    floor[b] = u < left ? u : left;
+    left -= floor[b];
+  }
+}
+
+/* The bands as a floor decision sees them: what each holds, what it is owed
+ * and whether it has a waiter that could take a unit. */
+typedef struct fc_floor_view {
+  uint32_t cap;
+  uint32_t total;                /* units held, and the ones already promised by a wake */
+  uint32_t reserve;              /* units critical is owed whatever it has waiting */
+  uint32_t floor[FC_BANDS];      /* units a band is owed while it has a waiter */
+  uint32_t claim[FC_BANDS];      /* what a band takes freely: critical's larger of floor and reserve */
+  uint32_t in[FC_BANDS];
+  uint8_t  wait[FC_BANDS];
+} fc_floor_view_t;
+
+/* `pend`: units promised to waiters already woken and not yet taken (a wake
+ * loop's own; NULL for none). `wait`: which bands have a waiter that could
+ * run, when the caller knows (queue lock held); NULL reads the mirrors. */
+static void
+fc_floor_view_load(const fc_state_t *fc, fc_floor_view_t *v, uint32_t cap,
+                   const uint32_t *pend, const uint8_t *wait)
+{
+  uint32_t pt = 0, crit, shed, total;
+
+  if (pend)
+    pt = pend[0] + pend[1] + pend[2];
+  total = atomic_load_explicit(&fc->inflight, memory_order_relaxed);
+  crit = atomic_load_explicit(&fc->band_inflight[FC_BAND_CRITICAL], memory_order_relaxed);
+  shed = atomic_load_explicit(&fc->band_inflight[FC_BAND_SHEDDABLE], memory_order_relaxed);
+  if (pend) {
+    crit += pend[FC_BAND_CRITICAL];
+    shed += pend[FC_BAND_SHEDDABLE];
+  }
+  total += pt;
+  v->cap = cap;
+  v->total = total;
+  for (int b = 0; b < FC_BANDS; b++) {
+    v->in[b] = fc_band_derive(total, crit, shed, (uint8_t)b);
+    v->wait[b] = wait ? wait[b] : fc_band_queued(fc, (uint8_t)b) > 0;
+  }
+  fc_floor_claims(&fc->cfg, cap, v->floor, &v->reserve);
+  for (int b = 0; b < FC_BANDS; b++)
+    v->claim[b] = v->floor[b];
+  if (v->reserve > v->claim[FC_BAND_CRITICAL])
+    v->claim[FC_BAND_CRITICAL] = v->reserve;
+}
+
+/* Units the other bands hold back from a request of `band`. A band below
+ * what it takes freely (its floor; critical's reserve) takes its own units
+ * and yields only the reserve; a band at or above it yields, besides, the
+ * floor every other band with a waiter is short of. */
+static uint32_t
+fc_floor_held_back(const fc_floor_view_t *v, uint8_t band)
+{
+  int below = v->in[band] < v->claim[band];
+  uint32_t held = 0;
+
+  for (int y = 0; y < FC_BANDS; y++) {
+    uint32_t rd = 0, fd = 0;
+
+    if (y == band)
+      continue;
+    if (y == FC_BAND_CRITICAL && v->reserve > v->in[y])
+      rd = v->reserve - v->in[y];
+    if (!below && v->wait[y] && v->floor[y] > v->in[y])
+      fd = v->floor[y] - v->in[y];
+    held += rd > fd ? rd : fd;
+  }
+  return held;
+}
+
+static int
+fc_floor_may_take(const fc_floor_view_t *v, uint8_t band)
+{
+  uint32_t held = fc_floor_held_back(v, band);
+
+  return held < v->cap && v->total < v->cap - held;
+}
+
+/* The ceiling a request of `band` may fill: 0 is "no unit" (a ceiling of 0
+ * elsewhere is unlimited, so the caller checks). Only an enforcing pool with
+ * a ceiling and a floor or a reserve holds anything back. */
+static int
+fc_floors_apply(const fc_state_t *fc, uint32_t cap)
+{
+  return cap != 0 && fc->cfg.mode == FC_MODE_ENFORCE && fc_floors_on(&fc->cfg);
+}
+
+/* Reserve one service unit for a request of `band` under the ceiling,
+ * holding back what the floors and the reserve owe the other bands. The
+ * floors are read from the band counters and queue mirrors, not one
+ * snapshot: a race with another admission can cross a floor by the units
+ * in flight in that race and no more. `wait` as in fc_floor_view_load. */
+static int
+fc_unit_take_band(fc_state_t *fc, uint8_t band, uint32_t cap, const uint8_t *wait)
+{
+  fc_floor_view_t v;
+  uint32_t held;
+
+  if (!fc_floors_apply(fc, cap))
+    return fc_unit_take(&fc->inflight, cap);
+  fc_floor_view_load(fc, &v, cap, NULL, wait);
+  held = fc_floor_held_back(&v, band);
+  if (held >= cap)
+    return -1;
+  return fc_unit_take(&fc->inflight, cap - held);
+}
+
+/* Whether a request of `band` is below what its band takes freely: it then
+ * does not wait behind the other bands' waiters. */
+static int
+fc_band_below_claim(const fc_state_t *fc, uint8_t band)
+{
+  fc_floor_view_t v;
+  uint32_t cap = fc_svc_cap(fc);
+
+  if (!fc_floors_apply(fc, cap))
+    return 0;
+  fc_floor_view_load(fc, &v, cap, NULL, NULL);
+  return v.in[band] < v.claim[band];
+}
+
+/* Lock held. Which bands hold a waiter whose tenant could take a unit now. */
+static void
+fc_floor_waiting_runnable(const fc_state_t *fc, uint32_t bound, uint8_t wait[FC_BANDS])
+{
+  const fc_queue_t *q = &fc->queue;
+  uint32_t i = q->head;
+
+  memset(wait, 0, FC_BANDS);
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+
+    if (e->live && fc_tenant_can_run(fc, e->tslot, bound))
+      wait[fc_band_of(e->band)] = 1;
+    i = fc_ring_wrap(q, i + 1);
+  }
+}
+
 /* Whether a newcomer of `band` waits behind the queue, read from the
  * lock-free mirrors: under strict, behind a waiter of its own band or a
  * higher one; otherwise behind anybody. With every waiter standard both
@@ -1429,6 +1603,10 @@ fc_waiters_ahead(const fc_state_t *fc, uint8_t band)
 
   if (fc_queued(fc) == 0)
     return 0;
+  /* Below its floor a band is served before the wake policy's choice: it
+   * waits only behind its own band. */
+  if (fc_band_below_claim(fc, band))
+    return fc_band_queued(fc, band) > 0;
   if (!fc_wake_strict(fc) || rank == FC_BANDS - 1)
     return 1;
   for (int r = 0; r <= rank; r++)
@@ -1461,6 +1639,16 @@ fc_band_waiter_can_run(fc_state_t *fc, uint8_t band, uint32_t bound)
 
   if (!fc_tenant_waiter_can_run(fc, bound))
     return 0;
+  if (fc_band_below_claim(fc, band)) {
+    i = q->head;
+    for (uint32_t k = 0; k < q->used; k++) {
+      const fc_queue_ent_t *e = &q->ring[i];
+      if (e->live && e->band == band && fc_tenant_can_run(fc, e->tslot, bound))
+        return 1;
+      i = fc_ring_wrap(q, i + 1);
+    }
+    return 0;
+  }
   if (!fc_wake_strict(fc) || rank == FC_BANDS - 1)
     return 1;
   for (int r = 0; r < FC_BANDS; r++) {
@@ -1523,8 +1711,19 @@ fc_service_acquire_shared(fc_state_t *fc, fc_permit_t *p, int can_queue,
   if (enforce && fc_queue_enabled(fc) && !woken &&
       fc_band_waiter_can_run(fc, p->band, bound))
     over = 1;
-  if (!over && fc_unit_take(&fc->inflight, fc_svc_cap(fc)) != 0)
-    over = 1;
+  if (!over) {
+    uint32_t cap = fc_svc_cap(fc);
+    uint8_t wait[FC_BANDS];
+    const uint8_t *w = NULL;
+
+    /* Under the lock the waiters that count are the ones that could run. */
+    if (fc_floors_apply(fc, cap) && fc_queued(fc) > 0) {
+      fc_floor_waiting_runnable(fc, bound, wait);
+      w = wait;
+    }
+    if (fc_unit_take_band(fc, p->band, cap, w) != 0)
+      over = 1;
+  }
   if (over) {
     if (enforce) {
       v = fc_band_verdict(fc, p, can_queue && fc_queue_enabled(fc) ? FC_QUEUE
@@ -1590,7 +1789,7 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken,
   if (fc->cfg.mode == FC_MODE_ENFORCE && fc_queue_enabled(fc) && !woken &&
       fc_waiters_ahead(fc, p->band))
     over = 1;
-  if (!over && fc_unit_take(&fc->inflight, fc_svc_cap(fc)) != 0)
+  if (!over && fc_unit_take_band(fc, p->band, fc_svc_cap(fc), NULL) != 0)
     over = 1;
   if (over) {
     if (fc->cfg.mode == FC_MODE_ENFORCE) {
@@ -2266,6 +2465,25 @@ fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out)
   return rc;
 }
 
+static int fc_ring_pop_floor(fc_state_t *fc, fc_queue_ent_t *out,
+                             const uint32_t pend[FC_BANDS]);
+
+/* Lock held. Take the live entry at ring index `at` out of the queue. */
+static void
+fc_ring_take_at(fc_queue_t *q, uint32_t at, fc_queue_ent_t *out)
+{
+  fc_queue_ent_t *e = &q->ring[at];
+
+  *out = *e;
+  e->live = 0;
+  q->count--;
+  fc_ring_band_sub(q, e->band);
+  while (q->used > 0 && !q->ring[q->head].live) {
+    q->head = fc_ring_wrap(q, q->head + 1);
+    q->used--;
+  }
+}
+
 /* Lock held. Take out the oldest live entry whose tenant could take a unit
  * now; the ones passed over keep their place. Under strict with a waiter of
  * a band other than standard, the oldest such entry of the highest band
@@ -2274,7 +2492,7 @@ fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out)
  * delivered: an entry put back keeps its slot counted, so the slot is never
  * reused under it. */
 static int
-fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out)
+fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC_BANDS])
 {
   fc_queue_t *q = &fc->queue;
   uint32_t bound = fc_tenant_svc_bound(fc);
@@ -2284,6 +2502,8 @@ fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out)
   int best_rank = FC_BANDS;
   fc_queue_ent_t *e;
 
+  if (fc_floors_apply(fc, fc_svc_cap(fc)))
+    return fc_ring_pop_floor(fc, out, pend);
   for (uint32_t k = 0; k < q->used; k++) {
     e = &q->ring[i];
     if (e->live && fc_tenant_can_run(fc, e->tslot, bound)) {
@@ -2300,15 +2520,63 @@ fc_ring_pop_runnable(fc_state_t *fc, fc_queue_ent_t *out)
   }
   if (best == UINT32_MAX)
     return 0;
-  e = &q->ring[best];
-  *out = *e;
-  e->live = 0;
-  q->count--;
-  fc_ring_band_sub(q, e->band);
-  while (q->used > 0 && !q->ring[q->head].live) {
-    q->head = fc_ring_wrap(q, q->head + 1);
-    q->used--;
+  fc_ring_take_at(q, best, out);
+  return 1;
+}
+
+/* Lock held. The wake on a pool that runs a floor or the reserve. The
+ * entries that could take a unit now are the oldest runnable one of each
+ * band whose band may take one (fc_floor_may_take). The highest-ranked band
+ * below its floor that has such an entry takes the unit; when no band is
+ * below its floor, the wake policy chooses: strict takes the highest band,
+ * otherwise the oldest entry. `pend` counts the units this wake loop has
+ * already promised and is moved by the caller when the wake is delivered. */
+static int
+fc_ring_pop_floor(fc_state_t *fc, fc_queue_ent_t *out, const uint32_t pend[FC_BANDS])
+{
+  fc_queue_t *q = &fc->queue;
+  uint32_t bound = fc_tenant_svc_bound(fc);
+  uint32_t first[FC_BANDS], dist[FC_BANDS];
+  uint8_t wait[FC_BANDS] = {0};
+  fc_floor_view_t v;
+  int pick = -1;
+  uint32_t i = q->head;
+
+  for (int b = 0; b < FC_BANDS; b++)
+    first[b] = UINT32_MAX;
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+
+    if (e->live && first[fc_band_of(e->band)] == UINT32_MAX &&
+        fc_tenant_can_run(fc, e->tslot, bound)) {
+      first[fc_band_of(e->band)] = i;
+      dist[fc_band_of(e->band)] = k;
+      wait[fc_band_of(e->band)] = 1;
+    }
+    i = fc_ring_wrap(q, i + 1);
   }
+  fc_floor_view_load(fc, &v, fc_svc_cap(fc), pend, wait);
+  for (int r = 0; r < FC_BANDS && pick < 0; r++) {
+    uint8_t b = fc_band_at_rank(r);
+
+    if (wait[b] && v.in[b] < v.claim[b] && fc_floor_may_take(&v, b))
+      pick = b;
+  }
+  for (int r = 0; r < FC_BANDS && pick < 0 && fc_wake_strict(fc); r++) {
+    uint8_t b = fc_band_at_rank(r);
+
+    if (wait[b] && fc_floor_may_take(&v, b))
+      pick = b;
+  }
+  if (pick < 0 && !fc_wake_strict(fc)) {
+    for (int b = 0; b < FC_BANDS; b++)
+      if (wait[b] && fc_floor_may_take(&v, (uint8_t)b) &&
+          (pick < 0 || dist[b] < dist[pick]))
+        pick = b;
+  }
+  if (pick < 0)
+    return 0;
+  fc_ring_take_at(q, first[pick], out);
   return 1;
 }
 
@@ -2350,13 +2618,13 @@ fc_queue_wait_end(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
 /* Pop the head and wake its owner. 0 when nobody was popped or the wake
  * could not be delivered. */
 static int
-fc_queue_wake_head(fc_state_t *fc)
+fc_queue_wake_head(fc_state_t *fc, uint32_t pend[FC_BANDS])
 {
   fc_queue_ent_t e;
   int rc;
 
   pthread_mutex_lock(&fc->queue.lock);
-  rc = fc_ring_pop_runnable(fc, &e);
+  rc = fc_ring_pop_runnable(fc, &e, pend);
   fc_queue_publish(fc);
   pthread_mutex_unlock(&fc->queue.lock);
   if (!rc)
@@ -2375,23 +2643,27 @@ fc_queue_wake_head(fc_state_t *fc)
   pthread_mutex_lock(&fc->queue.lock);
   fc_tenant_dec(fc, e.tslot, 1);
   pthread_mutex_unlock(&fc->queue.lock);
+  pend[fc_band_of(e.band)]++;
   return 1;
 }
 
 void
 fc_queue_wake_one(fc_state_t *fc)
 {
+  uint32_t pend[FC_BANDS] = {0};
+
   if (!fc || !fc_wake_hook)
     return;
   if (fc_queued(fc) == 0 || !fc_has_room(fc))
     return;
-  (void)fc_queue_wake_head(fc);
+  (void)fc_queue_wake_head(fc, pend);
 }
 
 void
 fc_queue_wake_room(fc_state_t *fc)
 {
   uint32_t n, cap, inflight;
+  uint32_t pend[FC_BANDS] = {0};
 
   if (!fc || !fc_wake_hook)
     return;
@@ -2410,7 +2682,7 @@ fc_queue_wake_room(fc_state_t *fc)
       n = cap - inflight;
   }
   while (n-- > 0) {
-    if (!fc_queue_wake_head(fc))
+    if (!fc_queue_wake_head(fc, pend))
       break;
   }
 }

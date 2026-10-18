@@ -17,8 +17,8 @@
 /*
  * The band knobs of the capacity gate's configuration, driven alone: the
  * four switches from the environment and a rule's tri-states over them,
- * the rule-only numeric knobs (the critical reserve folded into the
- * critical floor), the values held at their bounds, the derived `bands`
+ * the rule-only numeric knobs (the critical reserve is its own field,
+ * not a floor), the values held at their bounds, the derived `bands`
  * flag, and fc_cfg_equal seeing a change of every field while a rule that
  * declares none of them resolves equal to a pool configured before they
  * existed; and fc_cfg_band_guard holding an inherited combination the
@@ -168,14 +168,19 @@ test_numeric_knobs_are_the_rules(void)
   assert(out.src[FC_L_BAND_QUEUE] == FC_SRC_RULE);
   assert(out.bands == 1);
 
-  /* The reserve is the critical floor. */
+  /* The reserve is its own field: it is not a floor, and a floor of
+   * critical beside it is kept apart from it. */
   memset(&r, 0, sizeof(r));
   r.critical_reserve_pct = 25;
   fc_cfg_resolve(&out, &env, &r);
-  assert(out.band_min_share_pct[C] == 25);
+  assert(out.critical_reserve_pct == 25);
+  assert(out.band_min_share_pct[C] == 0);
   assert(out.src[FC_L_CRITICAL_RESERVE] == FC_SRC_RULE);
   assert(out.src[FC_L_BAND_MIN_SHARE] == FC_SRC_DEFAULT);
   assert(out.bands == 1);
+  r.band_min_share_pct[C] = 10;
+  fc_cfg_resolve(&out, &env, &r);
+  assert(out.critical_reserve_pct == 25 && out.band_min_share_pct[C] == 10);
 
   /* Values past their bounds are held at them. */
   memset(&r, 0, sizeof(r));
@@ -186,7 +191,7 @@ test_numeric_knobs_are_the_rules(void)
   r.band_queue_pct[S] = 255;
   fc_cfg_resolve(&out, &env, &r);
   assert(out.band_weight[C] == FC_BAND_WEIGHT_MAX);
-  assert(out.band_min_share_pct[B] == 100 && out.band_min_share_pct[C] == 100);
+  assert(out.band_min_share_pct[B] == 100 && out.critical_reserve_pct == 100);
   assert(out.band_wait_ms[S] == FC_QUEUE_WAIT_MS_MAX);
   assert(out.band_queue_pct[S] == 100);
 }
@@ -231,6 +236,7 @@ test_equal_sees_every_band_field(void)
   CHANGED(cfg.shed_queue_cfg = 1);
   CHANGED(cfg.tenant_wake_cfg = FC_TENANT_WAKE_RR);
   CHANGED(cfg.band_fallback = FC_BAND_FB_SOCKMAP);
+  CHANGED(cfg.critical_reserve_pct = 1);
   for (int b = 0; b < FC_BANDS; b++) {
     CHANGED(cfg.band_weight[b] = 1);
     CHANGED(cfg.band_min_share_pct[b] = 1);
@@ -261,6 +267,7 @@ test_guard_holds_the_refused_combinations(void)
   r.band_min_share_pct[S] = 20;
   r.band_wait_ms[B] = 500;
   r.band_queue_pct[C] = 30;
+  r.critical_reserve_pct = 25;
   fc_cfg_resolve(&cfg, &env, &r);
   assert(cfg.wake_policy == FC_WAKE_WEIGHTED && cfg.band_fallback == FC_BAND_FB_NONE);
   assert(fc_cfg_band_guard(&cfg, 1) == FC_BAND_FB_SOCKMAP);
@@ -269,6 +276,7 @@ test_guard_holds_the_refused_combinations(void)
   for (int b = 0; b < FC_BANDS; b++)
     assert(!cfg.band_weight[b] && !cfg.band_min_share_pct[b] &&
            !cfg.band_wait_ms[b] && !cfg.band_queue_pct[b]);
+  assert(cfg.critical_reserve_pct == 0);
   assert(cfg.bands == 0 && cfg.llmd_headers == 1);
   assert(!strcmp(fc_band_fallback_name(cfg.band_fallback), "sockmap_request"));
 

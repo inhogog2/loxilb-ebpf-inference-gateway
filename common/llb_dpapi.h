@@ -1192,7 +1192,7 @@ struct dp_proxy_tacts {
   // The numeric band knobs are the rule's own (0 = none). Every triple is
   // indexed by band: 0 standard, 1 critical, 2 sheddable (FC_BAND_*).
   uint8_t  fc_band_weight[3];         // weighted wake, 1..62 each
-  uint8_t  fc_band_min_share_pct[3];  // hard floor, % of the ceiling in force
+  uint8_t  fc_band_min_share_pct[3];  // floor, % of the ceiling in force (binds while the band has a waiter)
   uint8_t  fc_critical_reserve_pct;   // the critical floor under its own name
   uint8_t  fc_band_queue_pct[3];      // % of the queue depth a band may hold
   uint8_t  fc_band_pad[2];
