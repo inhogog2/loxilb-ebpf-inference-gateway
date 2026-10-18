@@ -92,13 +92,20 @@ dec(const fc_state_t *fc, enum fc_reason r)
 }
 
 /* The sweep's callback, deciding as sp_fc_drain_cb does: it answers only
- * when its swap to FC_P_EVICTED is the one that leaves QUEUED. `hook` runs
- * an owner's resume inside the window, before or after the swap. */
+ * when it takes the entry and swaps the permit to FC_P_EVICTED in one step
+ * (fc_queue_evicted_settle). `victim` is the permit the connection (fd, gen)
+ * holds NOW, as the proxy's lookup finds it. `hook` runs inside the window:
+ * 1 the owner's resume before the swap, 2 after it; 3 the owner answers its
+ * eviction, `leaver` leaves the queue and the connection's next request
+ * parks under the same (fd, gen); 4 as 3, then `extra` evicts that next
+ * request too, and the callback skips (its lookup failed). */
 struct sweep_ctx {
   fc_state_t *fc;
   fc_permit_t *victim;           /* the permit behind the evicted entry */
+  fc_permit_t *leaver;           /* hooks 3, 4: a waiter whose client leaves */
+  fc_permit_t *extra;            /* hook 4: a critical arrival */
   int answered;                  /* the 429 this path wrote */
-  int hook;                      /* 0 none, 1 owner before the swap, 2 after */
+  int hook;
   int owner_rc;                  /* what that owner's resume returned */
 };
 
@@ -110,7 +117,17 @@ sweep_fn(void *ctx, const fc_queue_ent_t *e)
   assert(e->band == B);
   if (s->hook == 1)
     s->owner_rc = fc_queue_owner_resume(s->fc, s->victim, MS(2000));
-  if (!fc_permit_settle(s->victim, FC_P_EVICTED))
+  if (s->hook >= 3) {
+    s->owner_rc = fc_queue_owner_resume(s->fc, s->victim, MS(2000));
+    fc_permit_release(s->leaver);
+    park(s->fc, s->victim, B, e->fd, MS(2500));
+    assert(s->victim->q_gen == e->gen);
+  }
+  if (s->hook == 4) {
+    park(s->fc, s->extra, C, 12, MS(2600));
+    return 0;
+  }
+  if (!fc_queue_evicted_settle(s->fc, s->victim, e->fd, e->gen))
     return 0;
   if (s->hook == 2)
     s->owner_rc = fc_queue_owner_resume(s->fc, s->victim, MS(2000));
@@ -210,8 +227,8 @@ test_each_inside_the_others_window(void)
     assert(fc_queue_evicted(&fc) == 0 && dec(&fc, FC_R_SHED) == 1);
     evicted_teardown(&fc, &run, &b, &c);
   }
-  /* The pass swaps first; the owner's resume comes while the entry is still
-   * on the list: it claims the entry, loses the swap and does nothing. */
+  /* The pass takes the entry and swaps first; the owner's resume then finds
+   * the permit decided and does nothing. */
   {
     struct sweep_ctx s = { .fc = &fc, .victim = &b, .hook = 2 };
 
@@ -222,6 +239,51 @@ test_each_inside_the_others_window(void)
     evicted_teardown(&fc, &run, &b, &c);
   }
   printf("  ok inside each other's window: one answer either way\n");
+}
+
+/* (fd, gen) names a connection, not a wait. The owner answers its eviction
+ * (429, the connection kept) while the pass has the entry in hand, and the
+ * connection's next request parks under the same pair: the pass must leave
+ * that request alone. And when that request is evicted too while the pass
+ * skips the first entry, its own entry stays owed. */
+static void
+test_same_connection_next_request(void)
+{
+  fc_state_t fc;
+  fc_permit_t run, b, c, d;
+
+  {
+    struct sweep_ctx s = { .fc = &fc, .victim = &b, .leaver = &c, .hook = 3 };
+
+    evicted_setup(&fc, &run, &b, &c);
+    assert(fc_queue_evicted_sweep(&fc, UINT64_MAX, sweep_fn, &s) == 0);
+    assert(s.owner_rc == FC_RESUME_EVICTED && s.answered == 0);
+    assert(b.state == FC_P_QUEUED && fc_queue_holds(&fc, &b));
+    assert(fc_queue_evicted(&fc) == 0 && dec(&fc, FC_R_SHED) == 1);
+    assert(fc_queue_take(&fc, &b) == 1 && b.state == FC_P_ENDED);
+    fc_permit_release(&b);
+    fc_permit_release(&run);
+    fc_set_wake_hook(NULL);
+    fc_state_destroy(&fc);
+  }
+  {
+    struct sweep_ctx s = { .fc = &fc, .victim = &b, .leaver = &c, .extra = &d, .hook = 4 };
+
+    evicted_setup(&fc, &run, &b, &c);
+    fc_permit_init(&d);
+    assert(fc_queue_evicted_sweep(&fc, UINT64_MAX, sweep_fn, &s) == 0);
+    assert(s.answered == 0 && dec(&fc, FC_R_SHED) == 2);
+    /* The second eviction is still owed: its owner claims it. */
+    assert(fc_queue_evicted(&fc) == 1);
+    assert(fc_queue_owner_resume(&fc, &b, MS(3000)) == FC_RESUME_EVICTED);
+    assert(fc_queue_evicted(&fc) == 0);
+    fc_permit_release(&b);
+    fc_permit_release(&d);
+    fc_permit_release(&run);
+    fc_set_wake_hook(NULL);
+    fc_state_destroy(&fc);
+  }
+  printf("  ok the next request on the same connection: the pass leaves it alone\n");
 }
 
 static void
@@ -407,6 +469,7 @@ main(void)
   test_owner_stalled_sweep_wins();
   test_owner_first_sweep_skips();
   test_each_inside_the_others_window();
+  test_same_connection_next_request();
   test_deadline_and_turn();
   test_drain();
   test_threads();

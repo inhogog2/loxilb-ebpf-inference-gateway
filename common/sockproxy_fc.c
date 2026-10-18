@@ -2247,11 +2247,15 @@ fc_evicted_drop(fc_queue_t *q, uint32_t i)
   atomic_store_explicit(&q->n_evicted, n - 1, memory_order_relaxed);
 }
 
-int
-fc_queue_evicted_claim(fc_state_t *fc, int fd, uint64_t gen)
+/* Takes (fd, gen)'s entry off the evicted list. With `p`, the permit is
+ * swapped QUEUED -> FC_P_EVICTED in the same hold of the queue lock: the
+ * pass then decides only a wait whose entry nobody has claimed, and an
+ * owner's resume can never fall between the claim and the swap. */
+static int
+fc_evicted_take(fc_state_t *fc, int fd, uint64_t gen, fc_permit_t *p)
 {
   fc_queue_t *q;
-  int claimed = 0;
+  int won = 0;
 
   if (!fc || fd < 0 || fc_queue_evicted(fc) == 0)
     return 0;
@@ -2260,12 +2264,24 @@ fc_queue_evicted_claim(fc_state_t *fc, int fd, uint64_t gen)
   for (uint32_t i = 0; i < atomic_load_explicit(&q->n_evicted, memory_order_relaxed); i++) {
     if (q->evicted[i].fd == fd && q->evicted[i].gen == gen) {
       fc_evicted_drop(q, i);
-      claimed = 1;
+      won = p ? fc_permit_settle(p, FC_P_EVICTED) : 1;
       break;
     }
   }
   pthread_mutex_unlock(&q->lock);
-  return claimed;
+  return won;
+}
+
+int
+fc_queue_evicted_claim(fc_state_t *fc, int fd, uint64_t gen)
+{
+  return fc_evicted_take(fc, fd, gen, NULL);
+}
+
+int
+fc_queue_evicted_settle(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen)
+{
+  return p ? fc_evicted_take(fc, fd, gen, p) : 0;
 }
 
 uint32_t
@@ -2280,10 +2296,11 @@ fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,
   if (!fc || fc_queue_evicted(fc) == 0)
     return 0;
   q = &fc->queue;
-  /* The entries stay on the list while `fn` decides them: an owner's resume
-   * meanwhile still finds its entry, claims it and swaps the state, and `fn`
-   * then loses the swap and answers nothing. Only one sweep runs at a time
-   * (PROXY_LOCK). */
+  /* The entries stay on the list while `fn` decides them: `fn` answers a
+   * waiter only by taking its entry and swapping its state in one hold of
+   * the queue lock (fc_queue_evicted_settle), so an owner's resume that
+   * claimed the entry meanwhile leaves `fn` nothing to take. Only one sweep
+   * runs at a time (PROXY_LOCK). */
   pthread_mutex_lock(&q->lock);
   for (i = 0; i < atomic_load_explicit(&q->n_evicted, memory_order_relaxed); i++)
     if (q->evicted[i].at_ns <= before_ns)
@@ -2296,11 +2313,14 @@ fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,
       answered++;
   }
   /* Decided either way now (answered here, claimed by its owner, or its
-   * connection gone): off the list, whatever is still on it. */
+   * connection gone): off the list, whatever is still on it. The same
+   * eviction only (its time too): a later request on the same connection,
+   * evicted meanwhile under the same (fd, gen), stays owed. */
   pthread_mutex_lock(&q->lock);
   for (i = 0; i < n; i++) {
     for (uint32_t k = 0; k < atomic_load_explicit(&q->n_evicted, memory_order_relaxed); k++) {
-      if (q->evicted[k].fd == take[i].fd && q->evicted[k].gen == take[i].gen) {
+      if (q->evicted[k].fd == take[i].fd && q->evicted[k].gen == take[i].gen &&
+          q->evicted[k].at_ns == take[i].at_ns) {
         fc_evicted_drop(q, k);
         break;
       }

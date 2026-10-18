@@ -868,6 +868,14 @@ int fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
  * was not evicted or another path has claimed it. */
 int fc_queue_evicted_claim(fc_state_t *fc, int fd, uint64_t gen);
 
+/* The pass's decision on an evicted waiter: (fd, gen)'s entry is taken off
+ * the evicted list and `p` swapped QUEUED -> FC_P_EVICTED in one hold of
+ * the queue lock. 1 when the pass now answers it. 0 when the entry is gone
+ * (its owner claimed it: the owner answers, and a later request on the same
+ * connection, parked under the same (fd, gen), is not this wait) or the
+ * permit had already left QUEUED. */
+int fc_queue_evicted_settle(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen);
+
 /* Evicted waiters whose answer is still owed. A read. */
 static inline uint32_t
 fc_queue_evicted(const fc_state_t *fc)
@@ -878,9 +886,9 @@ fc_queue_evicted(const fc_state_t *fc)
 /* Every waiter evicted at or before `before_ns` is handed to `fn` (the
  * entry's fd and gen, band sheddable) outside the queue lock, and taken off
  * the evicted list after `fn` returned. `fn` decides the request with
- * fc_permit_settle(..., FC_P_EVICTED) and answers it only when it wins, so a
+ * fc_queue_evicted_settle and answers it only when that returns 1, so a
  * late resume of the owner that claims the entry meanwhile and a pass that
- * answers it are never both: one of them swaps the state. For the 1 Hz pass
+ * answers it are never both: whoever takes the entry decides. For the 1 Hz pass
  * (a wake that was lost or came late) and the drain of a pool (UINT64_MAX:
  * all). Returns the number `fn` answered (returned nonzero for). */
 uint32_t fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,

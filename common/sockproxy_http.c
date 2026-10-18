@@ -5274,6 +5274,7 @@ proxy_get_fc_inflight_total(void)
 struct sp_fc_drain_ctx {
   uint8_t kind;
   uint8_t detach;
+  fc_state_t *fc;                /* SP_REAP_FC_SHED: the pool whose evicted list is swept */
 };
 
 static int
@@ -5289,8 +5290,14 @@ sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
     return 0;
   }
   /* One swap decides the request: if the owner's resume made it first (its
-   * turn, or its eviction claimed), this path answers nothing. */
-  if (!fc_permit_settle(&pfe->fc, d->kind == SP_REAP_FC_SHED ? FC_P_EVICTED : FC_P_ENDED)) {
+   * turn, or its eviction claimed), this path answers nothing. An evicted
+   * waiter is decided only with its entry still on the evicted list, taken
+   * in the same step: (fd, gen) names the connection, not the wait, and
+   * after the owner answered its eviction the next request on a kept
+   * connection may be parked under the same pair. */
+  if (d->kind == SP_REAP_FC_SHED
+          ? !fc_queue_evicted_settle(d->fc, &pfe->fc, e->fd, e->gen)
+          : !fc_permit_settle(&pfe->fc, FC_P_ENDED)) {
     return 0;
   }
   if (d->detach) {
@@ -5306,7 +5313,8 @@ sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach)
 {
   struct sp_fc_drain_ctx d = { .kind = kind, .detach = (uint8_t)(detach != 0) };
   struct sp_fc_drain_ctx shed = { .kind = SP_REAP_FC_SHED,
-                                  .detach = (uint8_t)(detach != 0) };
+                                  .detach = (uint8_t)(detach != 0),
+                                  .fc = tepval ? &tepval->fc : NULL };
 
   if (!tepval || !proxy_struct || !proxy_struct->ns) {
     return;
@@ -5319,7 +5327,8 @@ sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach)
 void
 sp_fc_evicted_sweep(proxy_epval_t *tepval, uint64_t before_ns)
 {
-  struct sp_fc_drain_ctx shed = { .kind = SP_REAP_FC_SHED, .detach = 0 };
+  struct sp_fc_drain_ctx shed = { .kind = SP_REAP_FC_SHED, .detach = 0,
+                                  .fc = tepval ? &tepval->fc : NULL };
 
   if (!tepval || !proxy_struct || !proxy_struct->ns) {
     return;
