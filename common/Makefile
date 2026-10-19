@@ -435,8 +435,21 @@ test_fc_band_wrr: test_fc_band_wrr.c sockproxy_fc.c sockproxy_fc.h
 test_fc_settle: test_fc_settle.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_settle.c sockproxy_fc.c -I. -lpthread
 
+# The P/D role gates wait at a full role ceiling. The gate functions are the
+# production ones, taken from sockproxy_http.c (each from its return-type
+# line to its closing brace) into a generated file, so a change to them is
+# what the test runs; the extraction fails unless it finds all three.
+PD_ROLE_WAIT_FNS = sp_fc_h1_refuse|sp_fc_h1_gate_role|sp_fc_h1_gate_pd_roles
+test_pd_role_wait.gen.c: sockproxy_http.c
+	awk '/^($(PD_ROLE_WAIT_FNS))\(/ {print prev; on = 1} on {print} on && /^}/ {on = 0; n++; print ""} {prev = $$0} END {if (n != 3) exit 1}' \
+	  sockproxy_http.c > $@ || { rm -f $@; exit 1; }
+
+test_pd_role_wait: test_pd_role_wait.c test_pd_role_wait.gen.c sockproxy_fc.c sockproxy_fc.h sockproxy_llmd.h sockproxy_obj_hint.h
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -o $@ test_pd_role_wait.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr test_fc_settle
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr test_fc_settle test_pd_role_wait
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
@@ -451,6 +464,7 @@ test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose 
 	./test_fc_band_ttl
 	./test_fc_band_wrr
 	./test_fc_settle
+	./test_pd_role_wait
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.

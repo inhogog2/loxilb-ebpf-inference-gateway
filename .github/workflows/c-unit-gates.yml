@@ -113,7 +113,7 @@ jobs:
       - name: The llm-d request headers (TTL parse and capture, dropped-reason mapping, the forwarded objective and fairness rewrite; ASan + UBSan)
         run: make -C common test_llmd
 
-      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off), its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize) and its priority bands (order, shed, floors, wait windows and shares, weighted wake, tenant rotation)
+      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off), its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize) and its priority bands (order, shed, floors, wait windows and shares, weighted wake, tenant rotation), and the P/D role gates waiting at a full role ceiling (production gate code, ASan + UBSan)
         run: make -C common test_fc
 
       - name: Half-close observation (bucket edges, sampling gate, TLS end classification, User-Agent families)

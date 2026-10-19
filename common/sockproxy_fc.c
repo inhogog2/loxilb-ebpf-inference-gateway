@@ -786,6 +786,7 @@ fc_permit_reset(fc_permit_t *p)
   p->q_gen = 0;
   p->q_enqueue_ns = 0;
   p->q_deadline_ns = 0;
+  p->q_first_ns = 0;
   p->admit_ns = 0;
   p->tkey = 0;
   p->tslot = -1;
@@ -2134,7 +2135,7 @@ fc_set_wake_hook(fc_wake_fn fn)
 /* Lock held. Append or prepend one entry; -1 when no slot can be made. */
 static int
 fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
-               uint32_t *slot_out)
+               int ordered, uint32_t *slot_out)
 {
   uint32_t slot;
 
@@ -2176,6 +2177,24 @@ fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
   } else {
     slot = q->tail;
     q->tail = fc_ring_wrap(q, q->tail + 1);
+    if (ordered) {
+      /* A request that arrived before the waiters at the tail (it waited
+       * in another queue first) goes in behind the last one that arrived
+       * no later than it, as a woken request goes back. */
+      q->ring[slot] = *e;
+      q->ring[slot].live = 1;
+      while (slot != q->head) {
+        uint32_t prev = slot == 0 ? q->cap - 1 : slot - 1;
+
+        if (q->ring[prev].live &&
+            q->ring[prev].enqueue_ns <= q->ring[slot].enqueue_ns)
+          break;
+        fc_queue_ent_t t = q->ring[prev];
+        q->ring[prev] = q->ring[slot];
+        q->ring[slot] = t;
+        slot = prev;
+      }
+    }
   }
   q->ring[slot] = *e;
   q->ring[slot].live = 1;
@@ -2349,11 +2368,24 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   uint8_t parked;
   uint8_t ttl_cut;
   uint32_t ttl_ms;
+  uint64_t first_ns;
+  uint64_t at_ns = now_ns;       /* now, whatever time the entry is given */
+  int ordered = 0;
 
   if (!fc || !p || fd < 0)
     return -1;
   tkey = p->tkey;
   band = p->band;
+  /* A request moved here from the P/D prefill park, where it waited first,
+   * keeps that wait: it takes its place among the waiters by when it first
+   * parked, and its window and its queue-wait sample count from then. Asked
+   * of this push only (the bind below clears it). An eviction it causes is
+   * decided now, and timed from now. */
+  first_ns = p->q_first_ns;
+  if (!front && first_ns && first_ns < now_ns) {
+    now_ns = first_ns;
+    ordered = 1;
+  }
   /* The client's TTL is asked of this push only (the bind below clears it);
    * a request going back to its place keeps the deadline it was first given
    * and whose it was. */
@@ -2414,7 +2446,8 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
    * sheddable waiter (fc_shed_queue): one is chosen now, and evicted only
    * once this request is sure to take its place. */
   if (!front && !fc->queue.dead && fc_queue_enabled(fc) &&
-      fc->queue.count >= fc->cfg.max_queue_depth)
+      fc->queue.count >= fc->cfg.max_queue_depth &&
+      first_deadline > at_ns)        /* one whose window is over takes nobody's place */
     evict = fc_ring_evict_pick(fc, band);
   if (!band_full && !fc->queue.dead && fc_queue_enabled(fc) &&
       (front || fc->queue.count < fc->cfg.max_queue_depth ||
@@ -2430,11 +2463,11 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
     }
     if (rc != -2 && evict != UINT32_MAX) {
       gone_enq_ns = fc->queue.ring[evict].enqueue_ns;
-      gone = fc_ring_evict(fc, evict, now_ns);
+      gone = fc_ring_evict(fc, evict, at_ns);
       evicted = 1;
     }
     if (rc != -2)
-      rc = fc_ring_insert(&fc->queue, &e, front, &slot);
+      rc = fc_ring_insert(&fc->queue, &e, front, ordered, &slot);
     if (tslot >= 0) {
       if (rc == 0) {
         fc->tenants[tslot].queued++;
@@ -2456,7 +2489,7 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
      * queued leaves it to the 1 Hz pass. */
     fc_count_band(fc, FC_R_SHED, FC_BAND_SHEDDABLE);
     /* Its park ends here (its owner only answers it): observed here. */
-    fc_note_wait(fc, now_ns > gone_enq_ns ? (now_ns - gone_enq_ns) / 1000000ULL : 0);
+    fc_note_wait(fc, at_ns > gone_enq_ns ? (at_ns - gone_enq_ns) / 1000000ULL : 0);
     if (fc_wake_hook)
       (void)fc_wake_hook(gone.fd, gone.gen);
   }
@@ -2865,7 +2898,7 @@ fc_queue_wake_head(fc_state_t *fc, uint32_t pend[FC_BANDS])
      * the head and the next released unit tries again. Its deadline is
      * unchanged, so the wait stays bounded. */
     pthread_mutex_lock(&fc->queue.lock);
-    if (fc_ring_insert(&fc->queue, &e, 1, NULL) != 0)
+    if (fc_ring_insert(&fc->queue, &e, 1, 0, NULL) != 0)
       fc_tenant_dec(fc, e.tslot, 1);
     /* What the pick spent is given back, if nothing moved it since. */
     if (u.band >= 0) {

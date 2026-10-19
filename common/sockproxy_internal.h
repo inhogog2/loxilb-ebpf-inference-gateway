@@ -270,7 +270,8 @@ void sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind);
  * KEPT (refused, the response written, the connection kept for its next
  * request). The endpoint gate returns the endpoint the unit landed on,
  * which may differ from the selector's pick, or one of the outcomes. The
- * role gate takes `may_wait`: a prefill/decode leg never waits. */
+ * role gate takes `may_wait`; the P/D role gates (sp_fc_h1_gate_pd_roles)
+ * wait, like the service and endpoint gates. */
 #define SP_FC_H1_REFUSED (-1)
 #define SP_FC_H1_QUEUED  (-2)
 #define SP_FC_H1_KEPT    (-3)
@@ -295,6 +296,8 @@ int sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval);
 int sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel);
 int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
                        int may_wait);
+int sp_fc_h1_gate_pd_roles(proxy_fd_ent_t *pfe, proxy_epval_t *tepval,
+                           int prefill_ep, int decode_ep);
 int sp_fc_normal_eligible(void *ctx, int ep);
 /* ctx: sp_mcp_fc_scope (sockproxy_mcp_rr.h). */
 int sp_fc_route_eligible(void *ctx, int ep);

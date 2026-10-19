@@ -546,6 +546,7 @@ typedef struct fc_permit {
   uint64_t q_gen;
   uint64_t q_enqueue_ns;
   uint64_t q_deadline_ns;
+  uint64_t q_first_ns;           /* when a request moved here from the P/D prefill park first parked, for the next fc_queue_push; 0 = none; cleared by the bind */
   uint64_t admit_ns;             /* fc_now_ns() when the first endpoint unit landed: dispatch */
   uint64_t tkey;                 /* the tenant the request is admitted as */
   int16_t  tslot;                /* tenant slot whose inflight count this permit holds, -1 = none */

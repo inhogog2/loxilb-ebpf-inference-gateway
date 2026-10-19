@@ -9672,6 +9672,27 @@ sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
   return 0;
 }
 
+/* The two role units of a P/D request, prefill then decode, each taken
+ * under its own ceiling. A request that meets a full role ceiling waits
+ * for a unit when the pool queues, as at the service and endpoint
+ * ceilings: whatever it took goes back first (sp_fc_h1_refuse), so a
+ * prefill unit granted before a refused decode is not held while it
+ * waits, and its wake drives the whole dispatch again. A request that
+ * waited in the P/D prefill park first carries that park's start
+ * (pd_resume_parked), and the queue counts its wait from then. Returns 0
+ * with both units held, else SP_FC_H1_QUEUED, SP_FC_H1_KEPT or
+ * SP_FC_H1_REFUSED. */
+int
+sp_fc_h1_gate_pd_roles(proxy_fd_ent_t *pfe, proxy_epval_t *tepval,
+                       int prefill_ep, int decode_ep)
+{
+  int rc = sp_fc_h1_gate_role(pfe, tepval, prefill_ep, FC_ROLE_PREFILL, 1);
+
+  if (rc == 0)
+    rc = sp_fc_h1_gate_role(pfe, tepval, decode_ep, FC_ROLE_DECODE, 1);
+  return rc;
+}
+
 /* The queue's wake: the popped entry's connection is driven again on its
  * owner worker through the resume ring, the path the prefill ring uses.
  * Non-zero when the wake could not be queued; the entry then keeps its
@@ -13056,7 +13077,13 @@ pd_resume_parked(int fd)
   }
 
   /* Clear park markers; the conn re-enters dispatch as a fresh request. pd_phase back
-   * to NONE so pd_setup_and_forward's P/D entry block (gated on PD_PHASE_NONE) runs. */
+   * to NONE so pd_setup_and_forward's P/D entry block (gated on PD_PHASE_NONE) runs.
+   * A request leaving the P/D prefill park hands its start to the capacity
+   * queue, should a role ceiling make it wait there (sp_fc_h1_gate_pd_roles):
+   * one wait, counted from its first park. Both clocks are CLOCK_MONOTONIC.
+   * The next binding of the permit (the push, or the next request's
+   * service gate) clears it. */
+  pfe->fc.q_first_ns = pfe->park_start_ts;
   pfe->park_ep_idx   = -1;
   pfe->park_start_ts = 0;
   pfe->pd_phase      = PD_PHASE_NONE;
