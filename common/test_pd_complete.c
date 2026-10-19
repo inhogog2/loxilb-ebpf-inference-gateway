@@ -99,6 +99,33 @@ test_resp_note_latch(void)
   printf("  [PASS] resp_note latch: once per request, no-op after, re-armed, one winner in a race\n");
 }
 
+/* The two wrappers over the one writer (proxy_note_client_response = take
+ * with a TTFB sample, proxy_note_local_answer = take without) share the
+ * latch: whichever answer the client got first is the request's record. */
+static void
+test_resp_note_take_local_and_backend(void)
+{
+  uint8_t noted = 0;
+
+  /* a refusal: status and class, no TTFB sample */
+  assert(resp_note_take(&noted, 0) == RESP_NOTE_COUNT);
+  /* a backend reply racing it for the same request records nothing */
+  assert(resp_note_take(&noted, 1) == 0 && "a local answer then a backend reply records once");
+  assert(resp_note_take(&noted, 0) == 0);
+
+  /* next request: a backend reply samples TTFB, a late local answer is a no-op */
+  resp_note_rearm(&noted);
+  assert(resp_note_take(&noted, 1) == (RESP_NOTE_COUNT | RESP_NOTE_TTFB));
+  assert(resp_note_take(&noted, 0) == 0 && "a backend reply then a local answer records once");
+
+  /* the streamed gate's re-arm while the previous record is still owed
+   * changes nothing: the latch already reads open */
+  noted = 0;
+  resp_note_rearm(&noted);
+  assert(resp_note_take(&noted, 0) == RESP_NOTE_COUNT);
+  printf("  [PASS] resp_note take: a local answer and a backend reply share one record; TTFB only for the backend reply\n");
+}
+
 /* ---- Case 1: terminator wholly inside one packet still completes ---- */
 static void
 test_done_whole_packet(void)
@@ -390,6 +417,7 @@ main(void)
 {
   printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
   test_resp_note_latch();
+  test_resp_note_take_local_and_backend();
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();

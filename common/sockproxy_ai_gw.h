@@ -239,7 +239,9 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
  *
  * Called once per refusal, from the gate's single verdict frame, for every
  * deny arm (credential, model authorization, model conflict, rate limit,
- * token reservation) on both protocol paths. The identity fields carry what
+ * token reservation) on both protocol paths, and from
+ * ai_gw_record_local_deny for a refusal made outside it, before any backend
+ * was chosen (capacity, route, framing). The identity fields carry what
  * the deciding arm resolved before refusing: a refused model names its
  * tenant, an unknown credential names nothing. The credential itself is
  * never passed.

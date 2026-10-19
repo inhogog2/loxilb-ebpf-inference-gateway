@@ -432,6 +432,41 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
   return (n > 0 && n < (int)cap) ? (size_t)n : 0;
 }
 
+/* The records of a reaper answer that is a whole response, as for every
+ * answer the gateway writes itself (sockproxy_http.c, "responses the gateway
+ * writes itself"). A request still queued or parked never reached a backend:
+ * its ending is a capacity refusal. A P/D request that timed out on its legs
+ * was dispatched: its ending is a completion with the status written, unless
+ * a response had already begun (the guards make that a no-op). The SSE events
+ * are body bytes inside a response in progress, not a response. */
+static void
+sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
+{
+  switch (kind) {
+  case SP_REAP_FC_QUEUE_TIMEOUT:      /* deny record: sp_reap_fc_format */
+    proxy_note_local_answer(pfe, 504);
+    break;
+  case SP_REAP_FC_DRAINED:            /* deny record: sp_reap_fc_format */
+    proxy_note_local_answer(pfe, 503);
+    break;
+  case SP_REAP_PD_PARK_TIMEOUT:
+    proxy_note_local_answer(pfe, 504);
+    proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504,
+                            "pd_admission_park_timeout");
+    break;
+  case SP_REAP_PD_PREFILL_TIMEOUT:
+  case SP_REAP_PD_DECODE_TIMEOUT:
+  case SP_REAP_PD_IDLE_TIMEOUT:
+    proxy_record_local_completion(pfe, 504);
+    break;
+  case SP_REAP_PD_STREAM_TIMEOUT:
+    proxy_record_local_completion(pfe, 502);
+    break;
+  default:
+    break;
+  }
+}
+
 void
 sp_reap_finish(proxy_fd_ent_t *pfe)
 {
@@ -467,6 +502,7 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
     }
   }
   if (pfe->fd > 0 && buf) {
+    sp_reap_record(pfe, kind);
     if (proxy_send_local_response_and_shutdown(pfe, buf, len) != 0) {
       log_error("[REAPER] fd=%d failed to send complete bounded response "
                 "(kind %u)", pfe->fd, kind);

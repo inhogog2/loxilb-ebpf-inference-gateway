@@ -42,6 +42,7 @@
 #include "sockproxy_l7policy.h"
 #include "sockproxy_health.h" /* CB snapshot guard */
 #include "sockproxy_internal.h" /* proxy_struct_t, proxy_struct, PROXY_LOCK/UNLOCK (attach) */
+#include "sockproxy_ai_admit.h" /* AI_GW_STAGE_ROUTE: a REJECT's deny record */
 #include "sockproxy_cache.h"    /* cmp_proxy_ent — entry equality at attach/detach */
 #include "sockproxy_cookie.h"   /* stateless cookie token derive/verify (pure) */
 #include "log.h"                /* log_error — attach diagnostics */
@@ -433,8 +434,13 @@ int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
                "\r\n"
                "%s\r\n",
                code, l7_reason_phrase(code), safe_body);
-  if (n > 0 && n < (int)sizeof(resp))
+  if (n > 0 && n < (int)sizeof(resp)) {
+    /* A refusal before any backend was chosen, recorded as every answer the
+     * gateway writes itself: the response, and a deny record at ROUTE. */
+    proxy_note_local_answer(pfe, (uint16_t)code);
+    proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code, "l7_policy_reject");
     send(pfe->fd, resp, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
 
   shutdown(pfe->fd, SHUT_RDWR);
   return 0;
@@ -486,8 +492,11 @@ int l7_send_redirect(struct proxy_fd_ent *pfe, int status_code,
                "Connection: close\r\n"
                "\r\n",
                code, l7_reason_phrase(code), location);
-  if (n > 0 && n < (int)sizeof(resp))
+  if (n > 0 && n < (int)sizeof(resp)) {
+    /* A configured answer that completes the request with its 3xx. */
+    proxy_record_local_completion(pfe, (uint16_t)code);
     send(pfe->fd, resp, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
 
   shutdown(pfe->fd, SHUT_RDWR);
   return 0;

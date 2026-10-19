@@ -39,6 +39,7 @@
 #include "sockproxy.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_ai_admit.h" /* AI_GW_STAGE_FRAMING: the oversize refusal's record */
 
 /* ==========================================================================
  * SGLang P/D dual dispatch
@@ -170,6 +171,8 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason,
     const char *pd_model = proxy_effective_model(client_pfe);
     llb_ai_pd_record((char *)pd_model, 0, 0, 0, 4 /*prefill error*/);
   }
+  /* The client's answer: completed with the status written. */
+  proxy_record_local_completion(client_pfe, 502);
   if (client_pfe->fd > 0) {
     if (client_pfe->ssl) {
       SSL_write(client_pfe->ssl, pd_sg_err, sizeof(pd_sg_err) - 1);
@@ -211,6 +214,11 @@ pd_sg_oversize_reject(proxy_fd_ent_t *client_pfe)
   log_error("[PD_SG] streamable request on a disagg rule — fail-closed 503 "
             "(client_fd=%d cl=%zu)",
             client_pfe->fd, client_pfe->http_content_length);
+  /* A refusal before any backend bytes moved: the response, and a deny
+   * record at FRAMING. */
+  proxy_note_local_answer(client_pfe, 503);
+  proxy_record_local_deny(client_pfe, AI_GW_STAGE_FRAMING, 503,
+                          "pd_sg_oversize_unroutable");
   if (client_pfe->fd > 0) {
     if (client_pfe->ssl) {
       SSL_write(client_pfe->ssl, pd_sg_503, sizeof(pd_sg_503) - 1);
@@ -576,6 +584,8 @@ fail:
         "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang dual dispatch failed\"}";
     const char *pd_model = proxy_effective_model(client_pfe);
     llb_ai_pd_record((char *)pd_model, 0, 0, 0, 2 /*decode error*/);
+    /* The client's answer: completed with the status written. */
+    proxy_record_local_completion(client_pfe, 503);
     if (client_pfe->fd > 0) {
       if (client_pfe->ssl) {
         SSL_write(client_pfe->ssl, pd_sg_dispatch_err,
@@ -1048,6 +1058,8 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
         "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang bootstrap injection failed\"}";
     log_error("[PD_SG] bootstrap prep failed — fd=%d prefill_ep=%d "
               "(failing closed)", pfe->fd, sg_pidx);
+    /* The client's answer: completed with the status written. */
+    proxy_record_local_completion(pfe, 503);
     if (pfe->ssl) {
       SSL_write(pfe->ssl, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1);
     } else {

@@ -2551,6 +2551,141 @@ test_class_on_switch(void)
   assert(ai_gw_class_on() == 0);
 }
 
+/* ---- every refusal is recorded once, at its stage ----------------------
+ *
+ * The gateway counts every refusal it makes in one place, the deny record:
+ * the gate's arms through ai_gw_admit's verdict frame, and the refusals made
+ * outside it (capacity, route, framing) through ai_gw_record_local_deny. The
+ * five arms below exist only in C; each answers once and is recorded once,
+ * with the stage, status and code its client got. */
+
+static void
+expect_one_deny(int stage, int status, const char *code)
+{
+  assert(deny_stub.calls == 1);
+  assert(deny_stub.stage == stage);
+  assert(deny_stub.http_status == status);
+  assert(strcmp(deny_stub.error_code, code) == 0);
+}
+
+static void
+test_c_only_refusals_are_recorded_once_at_their_stage(void)
+{
+  ai_gw_admit_result_t res;
+
+  /* netid_unavailable: a fail-closed binding whose lookup failed */
+  {
+    ai_gw_req_ctx_t req = {
+      .api_key = "",
+      .body = body,
+      .body_len = sizeof(body) - 1,
+      .svc_ident = NET_SVC,
+      .client_ip = NET_SRC,
+      .netid_bound = AI_GW_NETID_BOUND | AI_GW_NETID_FAIL_CLOSED,
+    };
+    reset_stubs();
+    nid_bind("line-1-tenant", 1, 1);
+    nid_stub.rc = -1;
+    assert(ai_gw_admit(&req, &res) == -1);
+    expect_one_deny(AI_GW_STAGE_AUTH, 503, "netid_unavailable");
+  }
+
+  /* objective_not_allowed: a strict rule and an objective not the tenant's */
+  {
+    ai_gw_req_ctx_t req = class_key_req();
+    req.objective_hint = "not-mine";
+    req.objective_strict = 1;
+    reset_stubs();
+    cls_stub.out.objective_denied = 1;
+    assert(ai_gw_admit(&req, &res) != 0);
+    expect_one_deny(AI_GW_STAGE_OBJECTIVE, 403, "objective_not_allowed");
+  }
+
+  /* model_conflict and the binding's model_not_allowed: a bound source */
+  {
+    ai_gw_req_ctx_t req = {
+      .body = body,
+      .body_len = sizeof(body) - 1,
+      .hdr_model = "m2",
+      .auth_mode = 0,
+      .svc_ident = NET_SVC,
+      .client_ip = NET_SRC,
+      .netid_bound = 1,
+    };
+    reset_stubs();
+    nid_bind("line-1-tenant", 0, 0);
+    assert(ai_gw_admit(&req, &res) == -1);
+    expect_one_deny(AI_GW_STAGE_CONFLICT, 400, "model_conflict");
+
+    req.hdr_model = "";
+    reset_stubs();
+    nid_bind("line-1-tenant", 0, 0);
+    nid_stub.out.model_ok = 0;
+    assert(ai_gw_admit(&req, &res) == -1);
+    expect_one_deny(AI_GW_STAGE_AUTH, 403, "model_not_allowed");
+  }
+
+  /* network_tenant_mismatch: an enforcing binding, a key of another tenant */
+  {
+    ai_gw_req_ctx_t req = {
+      .api_key = "sk-abc",
+      .body = body,
+      .body_len = sizeof(body) - 1,
+      .auth_mode = 1,
+      .svc_ident = NET_SVC,
+      .client_ip = NET_SRC,
+      .netid_bound = 1,
+    };
+    reset_stubs();
+    nid_bind("another-tenant", 1, 0);
+    assert(ai_gw_admit(&req, &res) == -1);
+    expect_one_deny(AI_GW_STAGE_AUTH, 403, "network_tenant_mismatch");
+  }
+}
+
+static void
+test_local_refusals_are_recorded_at_their_stage(void)
+{
+  /* Route: no pool for the named model; no rule matched (no model). */
+  reset_stubs();
+  ai_gw_record_local_deny(AI_GW_STAGE_ROUTE, "req-route", 2, NET_SVC, "m9",
+                          "", "", "", 503, "model_unavailable", NET_SRC, "",
+                          0, AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "");
+  expect_one_deny(AI_GW_STAGE_ROUTE, 503, "model_unavailable");
+  assert(strcmp(deny_stub.model, "m9") == 0);
+  assert(strcmp(deny_stub.request_id, "req-route") == 0 && deny_stub.producer_id == 2);
+
+  reset_stubs();
+  ai_gw_record_local_deny(AI_GW_STAGE_ROUTE, "req-nr", 2, NET_SVC, NULL,
+                          NULL, NULL, NULL, 503, "no_route", NET_SRC, NULL,
+                          0, AI_GW_AUTH_SRC_CREDENTIAL, NULL, 0, 0, NULL);
+  expect_one_deny(AI_GW_STAGE_ROUTE, 503, "no_route");
+  assert(deny_stub.model[0] == '\0' && deny_stub.tenant[0] == '\0');
+
+  /* Framing: an admitted identity is carried as the gate resolved it. */
+  reset_stubs();
+  ai_gw_record_local_deny(AI_GW_STAGE_FRAMING, "req-413", 1, NET_SVC, "m1",
+                          "tenant-1", "key-1", "", 413,
+                          "request_body_too_large", NET_SRC, "", 0,
+                          AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "");
+  expect_one_deny(AI_GW_STAGE_FRAMING, 413, "request_body_too_large");
+  assert(strcmp(deny_stub.tenant, "tenant-1") == 0 && strcmp(deny_stub.key, "key-1") == 0);
+
+  /* Capacity: the capacity helper is the same record at CAPACITY. */
+  reset_stubs();
+  ai_gw_record_capacity_deny("req-pd", 1, NET_SVC, "m1", "tenant-1", "key-1",
+                             "", 429, "pd_overloaded", NET_SRC, "", 0,
+                             AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "");
+  expect_one_deny(AI_GW_STAGE_CAPACITY, 429, "pd_overloaded");
+
+  /* The values the Go side names a stage by: appended, none moved. */
+  assert(AI_GW_STAGE_NONE == 0 && AI_GW_STAGE_AUTH == 1 &&
+         AI_GW_STAGE_CONFLICT == 2 && AI_GW_STAGE_RATELIMIT == 3 &&
+         AI_GW_STAGE_RESERVE == 4 && AI_GW_STAGE_CAPACITY == 5 &&
+         AI_GW_STAGE_OBJECTIVE == 6 && AI_GW_STAGE_ROUTE == 7 &&
+         AI_GW_STAGE_FRAMING == 8 && AI_GW_STAGE_SECURITY == 9);
+}
+
 int
 main(void)
 {
@@ -2608,6 +2743,11 @@ main(void)
   test_class_key_without_a_tenant();
   test_class_resolver_failure_is_standard();
   test_class_on_switch();
+  test_c_only_refusals_are_recorded_once_at_their_stage();
+  test_local_refusals_are_recorded_at_their_stage();
+  puts("PASS: refusals: each C-only gate arm and each local refusal (route, "
+       "framing, capacity) is recorded once with its stage, status and code; "
+       "stage values pinned");
   puts("PASS: class stage: off asks nothing, every arm hands its identity over, "
        "a denied objective refuses only on a strict rule and before any charge, "
        "a tier that was read is handed back to be nulled");
