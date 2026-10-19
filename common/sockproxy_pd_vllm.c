@@ -198,6 +198,9 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
    * recompute + the origin-streak feed above). */
   if (is_trt && pr_status == 200 &&
       pd_trt_ctx_early_exit_check(l_prefill, l_prefill_len)) {
+    /* The client is answered from the prefill leg, whose reply the response
+     * capture skips: record the response here, before the relay. */
+    proxy_note_client_response(client_pfe, (uint16_t)pr_status);
     pd_trt_early_exit_relay(client_pfe, l_prefill, l_prefill_len,
                             pd_trt_stream_requested(l_body, l_body_len));
     ret = 0;

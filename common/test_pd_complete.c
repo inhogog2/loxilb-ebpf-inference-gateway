@@ -37,6 +37,8 @@ struct proxy_fd_ent {
 };
 
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_resp_note.h"
+#include <pthread.h>
 
 /* A per-"connection" sliding-tail fixture, mirroring the proxy_fd_ent.sse_tail /
  * .sse_tail_len fields the production call site rides on. Zero-initialised =
@@ -51,6 +53,50 @@ scan(struct tail_state *ts, const char *pkt)
 {
   return pd_scan_msg_end_window(ts->tail, &ts->tail_len,
                                 (const uint8_t *)pkt, strlen(pkt));
+}
+
+/* The response-record latch (proxy_note_client_response): one record per
+ * request whichever site reaches it first (the decode capture or a prefill-leg
+ * answer); every later call for that request is a no-op; the next request on
+ * the connection records again. */
+static uint8_t race_latch;
+static int race_wins;
+
+static void *
+race_claim(void *arg)
+{
+  (void)arg;
+  if (resp_note_claim(&race_latch)) __atomic_fetch_add(&race_wins, 1, __ATOMIC_RELAXED);
+  return NULL;
+}
+
+static void
+test_resp_note_latch(void)
+{
+  uint8_t noted = 0;   /* pfe_alloc zeroes the field: the latch starts open */
+
+  assert(resp_note_claim(&noted) == 1 && "first site records");
+  assert(resp_note_claim(&noted) == 0 && "second site for the same request is a no-op");
+  assert(resp_note_claim(&noted) == 0);
+  resp_note_rearm(&noted);   /* next request on the kept-alive connection */
+  assert(resp_note_claim(&noted) == 1 && "re-armed per request");
+  assert(resp_note_claim(&noted) == 0);
+
+  /* the two sites run on different workers: exactly one wins a race */
+  for (int round = 0; round < 200; round++) {
+    pthread_t th[8];
+    race_latch = 0;
+    race_wins = 0;
+    for (int i = 0; i < 8; i++) assert(pthread_create(&th[i], NULL, race_claim, NULL) == 0);
+    for (int i = 0; i < 8; i++) pthread_join(th[i], NULL);
+    assert(race_wins == 1 && "exactly one record per request under a race");
+  }
+
+  assert(resp_status_class(0) == 0 && resp_status_class(100) == 0 && resp_status_class(199) == 0);
+  assert(resp_status_class(200) == 2 && resp_status_class(299) == 2);
+  assert(resp_status_class(302) == 3 && resp_status_class(404) == 4 && resp_status_class(429) == 4);
+  assert(resp_status_class(500) == 5 && resp_status_class(599) == 5 && resp_status_class(600) == 0);
+  printf("  [PASS] resp_note latch: once per request, no-op after, re-armed, one winner in a race\n");
 }
 
 /* ---- Case 1: terminator wholly inside one packet still completes ---- */
@@ -242,6 +288,7 @@ int
 main(void)
 {
   printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
+  test_resp_note_latch();
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();

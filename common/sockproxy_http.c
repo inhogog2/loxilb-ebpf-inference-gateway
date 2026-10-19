@@ -55,6 +55,7 @@
 #include "sockproxy_in_ifindex.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
+#include "sockproxy_resp_note.h" /* once-per-request response record latch */
 #include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
@@ -1296,6 +1297,37 @@ proxy_usage_ops(proxy_fd_ent_t *pfe)
   return &pd_dialect_plain;
 }
 
+/* Record the response the client receives, once per request: its status
+ * (metric_response_status), the responses-by-status class counter and the
+ * TTFB sample, taken now. Called by the backend response capture and by every
+ * path that answers the client from the P/D prefill leg, whose reply the
+ * capture skips, just before it relays; so TTFB is the client's first byte
+ * whichever leg delivered it. The latch makes a second call for the same
+ * request a no-op (sockproxy_resp_note.h). Returns 1 when it recorded. */
+int
+proxy_note_client_response(proxy_fd_ent_t *pfe, uint16_t status)
+{
+  if (!pfe || !resp_note_claim(&pfe->metric_resp_noted)) return 0;
+  pfe->metric_response_status = status;
+  // Every final or interim status counts in the total; 1xx has no class.
+  atomic_fetch_add(&global_stats.http_responses_total, 1);
+  switch (resp_status_class(status)) {
+  case 2: atomic_fetch_add(&global_stats.http_status_2xx, 1); break;
+  case 3: atomic_fetch_add(&global_stats.http_status_3xx, 1); break;
+  case 4: atomic_fetch_add(&global_stats.http_status_4xx, 1); break;
+  case 5: atomic_fetch_add(&global_stats.http_status_5xx, 1); break;
+  default: break;
+  }
+  // TTFB latency — recorded unconditionally (see request-start capture in
+  // handle_on_message_complete); the histogram is a first-class L7 metric,
+  // not gated behind the optional HAVE_HTTP_TRACE trace subsystem.
+  if (pfe->metric_req_start_ns > 0) {
+    uint64_t latency_us = (get_timestamp_ns() - pfe->metric_req_start_ns) / 1000;
+    record_latency_sample(latency_us);
+  }
+  return 1;
+}
+
 int
 proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 {
@@ -1590,9 +1622,11 @@ skip_deferred_masking:
 
 #ifdef HAVE_HTTP_TRACE
     // Parse HTTP response status and Content-Length for tracing (ONCE per connection)
-    // Only parse from backend connections (odir=1) when we haven't captured status yet
+    // Only parse from backend connections (odir=1) when we haven't captured status yet.
+    // Not a P/D prefill reply: the client never sees it (see the L7 METRICS block).
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
-        rfd_ent->response_status_code == 0 && len > 16) {
+        rfd_ent->response_status_code == 0 && len > 16 &&
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
 
       const char *buf = (const char *)msg;
       size_t header_search_len = (len < 2048) ? len : 2048;  // Only search first 2KB
@@ -1638,8 +1672,16 @@ skip_deferred_masking:
 #endif
 
     // L7 METRICS: Parse HTTP response status (independent of Jaeger tracing)
+    /* The status of the response the CLIENT receives. On the sequential P/D
+     * machine the first status line to arrive is the prefill leg's, which is
+     * buffered and never relayed; taking it made every P/D request report its
+     * prefill status (and its TTFB at the prefill reply) whatever the decode
+     * leg answered. The capture waits for the decode leg. A path that answers
+     * the client from the prefill leg itself records the response where it
+     * relays (proxy_note_client_response). */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
-        rfd_ent->metric_response_status == 0 && len > 16) {
+        rfd_ent->metric_response_status == 0 && len > 16 &&
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
       const char *buf = (const char *)msg;
       if (memcmp(buf, "HTTP/1.", 7) == 0 && len > 12) {
         const char *status_start = buf + 9;
@@ -1650,25 +1692,8 @@ skip_deferred_masking:
           uint16_t status = (status_start[0] - '0') * 100 +
                             (status_start[1] - '0') * 10 +
                             (status_start[2] - '0');
-          rfd_ent->metric_response_status = status;
-          // Count by status class (skip 1xx interim responses)
-          atomic_fetch_add(&global_stats.http_responses_total, 1);
-          if (status >= 200 && status < 300) {
-            atomic_fetch_add(&global_stats.http_status_2xx, 1);
-          } else if (status >= 300 && status < 400) {
-            atomic_fetch_add(&global_stats.http_status_3xx, 1);
-          } else if (status >= 400 && status < 500) {
-            atomic_fetch_add(&global_stats.http_status_4xx, 1);
-          } else if (status >= 500 && status < 600) {
-            atomic_fetch_add(&global_stats.http_status_5xx, 1);
-          }
-          // TTFB latency — recorded unconditionally (see request-start capture in
-          // handle_on_message_complete); the histogram is a first-class L7 metric,
-          // not gated behind the optional HAVE_HTTP_TRACE trace subsystem.
-          if (rfd_ent->metric_req_start_ns > 0) {
-            uint64_t latency_us = (get_timestamp_ns() - rfd_ent->metric_req_start_ns) / 1000;
-            record_latency_sample(latency_us);
-          }
+          // Status, class counter and TTFB sample, once per request.
+          int noted = proxy_note_client_response(rfd_ent, status);
           // Origin-error breaker feed for plain (non-P/D) relay: an endpoint
           // that accepts TCP but keeps answering 5xx never trips the
           // connect-level breaker, and prefix affinity keeps re-selecting it.
@@ -1678,7 +1703,7 @@ skip_deferred_masking:
           // for load accounting). 4xx neither extends nor resets the streak:
           // engines answer 4xx/5xx to client-fault bodies, and only a
           // consecutive-5xx streak should demote.
-          if (rfd_ent->pd_phase == PD_PHASE_NONE &&
+          if (noted && rfd_ent->pd_phase == PD_PHASE_NONE &&
               rfd_ent->epv && rfd_ent->ep_num >= 0) {
             proxy_epval_t *repval = (proxy_epval_t *)rfd_ent->epv;
             if (status >= 500) {
@@ -9750,6 +9775,7 @@ handle_on_message_complete(llhttp_t* parser)
     pfe->metric_req_start_ns = get_timestamp_ns();
     pfe->metric_response_status = 0;
     pfe->metric_ai_recorded = 0;   // re-arm per request (keep-alive connection reuse)
+    resp_note_rearm(&pfe->metric_resp_noted);
   }
 
   // AI Gateway: Enforce X-Api-Key validation and per-key / per-tenant RPS limits.

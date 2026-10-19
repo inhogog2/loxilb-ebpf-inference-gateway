@@ -124,6 +124,9 @@ jobs:
       - name: A client kept open after its FIN has only its read side shut (source invariant)
         run: make -C common check_client_eof_keep
 
+      - name: A P/D request reports the status its client received, never the prefill leg's (source invariant)
+        run: make -C common check_pd_status_sites
+
       - name: The correlation key that joins a request's records across its keep-alive reset
         run: make -C common test_ridjoin
 

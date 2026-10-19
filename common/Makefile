@@ -450,6 +450,13 @@ check_notify_arm:
 check_client_eof_keep:
 	sh ./check_client_eof_keep.sh
 
+# A P/D request reports the status its client received: both response-status
+# captures skip the sequential machine's prefill reply, and every path that
+# answers the client records the response through proxy_note_client_response.
+.PHONY: check_pd_status_sites
+check_pd_status_sites:
+	sh ./check_pd_status_sites.sh
+
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
 # sockproxy_cookie.h primitives, links -lssl -lcrypto (the already-linked HMAC).
@@ -682,8 +689,8 @@ test_pd_leak: test_pd_leak.c sockproxy_pd_leak.h
 # message-end terminator split across two reads — the Bug-A stall on the
 # sse_active==0 path that the single-packet FIX-4 scan missed. -fsanitize=address
 # guards the bounded window/tail copies.
-test_pd_complete: test_pd_complete.c sockproxy_pd_leak.h
-	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I. -DTEST_PD_COMPLETE
+test_pd_complete: test_pd_complete.c sockproxy_pd_leak.h sockproxy_resp_note.h
+	$(CC) -Wall -Wextra -fsanitize=address -pthread -o $@ $< -I. -DTEST_PD_COMPLETE
 
 # Phase 90-02 (REQ-REG / contract §5): adversarial HTTP-response message-framing
 # regression units for the M1 response-leg parser. UNLIKE the header-only
