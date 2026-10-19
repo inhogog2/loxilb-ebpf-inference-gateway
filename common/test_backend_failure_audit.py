@@ -16,7 +16,7 @@ prefix = r'''
 #include <stdio.h>
 #include <string.h>
 typedef struct {
- int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc;
+ int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc, noted;
  uint64_t metric_req_start_ns;
  int usage_prompt_toks, usage_complet_toks, auth_src, adm_priority;
  int adm_class_set, adm_class, adm_objective_denied, adm_hint_not_applied;
@@ -36,10 +36,15 @@ static int notify_worker_id(void){return 2;}
 static void proxy_pfe_svc_ident(proxy_fd_ent_t *p,char *s,size_t n){(void)p;snprintf(s,n,"lab-service");}
 static void fc_permit_release(int *p){if(*p){released++;*p=0;}}
 #define AI_GW_CLASS_INFO(a,b,c,d) 0
-/* The response record (status and class, no TTFB): counted, latched by the
- * product's writer, not modelled here. */
+/* The response record (status and class, no TTFB): every call counted. The
+ * product's writer is modelled where the request records depend on it: once
+ * per request (the latch), on the client leg only, and it sets the status. */
 static int local_notes, last_note_status;
-static int proxy_note_local_answer(proxy_fd_ent_t *p,uint16_t s){(void)p;local_notes++;last_note_status=s;return 1;}
+static int proxy_note_local_answer(proxy_fd_ent_t *p,uint16_t s){
+ local_notes++;last_note_status=s;
+ if(p->odir||p->noted) return 0;
+ p->noted=1;p->metric_response_status=s;return 1;
+}
 static int denies, deny_stage, deny_status;
 static char deny_code[48], deny_model[32], deny_tenant[32], deny_request[32];
 static void ai_gw_record_local_deny(int stage,const char *rid,int prod,const char *svc,const char *model,
@@ -90,7 +95,7 @@ int main(void){
  assert(emitted==2 && observed_status==502 && released==2);
  p=request();p.ai_gw_mode=0;proxy_send_backend_unreachable(&p,"raw proxy");
  p=request();p.odir=1;proxy_send_backend_unreachable(&p,"backend leg");
- p=request();p.metric_response_status=200;proxy_send_backend_unreachable(&p,"response began");
+ p=request();p.metric_response_status=200;p.noted=1;proxy_send_backend_unreachable(&p,"response began");
  assert(p.metric_response_status==200);
  p=request();p.metric_ai_recorded=1;proxy_send_backend_unreachable(&p,"already recorded");
  assert(emitted==2 && sent==7);
@@ -114,7 +119,12 @@ int main(void){
  assert(denies==1 && deny_stage==7 && deny_status==503);
  assert(!strcmp(deny_code,"model_unavailable") && !strcmp(deny_model,"model-unknown"));
  assert(!strcmp(deny_tenant,"tenant-a") && !strcmp(deny_request,"test-request-a"));
- assert(emitted==3 && !p.metric_ai_recorded && p.fc==1 && local_notes==10);
+ assert(emitted==3 && p.fc==1 && local_notes==10 && p.metric_response_status==503);
+ /* and no completion is owed beside it: the next request on the connection,
+  * or its teardown, must not count the refusal again as completed */
+ assert(p.metric_ai_recorded);
+ proxy_ai_record_completion(&p);
+ assert(emitted==3);
  /* no model named: none is invented from the previous response */
  p=request();
  sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));
@@ -126,8 +136,15 @@ int main(void){
  p=request();p.ai_gw_mode=0;sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));
  p=request();p.odir=1;sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));
  assert(denies==3 && local_notes==14);
+ /* a refusal after the request's response was recorded leaves that
+  * response's completion owed, and it is the one written */
+ p=request();p.noted=1;p.metric_response_status=200;
+ sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));
+ assert(denies==4 && !p.metric_ai_recorded);
+ proxy_ai_record_completion(&p);
+ assert(emitted==4 && observed_status==200);
  puts("backend-failure audit: identity/status, once-only, send failure, non-AI/backend/started guards PASS");
- puts("local answers: an outage completes with its status, a refusal is one deny record at its stage, both record the response PASS");
+ puts("local answers: an outage completes with its status, a refusal is one deny record at its stage and never a completion, both record the response PASS");
 }
 '''
 with tempfile.TemporaryDirectory() as td:

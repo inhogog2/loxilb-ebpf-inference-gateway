@@ -216,7 +216,7 @@ pd_sg_oversize_reject(proxy_fd_ent_t *client_pfe)
             client_pfe->fd, client_pfe->http_content_length);
   /* A refusal before any backend bytes moved: the response, and a deny
    * record at FRAMING. */
-  proxy_note_local_answer(client_pfe, 503);
+  proxy_note_local_refusal(client_pfe, 503);
   proxy_record_local_deny(client_pfe, AI_GW_STAGE_FRAMING, 503,
                           "pd_sg_oversize_unroutable");
   if (client_pfe->fd > 0) {
