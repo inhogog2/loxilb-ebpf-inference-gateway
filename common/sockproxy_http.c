@@ -8869,6 +8869,7 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->http_pok = 0;
   pfe->http_hok = 0;
   pfe->http_hvok = 0;
+  pfe->host_url[0] = '\0';
   pfe->http_hdrs_done = 0;
   pfe->http_body_complete = 0;
   pfe->http_content_length = 0;
@@ -12084,6 +12085,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->http_pok = 0;
     pfe->http_hok = 0;
     pfe->http_hvok = 0;
+    pfe->host_url[0] = '\0';
     pfe->http_hdrs_done = 0;
     pfe->http_body_complete = 0;
     pfe->http_content_length = 0;
@@ -12952,6 +12954,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
         // Reset flags before parsing
         int json_stream_was_pending = pfe->json_stream_route_pending;
+        int hdrs_were_done = pfe->http_hdrs_done;  /* header block completed in an earlier read */
         pfe->http_pok = 0;
         pfe->http_hok = 0;
         pfe->http_hvok = 0;
@@ -12989,10 +12992,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         pfe->parsed_off = pfe->rcv_off;
 
         /* llhttp reports the Host callbacks only while parsing the headers.
-         * An oversize JSON request deliberately spans another read while we
-         * wait for its body model, so restore the already-proven header state
-         * for that continuation read. */
-        if (json_stream_was_pending || (sp_mcp_enabled(pfe) && pfe->http_hdrs_done)) {
+         * A continuation read of the same request — an oversize JSON request
+         * waiting for its body model, or any request whose header block
+         * completed in an earlier read and whose body arrives in this one —
+         * sees none of them, so restore the already-proven header state.
+         * Without it the body read selects with no Host and bypasses model
+         * routing. host_url is cleared at every request boundary, so it holds
+         * this request's Host or nothing. */
+        if (json_stream_was_pending || pfe->http_hdrs_done) {
           pfe->http_hok = 1;
           pfe->http_hvok = pfe->host_url[0] != '\0';
         }
@@ -13031,8 +13038,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // - File uploads (>64KB) benefit from streaming → prevents buffer overflow
           // - Conservative threshold ensures we catch 250KB uploads (customer case)
 
-          // upload detection instrument: one line per request, so debug level only
-          if (pfe->http_hok) {
+          // upload detection instrument: one line per request, so debug level only.
+          // Logged on the read that completes the header block: the header state
+          // is restored on every later read of the request, so http_hok alone
+          // would repeat it for each buffered body read.
+          if (pfe->http_hdrs_done && !hdrs_were_done) {
             log_debug("[UPLOAD_DEBUG] fd=%d: pok=%d hok=%d hvok=%d Content-Length=%zu threshold=%d",
                      fd, pfe->http_pok, pfe->http_hok, pfe->http_hvok,
                      pfe->http_content_length, (64 * 1024));
@@ -13460,6 +13470,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->http_pok = 0;
           pfe->http_hok = 0;
           pfe->http_hvok = 0;
+          pfe->host_url[0] = '\0';
           pfe->http_hdrs_done = 0;
           pfe->http_body_complete = 0;
           pfe->http_content_length = 0;
