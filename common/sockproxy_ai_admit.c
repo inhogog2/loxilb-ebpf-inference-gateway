@@ -163,6 +163,37 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 }
 
 void
+ai_gw_record_local_deny(int stage, const char *request_id, int producer_id,
+                        const char *svc_ident, const char *model,
+                        const char *tenant_id, const char *key_id,
+                        const char *user_id, int http_status,
+                        const char *error_code,
+                        const char *client_ip, const char *origin_ip,
+                        int trusted_hops, int auth_src,
+                        const char *net_identity,
+                        int priority, int class_info,
+                        const char *objective)
+{
+  /* The same attribution every other record carries, with the same
+   * meaning: client_ip is the socket peer, origin_ip is "" unless the header
+   * splice derived one before this refusal, and trusted_hops pairs with it. */
+  llb_ai_record_deny((char *)(request_id ? request_id : ""), producer_id,
+                     (char *)(svc_ident ? svc_ident : ""),
+                     (char *)(model ? model : ""),
+                     (char *)(tenant_id ? tenant_id : ""),
+                     (char *)(key_id ? key_id : ""),
+                     (char *)(user_id ? user_id : ""),
+                     stage, http_status,
+                     (char *)(error_code ? error_code : ""),
+                     (char *)(client_ip ? client_ip : ""),
+                     (char *)(origin_ip ? origin_ip : ""),
+                     trusted_hops, auth_src,
+                     (char *)(net_identity ? net_identity : ""),
+                     priority, class_info,
+                     (char *)(objective ? objective : ""));
+}
+
+void
 ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            const char *svc_ident, const char *model,
                            const char *tenant_id, const char *key_id,
@@ -174,23 +205,11 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            int priority, int class_info,
                            const char *objective)
 {
-  /* The same attribution every other record carries, with the same
-   * meaning: client_ip is the socket peer, origin_ip is "" unless the header
-   * splice derived one before this refusal, and trusted_hops pairs with it. */
-  llb_ai_record_deny((char *)(request_id ? request_id : ""), producer_id,
-                     (char *)(svc_ident ? svc_ident : ""),
-                     (char *)(model ? model : ""),
-                     (char *)(tenant_id ? tenant_id : ""),
-                     (char *)(key_id ? key_id : ""),
-                     (char *)(user_id ? user_id : ""),
-                     (int)AI_GW_STAGE_CAPACITY, http_status,
-                     (char *)(error_code ? error_code : ""),
-                     (char *)(client_ip ? client_ip : ""),
-                     (char *)(origin_ip ? origin_ip : ""),
-                     trusted_hops, auth_src,
-                     (char *)(net_identity ? net_identity : ""),
-                     priority, class_info,
-                     (char *)(objective ? objective : ""));
+  ai_gw_record_local_deny((int)AI_GW_STAGE_CAPACITY, request_id, producer_id,
+                          svc_ident, model, tenant_id, key_id, user_id,
+                          http_status, error_code, client_ip, origin_ip,
+                          trusted_hops, auth_src, net_identity, priority,
+                          class_info, objective);
 }
 
 /* ---- services with a network-identity binding ---------------------------

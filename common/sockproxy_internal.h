@@ -193,6 +193,15 @@ int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                            const void *buf, size_t len);
 /* The 502 of a request no backend took, framed with its length. */
 int proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail);
+/* Responses the gateway writes itself, recorded as the client receives them
+ * (sockproxy_http.c, "responses the gateway writes itself"). */
+int sp_send_local_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
+                          const char *code, const void *buf, size_t len);
+int sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
+                         size_t len);
+void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
+                             const char *code);
+void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                            int retry_body, const char *code, const char *msg);
 /* `keep`: the refusal leaves the connection open for its next request (the

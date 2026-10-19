@@ -166,7 +166,7 @@ typedef struct proxy_h2_stream {
                                      // (mirrors PROXY_USAGE_TAIL_KEEP)
   uint16_t usage_tail_len;
   uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
-  int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
+  int      metric_response_status;   // :status the client got: the backend's, or a local outage answer's (0 = unseen)
   uint8_t  response_is_sse;           // final response media type, per stream
   uint8_t  fc_first_data_seen;       // the first response DATA chunk was looked at for TTFT
   fc_permit_t fc;                    // capacity admission permit of THIS stream (one

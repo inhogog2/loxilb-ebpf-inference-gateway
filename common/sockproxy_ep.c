@@ -46,6 +46,7 @@
 #define SP_MCP_PROXY_SELECTOR
 #include "sockproxy_mcp_rr.h"
 #include "sockproxy_ep.h"       /* own header */
+#include "sockproxy_ai_admit.h" /* AI_GW_STAGE_* of a local refusal */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 
 #define XXH_STATIC_LINKING_ONLY
@@ -597,7 +598,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "\r\n"
                       "{\"error\":\"no_route\","
                       "\"detail\":\"L7 FORWARD resolved no backend pool\"}\r\n";
-                  proxy_send_local_response(pfe, l7_no_pool_resp, strlen(l7_no_pool_resp));
+                  sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "no_route",
+                                        l7_no_pool_resp, strlen(l7_no_pool_resp));
                   pfe->lb_err_body_sent = 1;
                 }
                 return -1;
@@ -624,7 +626,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                        "{\"error\":\"model_unavailable\",\"model\":\"%s\","
                        "\"detail\":\"no backend pool for this model\"}\r\n",
                        effective_model);
-              proxy_send_local_response(pfe, response_buf, strlen(response_buf));
+              sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "model_unavailable",
+                                    response_buf, strlen(response_buf));
               log_info("[MODEL_ROUTING] 503 sent for model='%s' on fd=%d",
                        effective_model, pfe->fd);
               pfe->lb_err_body_sent = 1;
@@ -642,7 +645,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                   "\r\n"
                   "{\"error\":\"no_route\","
                   "\"detail\":\"no routing rule matched the request path\"}\r\n";
-              proxy_send_local_response(pfe, no_route_resp, strlen(no_route_resp));
+              sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "no_route",
+                                  no_route_resp, strlen(no_route_resp));
               log_info("[PROXY_NO_ROUTE] 503 sent: no prefix match for path='%s' on fd=%d",
                        request_path ? request_path : "", pfe->fd);
               pfe->lb_err_body_sent = 1;
@@ -662,7 +666,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                     "\r\n"
                     "{\"error\":\"no_rules\","
                     "\"detail\":\"all routing rules have been removed for this service\"}\r\n";
-                proxy_send_local_response(pfe, no_rule_resp, strlen(no_rule_resp));
+                sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "no_rules",
+                                    no_rule_resp, strlen(no_rule_resp));
                 log_info("[PROXY_NO_RULES] 503 sent on fd=%d (empty ephash)", pfe->fd);
               } else {
                 log_error("Default endpoint (ephash) is NULL!");
@@ -713,14 +718,14 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\"detail\":\"every endpoint of the route is down or circuit-broken\"}\r\n";
             fc_permit_release(&pfe->fc);
             pfe->lb_err_body_sent=1;
-            proxy_send_local_response(pfe,subset_down,sizeof(subset_down)-1);
+            sp_send_local_outage(pfe,503,subset_down,sizeof(subset_down)-1);
             return -1;
           }
           if (algorithm_selection<0) {
             static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             fc_permit_release(&pfe->fc);
             pfe->lb_err_body_sent=1;
-            proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
+            sp_send_local_outage(pfe,503,unavailable,sizeof(unavailable)-1);
             return -1;
           }
         }
@@ -748,7 +753,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: application/json\r\nConnection: close\r\n\r\n"
                       "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
-                  proxy_send_local_response(pfe, bad_salt, sizeof(bad_salt) - 1);
+                  sp_send_local_refusal(pfe, AI_GW_STAGE_FRAMING, 400, "invalid_cache_salt",
+                                        bad_salt, sizeof(bad_salt) - 1);
                   return -1;
                 }
                 if (policy_rc == 0)
@@ -817,7 +823,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: application/json\r\nConnection: close\r\n\r\n"
                       "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
-                  proxy_send_local_response(pfe, bad_salt, sizeof(bad_salt) - 1);
+                  sp_send_local_refusal(pfe, AI_GW_STAGE_FRAMING, 400, "invalid_cache_salt",
+                                        bad_salt, sizeof(bad_salt) - 1);
                   return -1;
                 }
                 if (policy_rc == 0)
@@ -922,7 +929,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\r\n"
                 "{\"error\":\"pd_overloaded\","
                 "\"detail\":\"all prefill endpoints at in-flight capacity\"}\r\n";
-              proxy_send_local_response(pfe, pd_429_resp, strlen(pd_429_resp));
+              sp_send_local_refusal(pfe, AI_GW_STAGE_CAPACITY, 429, "pd_overloaded",
+                                    pd_429_resp, strlen(pd_429_resp));
               pfe->lb_err_body_sent = 1;
             }
             return -1;
@@ -953,7 +961,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\","
                 "\"detail\":\"no healthy prefill or decode endpoint\"}\r\n";
-              proxy_send_local_response(pfe, pd_503_resp, strlen(pd_503_resp));
+              sp_send_local_outage(pfe, 503, pd_503_resp, strlen(pd_503_resp));
               pfe->lb_err_body_sent = 1;
               /* A decode hint the Tier-0 lookup may have written is not a
                * unit (none was taken); see the role-gate exit below. */
@@ -1184,7 +1192,7 @@ pd_fallback_normal:
                   "\r\n"
                   "{\"error\":\"no_healthy_backend\","
                   "\"detail\":\"all backend endpoints down or circuit-broken\"}\r\n";
-              proxy_send_local_response(pfe, lb_all_down_503, strlen(lb_all_down_503));
+              sp_send_local_outage(pfe, 503, lb_all_down_503, strlen(lb_all_down_503));
               pfe->lb_err_body_sent = 1;
             }
             return -1;  // No active endpoints available
@@ -1252,7 +1260,7 @@ pd_fallback_normal:
           static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
           fc_permit_release(&pfe->fc);
           pfe->lb_err_body_sent=1;
-          proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
+          sp_send_local_outage(pfe,503,unavailable,sizeof(unavailable)-1);
           return -1;
         }
         epip = tepval->eps[sel].xip;
@@ -1433,7 +1441,7 @@ pd_fallback_normal:
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\","
                 "\"detail\":\"all prefill endpoints unreachable\"}\r\n";
-              proxy_send_local_response(pfe, pd_503, strlen(pd_503)); }
+              sp_send_local_outage(pfe, 503, pd_503, strlen(pd_503)); }
             /* Clear EP indices so pd_cleanup() skips double-decrement */
             pfe->pd_prefill_ep_idx = -1;
             pfe->pd_decode_ep_idx  = -1;
@@ -1910,7 +1918,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                   "\r\n"
                   "{\"error\":\"service_unavailable\","
                   "\"detail\":\"all backend endpoints unreachable\"}\r\n";
-              proxy_send_local_response(pfe, err_503, strlen(err_503));
+              sp_send_local_outage(pfe, 503, err_503, strlen(err_503));
             }
             return -1;
           }
@@ -2003,7 +2011,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
               "\r\n"
               "{\"error\":\"service_unavailable\","
               "\"detail\":\"all backend endpoints unreachable\"}\r\n";
-          proxy_send_local_response(pfe, err_503, strlen(err_503));
+          sp_send_local_outage(pfe, 503, err_503, strlen(err_503));
         }
         if (sel) {
           ep_sel->n_eps = sel;

@@ -294,7 +294,8 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
       latency_ms = (int64_t)((now - stream->admit_mono_ns) / 1000000ULL);
   }
   /* A request record is emitted ONLY when the response actually progressed,
-   * which here means a backend :status was captured for this stream. A
+   * which here means a backend :status was captured for this stream, or the
+   * gateway answered it with an outage status (h2_send_local_outage). A
    * stream torn down before that — a client RST_STREAM mid-flight, a backend
    * that died before answering — releases its reservation and is charged
    * whatever arrived, but it never completed a response and must not be
@@ -3148,6 +3149,31 @@ proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
  * Returns 0 when handled on h2 (caller must NOT also do the H1 raw send); -1 when
  * pfe is not on an active h2 session (caller falls back to the H1 raw path).
  */
+/* The deny record of a refusal made on one stream outside the gate's verdict
+ * frame, with the identity the gate stamped on the stream. Taken before the
+ * answer: the answer can free the stream. AI-gateway connections only, as
+ * on HTTP/1.1. */
+static void
+h2_record_local_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                     int stage, int status_code, const char *model,
+                     const char *error_code)
+{
+  if (!pfe || !pfe->ai_gw_mode || !stream)
+    return;
+  ai_gw_record_local_deny(stage, stream->request_id, notify_worker_id(),
+                          stream->svc_ident, model, stream->tenant_id,
+                          stream->auth_key_id, stream->auth_user_id,
+                          status_code, error_code, pfe->l7_peer_ip,
+                          stream->l7_origin_ip,
+                          (int)stream->l7_trusted_hops,
+                          (int)stream->auth_src, stream->auth_net_identity,
+                          (int)stream->adm_priority,
+                          AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
+                                           stream->adm_objective_denied,
+                                           stream->adm_hint_not_applied),
+                          stream->adm_objective);
+}
+
 int
 proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
                            const char *location, const char *body)
@@ -3189,6 +3215,19 @@ proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
   hdrs[nvlen].valuelen = 1;
   hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
   nvlen++;
+
+  /* The records, as for every answer the gateway writes itself: a REJECT or
+   * a no-match is a refusal at ROUTE; a REDIRECT completes the request with
+   * its 3xx, which the stream's settle records. Before the answer, which can
+   * free the stream. */
+  proxy_h2_stream_t *l7_stream = find_stream(pfe->h2_session, sid);
+  if (l7_stream) {
+    if (location && location[0])
+      l7_stream->metric_response_status = status_code;
+    else
+      h2_record_local_deny(pfe, l7_stream, AI_GW_STAGE_ROUTE, status_code,
+                           l7_stream->effective_model, "l7_policy_reject");
+  }
 
   /* NULL data provider => END_STREAM is set on the HEADERS frame (no body). */
   int rv = nghttp2_submit_response(pfe->h2_session->session, sid,
@@ -3397,6 +3436,33 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     blen = 0;
   return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
                             NULL, 0);
+}
+
+/* A refusal the stream's dispatch made outside the gate's verdict frame,
+ * before any backend was chosen (route, framing): the deny record
+ * (h2_record_local_deny), then the answer. The class counter has no HTTP/2
+ * responses at all (F-7). */
+static int
+h2_send_local_refusal(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                      int stage, int status_code, const char *model,
+                      const char *error_code, const char *error_msg)
+{
+  h2_record_local_deny(pfe, stream, stage, status_code, model, error_code);
+  return proxy_h2_send_ai_deny(pfe, stream, status_code, 0, 0, error_code,
+                               error_msg);
+}
+
+/* An outage answer on one stream: no backend could take it. The status is
+ * the stream's response, so its settle records a completion with it,
+ * outcome "completed", as the HTTP/1.1 twin (sp_send_local_outage) does. */
+static int
+h2_send_local_outage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                     int status_code, const char *error_code,
+                     const char *error_msg)
+{
+  stream->metric_response_status = status_code;
+  return proxy_h2_send_ai_deny(pfe, stream, status_code, 0, 0, error_code,
+                               error_msg);
 }
 
 /* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
@@ -4850,7 +4916,7 @@ h2_have_tepval:
       /* Logged first: lookup_model may point into the stream. */
       log_info("[MODEL_ROUTING][HTTP/2] 503 for model='%s' stream=%d",
                lookup_model, stream_id);
-      proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0,
+      h2_send_local_refusal(pfe, stream, AI_GW_STAGE_ROUTE, 503, lookup_model,
                             "model_unavailable",
                             "no backend pool for this model");
       return 0;
@@ -4986,7 +5052,8 @@ h2_have_tepval:
        * L7 dispatch, so this stream was left unanswered. The permit goes
        * first: the answer can free the stream. */
       fc_permit_release(&stream->fc);
-      proxy_h2_send_ai_deny(pfe, stream, 400, 0, 0, "invalid_cache_salt",
+      h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 400,
+                            stream->effective_model, "invalid_cache_salt",
                             "cache_salt must be a non-empty JSON string of at most 63 bytes");
       return 0;
     }
@@ -5037,8 +5104,8 @@ h2_have_tepval:
       ep_idx = sp_mcp_request_select(tepval, pfe);
       if (ep_idx < 0) {
         fc_permit_release(&stream->fc);
-        proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "no_healthy_backend",
-                              "every endpoint of the route is down or circuit-broken");
+        h2_send_local_outage(pfe, stream, 503, "no_healthy_backend",
+                             "every endpoint of the route is down or circuit-broken");
         return 0;
       }
     } else {
@@ -5130,8 +5197,8 @@ h2_have_tepval:
    * probe is taken here. */
   if (sp_route_subset(pfe, tepval) && !sp_mcp_reserve_probe(tepval, ep_idx)) {
     fc_permit_release(&stream->fc);
-    proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "no_healthy_backend",
-                          "the route's endpoint is circuit-broken");
+    h2_send_local_outage(pfe, stream, 503, "no_healthy_backend",
+                         "the route's endpoint is circuit-broken");
     return 0;
   }
   sp_pool_hold(&pfe->epv, tepval);

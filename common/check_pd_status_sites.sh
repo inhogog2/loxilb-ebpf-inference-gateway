@@ -12,9 +12,11 @@
 # is missing from the responses-by-status class counter and the TTFB sample.
 #
 # The record (status, class counter, TTFB sample) has one writer,
-# proxy_note_client_response, latched once per request. Every site that
-# answers the client with a backend reply calls it: the capture, and each
-# relay of the prefill reply.
+# proxy_note_response_, latched once per request, reached through
+# proxy_note_client_response for a backend reply (TTFB sampled) and
+# proxy_note_local_answer for the gateway's own answers (check_local_answers.sh).
+# Every site that answers the client with a backend reply calls the first:
+# the capture, and each relay of the prefill reply.
 #
 #   sh check_pd_status_sites.sh    (from anywhere; exit 1 on a violation)
 set -eu
@@ -48,12 +50,12 @@ if ! printf '%s\n' "$cap" | grep -q 'proxy_note_client_response(rfd_ent, status)
   fail=1
 fi
 
-# 1c. The helper is the only writer of the class counters and the TTFB sample,
+# 1c. The writer is the only one of the class counters and the TTFB sample,
 #     so no path can record a response around it (or twice).
-h_from=$(grep -n '^proxy_note_client_response(' ./sockproxy_http.c | head -1 | cut -d: -f1)
+h_from=$(grep -n '^proxy_note_response_(' ./sockproxy_http.c | head -1 | cut -d: -f1)
 h_to=$(awk -v f="${h_from:-0}" 'NR > f && /^}/ {print NR; exit}' ./sockproxy_http.c)
-if [ -z "$h_from" ] || ! sed -n "${h_from},${h_to}p" ./sockproxy_http.c | grep -q 'resp_note_claim(&pfe->metric_resp_noted)'; then
-  echo "sockproxy_http.c: proxy_note_client_response must take the once-per-request latch (resp_note_claim)"
+if [ -z "$h_from" ] || ! sed -n "${h_from},${h_to}p" ./sockproxy_http.c | grep -q 'resp_note_take(&pfe->metric_resp_noted'; then
+  echo "sockproxy_http.c: proxy_note_response_ must take the once-per-request latch (resp_note_take)"
   fail=1
 fi
 outside=$(grep -nE 'global_stats\.http_(responses_total|status_[1-5]xx)|record_latency_sample\(' ./*.c \
@@ -61,7 +63,7 @@ outside=$(grep -nE 'global_stats\.http_(responses_total|status_[1-5]xx)|record_l
             | awk -F: -v a="${h_from:-0}" -v b="${h_to:-0}" '!($1 == "./sockproxy_http.c" && $2 >= a && $2 <= b)' || true)
 if [ -n "$outside" ]; then
   printf '%s\n' "$outside"
-  echo "  ^ a response record outside proxy_note_client_response"
+  echo "  ^ a response record outside proxy_note_response_"
   fail=1
 fi
 

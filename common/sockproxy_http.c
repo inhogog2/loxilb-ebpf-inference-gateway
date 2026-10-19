@@ -400,6 +400,97 @@ proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
       SP_LOCAL_SEND_RETRY_MAX);
 }
 
+/* ---- responses the gateway writes itself -----------------------------------
+ *
+ * A request answered by the gateway instead of a backend is recorded like
+ * any response the client receives (status and class, no TTFB sample:
+ * proxy_note_local_answer), and once as a request, by what the answer means:
+ *
+ *   - a refusal, decided before any backend was chosen: a deny record at its
+ *     stage (llb_ai_record_deny), outcome "denied";
+ *   - an outage, no backend able to take it: a completion with the status
+ *     written (llb_ai_record_request), outcome "completed", so the error
+ *     ratio sees it, as it sees a backend's own 5xx.
+ *
+ * The request record is for AI-gateway connections only, the population
+ * whose completions are recorded; the class counter is every HTTP/1.1
+ * response, as it is for backend replies. check_local_answers.sh holds every
+ * local send to one of these, or to its allowlist with the reason. */
+
+/* The model the refused request itself named. proxy_effective_model falls
+ * back to the previous response's snapshot on a kept connection, which a
+ * request refused before naming one would wrongly take. */
+static const char *
+proxy_refused_model(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->effective_model[0] != '\0')
+    return pfe->effective_model;
+  if (pfe->x_model_header[0] != '\0')
+    return pfe->x_model_header;
+  return pfe->prefix_key.model;
+}
+
+void
+proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
+                        const char *code)
+{
+  char svc_ident[64];
+
+  if (!pfe || pfe->odir != 0 || !pfe->ai_gw_mode)
+    return;
+  proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
+  ai_gw_record_local_deny(stage, proxy_request_id(pfe), notify_worker_id(),
+                          svc_ident, proxy_refused_model(pfe),
+                          pfe->tenant_id, pfe->auth_key_id,
+                          pfe->auth_user_id, status, code,
+                          pfe->l7_peer_ip, proxy_origin_ip(pfe),
+                          (int)proxy_origin_trusted_hops(pfe),
+                          (int)pfe->auth_src, pfe->auth_net_identity,
+                          (int)pfe->adm_priority,
+                          AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
+                                           pfe->adm_objective_denied,
+                                           pfe->adm_hint_not_applied),
+                          pfe->adm_objective);
+}
+
+/* The records of an answer that completes the request with the status
+ * written (an outage, a backend failure, a configured redirect). The
+ * completion keeps the normal guard: a later teardown must not emit it a
+ * second time, and an already-started response must not be overwritten. */
+void
+proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status)
+{
+  int owed = pfe->odir == 0 && pfe->ai_gw_mode &&
+             !pfe->metric_ai_recorded && pfe->metric_response_status == 0;
+
+  proxy_note_local_answer(pfe, status);
+  if (owed) {
+    pfe->metric_response_status = status;
+    proxy_ai_record_completion(pfe);
+  }
+}
+
+/* A refusal decided before any backend was chosen (route, framing, P/D
+ * capacity), written on the client socket. `status` is the one the
+ * response carries. Returns proxy_send_local_response's result. */
+int
+sp_send_local_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
+                      const char *code, const void *buf, size_t len)
+{
+  proxy_note_local_answer(pfe, status);
+  proxy_record_local_deny(pfe, stage, status, code);
+  return proxy_send_local_response(pfe, buf, len);
+}
+
+/* An outage answer: no backend could take the request. */
+int
+sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
+                     size_t len)
+{
+  proxy_record_local_completion(pfe, status);
+  return proxy_send_local_response(pfe, buf, len);
+}
+
 /* The answer to a request no backend took. It carries its length, so the
  * client knows it is whole without waiting for the close that follows. */
 int
@@ -427,14 +518,8 @@ proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
   }
   /* This response bypasses the backend parser, which normally captures the
    * status that completion/teardown audit relies on. Record the terminal
-   * failure even if the client cannot receive the whole local response.
-   * Keep the normal completion guard: a later teardown must not emit it a
-   * second time, and an already-started response must not be overwritten. */
-  if (pfe->odir == 0 && pfe->ai_gw_mode &&
-      !pfe->metric_ai_recorded && pfe->metric_response_status == 0) {
-    pfe->metric_response_status = 502;
-    proxy_ai_record_completion(pfe);
-  }
+   * failure even if the client cannot receive the whole local response. */
+  proxy_record_local_completion(pfe, 502);
   return proxy_send_local_response(pfe, resp, (size_t)n);
 }
 
@@ -1297,17 +1382,18 @@ proxy_usage_ops(proxy_fd_ent_t *pfe)
   return &pd_dialect_plain;
 }
 
-/* Record the response the client receives, once per request: its status
- * (metric_response_status), the responses-by-status class counter and the
- * TTFB sample, taken now. Called by the backend response capture and by every
- * path that answers the client from the P/D prefill leg, whose reply the
- * capture skips, just before it relays; so TTFB is the client's first byte
- * whichever leg delivered it. The latch makes a second call for the same
- * request a no-op (sockproxy_resp_note.h). Returns 1 when it recorded. */
-int
-proxy_note_client_response(proxy_fd_ent_t *pfe, uint16_t status)
+/* The one writer of the client-visible response record: the status
+ * (metric_response_status), the responses-by-status class counter and, when
+ * sample_ttfb, the TTFB sample, taken now. Once per request: the latch makes
+ * a second call for the same request a no-op (sockproxy_resp_note.h).
+ * Returns 1 when it recorded. Reached only through the two wrappers below,
+ * whose names say which kind of response a site records. */
+static int
+proxy_note_response_(proxy_fd_ent_t *pfe, uint16_t status, int sample_ttfb)
 {
-  if (!pfe || !resp_note_claim(&pfe->metric_resp_noted)) return 0;
+  int take = pfe ? resp_note_take(&pfe->metric_resp_noted, sample_ttfb) : 0;
+
+  if (!take) return 0;
   pfe->metric_response_status = status;
   // Every final or interim status counts in the total; 1xx has no class.
   atomic_fetch_add(&global_stats.http_responses_total, 1);
@@ -1321,11 +1407,34 @@ proxy_note_client_response(proxy_fd_ent_t *pfe, uint16_t status)
   // TTFB latency — recorded unconditionally (see request-start capture in
   // handle_on_message_complete); the histogram is a first-class L7 metric,
   // not gated behind the optional HAVE_HTTP_TRACE trace subsystem.
-  if (pfe->metric_req_start_ns > 0) {
+  if ((take & RESP_NOTE_TTFB) && pfe->metric_req_start_ns > 0) {
     uint64_t latency_us = (get_timestamp_ns() - pfe->metric_req_start_ns) / 1000;
     record_latency_sample(latency_us);
   }
   return 1;
+}
+
+/* Record a backend reply the client receives, with its TTFB sample. Called
+ * by the backend response capture and by every path that answers the client
+ * from the P/D prefill leg, whose reply the capture skips, just before it
+ * relays; so TTFB is the client's first byte whichever leg delivered it. */
+int
+proxy_note_client_response(proxy_fd_ent_t *pfe, uint16_t status)
+{
+  return proxy_note_response_(pfe, status, 1);
+}
+
+/* Record a response the gateway wrote itself to its client, in place of a
+ * backend: a refusal or an outage answer. Status and class, no TTFB sample:
+ * the histogram has no labels, and a refusal storm would pull the inference
+ * latency distribution down. Called before the answer is written, so a
+ * backend reply racing it on another worker cannot be recorded instead. An
+ * answer written on a backend leg is no client's response. */
+int
+proxy_note_local_answer(proxy_fd_ent_t *pfe, uint16_t status)
+{
+  if (!pfe || pfe->odir != 0) return 0;
+  return proxy_note_response_(pfe, status, 0);
 }
 
 int
@@ -8767,7 +8876,9 @@ handle_on_message_begin(llhttp_t* parser)
  * {"error","retry_after"} body for rate/reserve refusals, the
  * {"error","message"} body otherwise, Retry-After when the gate set one.
  * Emission goes through the bounded local sender so a TLS-terminated
- * listener answers with a TLS record, never plaintext on the raw fd. */
+ * listener answers with a TLS record, never plaintext on the raw fd.
+ * Records the response; the request record is the caller's: the gate's
+ * verdict frame (ai_gw_admit), or sp_h1_send_framing_deny. */
 void
 sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                       int retry_body, const char *code, const char *msg)
@@ -8777,12 +8888,24 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
   n = sp_h1_format_admit_deny(resp_buf, sizeof(resp_buf), status,
                               retry_after, retry_body, code, msg);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
+    proxy_note_local_answer(pfe, (uint16_t)status);
     if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
       log_error("[AIGateway] fd=%d failed to send complete bounded %d "
                 "refusal", pfe->fd, status);
   } else {
     shutdown(pfe->fd, SHUT_RDWR);
   }
+}
+
+/* A refusal of a request that cannot be admitted as framed (FRAMING stage):
+ * an oversized body, or one whose model is out of reach. Decided outside the
+ * gate's verdict frame, so the deny record is taken here. */
+static void
+sp_h1_send_framing_deny(proxy_fd_ent_t *pfe, int status, const char *code,
+                        const char *msg)
+{
+  proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status, code);
+  sp_h1_send_admit_deny(pfe, status, 0, 0, code, msg);
 }
 
 /* A capacity refusal: the request passed policy and there is no room for it.
@@ -8832,6 +8955,8 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     status_line, blen, retry_after, inflight, queued, limit,
     keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
+    /* The request record is the caller's (ai_gw_record_capacity_deny). */
+    proxy_note_local_answer(pfe, (uint16_t)status);
     rc = keep ? proxy_send_local_response(pfe, resp_buf, (size_t)n)
               : proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n);
     if (rc != 0)
@@ -9563,6 +9688,23 @@ sp_h1_pre_dispatch_admit(int fd, proxy_fd_ent_t *pfe)
   return sp_h1_admit_apply(pfe, hent, &req, "streamed");
 }
 
+/* A streamed request is gated before message-complete, which is where a
+ * request's response record is re-opened (handle_on_message_complete); on a
+ * kept connection the latch still holds the previous request's, and a
+ * refusal here would be a latched no-op. Re-opened before the gate. The
+ * store cannot lose the previous response's record, pipelined or not: that
+ * record is owed only while the latch reads 0, which the store leaves 0. If a
+ * refusal then takes the latch first, the previous reply is never recorded,
+ * and never delivered either: a streamed request cannot keep its connection
+ * after a refusal (sp_h1_refusal_keeps_connection). The rest of the request's metric fields are still re-armed
+ * at message-complete. */
+static void
+sp_h1_stream_response_rearm(proxy_fd_ent_t *pfe)
+{
+  if (pfe->odir == 0)
+    resp_note_rearm(&pfe->metric_resp_noted);
+}
+
 /* An oversized JSON request whose top-level model did not appear inside
  * the bounded routing prefix. On an enforcing service the model is what
  * the credential is authorized against, so without it the request cannot
@@ -9591,8 +9733,7 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
     snprintf(msg, sizeof(msg),
              "model must appear within the first %u body bytes",
              SP_JSON_ROUTE_PREFIX_MAX);
-    sp_h1_send_admit_deny(pfe, 413, 0, 0,
-                          "request_too_large_for_admission", msg);
+    sp_h1_send_framing_deny(pfe, 413, "request_too_large_for_admission", msg);
     log_debug("[AIGateway] fd=%d streamed request refused 413: no top-level "
              "model within %u buffered body bytes (content_length=%zu)",
              fd, SP_JSON_ROUTE_PREFIX_MAX, pfe->http_content_length);
@@ -9601,6 +9742,8 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
 
   {
     static const char model_late[] = SP_MODEL_REQUIRED_EARLY_RESPONSE;
+    proxy_note_local_answer(pfe, 400);
+    proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400, "model_required_early");
     if (proxy_send_local_response_and_shutdown(
             pfe, model_late, sizeof(model_late) - 1) != 0)
       log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
@@ -13154,6 +13297,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 if (proxy_send_local_100_continue(pfe) != 0)
                   return -1;
                 if (route_body_at_limit) {
+                  sp_h1_stream_response_rearm(pfe);
                   sp_h1_stream_model_unresolvable(fd, pfe);
                   pfe->lb_err_body_sent = 1;
                   return -1;
@@ -13203,6 +13347,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
              * in the callback and is not gated again. */
             if (pfe->is_streamable && !pfe->http_pok &&
                 !pfe->ai_gw_stream_gated) {
+              sp_h1_stream_response_rearm(pfe);
               if (sp_h1_pre_dispatch_admit(fd, pfe) != 0) {
                 pfe->lb_err_body_sent = 1;
                 return -1;   /* refused: response sent, socket shut */
@@ -13430,9 +13575,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               proxy_map_ent_t *ovf_head = (proxy_map_ent_t *)pfe->head;
               proxy_epval_t *ovf_pool0 = sp_pool_first(ovf_head);
               if (pfe->odir == 0 && ovf_pool0 && ovf_pool0->ai_gw_mode) {
-                sp_h1_send_admit_deny(pfe, 413, 0, 0, "request_body_too_large",
-                                      "request body exceeds the gateway's "
-                                      "buffered maximum; send a Content-Length");
+                sp_h1_send_framing_deny(pfe, 413, "request_body_too_large",
+                                        "request body exceeds the gateway's "
+                                        "buffered maximum; send a Content-Length");
                 pfe->lb_err_body_sent = 1;
                 log_debug("[AIGateway] fd=%d request refused 413: %zu buffered "
                          "bytes without a streamable Content-Length "

@@ -457,6 +457,15 @@ check_client_eof_keep:
 check_pd_status_sites:
 	sh ./check_pd_status_sites.sh
 
+# A response the gateway writes itself is recorded as the client receives it
+# (status and class, no TTFB sample), and once as a request: a staged
+# refusal, or an outage completion. Every local send records or is
+# allowlisted with its reason; each rule is mutation-tested.
+.PHONY: check_local_answers
+check_local_answers:
+	sh ./check_local_answers.sh
+	sh ./check_local_answers_mutations.sh
+
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
 # sockproxy_cookie.h primitives, links -lssl -lcrypto (the already-linked HMAC).
