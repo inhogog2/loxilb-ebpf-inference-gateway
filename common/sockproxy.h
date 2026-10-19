@@ -2623,6 +2623,8 @@ uint32_t pd_connect_retry_budget(int pd_disagg_enabled, uint32_t kv_exact_mode);
 int pd_parked_pop_head(pd_parked_fifo_t *q, pd_parked_ent_t *out);
 int pd_parked_peek_head(const pd_parked_fifo_t *q, pd_parked_ent_t *out);
 int pd_parked_remove_fd(pd_parked_fifo_t *q, int want_fd, uint64_t want_gen);
+int pd_parked_holds(const pd_parked_fifo_t *q, int fd, uint64_t gen);
+int pd_parked_turn_pending(proxy_epval_t *t, const proxy_fd_ent_t *p);
 /* runtime max-park bound (env LLB_PD_MAX_PARK_SEC; 0/unset = reap off). */
 uint32_t pd_max_park_sec(void);
 /* runtime per-EP parked-FIFO depth (env LLB_PD_QUEUE_DEPTH_PER_EP;

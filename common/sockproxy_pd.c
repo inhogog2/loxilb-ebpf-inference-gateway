@@ -1629,6 +1629,37 @@ pd_parked_peek_head(const pd_parked_fifo_t *q, pd_parked_ent_t *out)
   return 1;
 }
 
+/* 1 when an entry for (fd, gen) is still in the FIFO, 0 otherwise. O(count).
+ * A parked request's entry leaves only by a pop for its turn (slot return,
+ * drain) or by removal at cleanup or reap, so a resume that still finds its
+ * entry is not its turn. */
+int
+pd_parked_holds(const pd_parked_fifo_t *q, int fd, uint64_t gen)
+{
+  if (!q) return 0;
+  uint16_t idx = q->head;
+  for (uint16_t k = 0; k < q->count; k++) {
+    if (q->slot[idx].fd == fd && q->slot[idx].gen == gen) return 1;
+    idx = (uint16_t)((idx + 1) % PD_MAX_QUEUE_DEPTH);
+  }
+  return 0;
+}
+
+/* 1 while a parked request's own entry is still in its FIFO: a resume now is
+ * not its turn. Takes pd_parked_lock. */
+int
+pd_parked_turn_pending(proxy_epval_t *t, const proxy_fd_ent_t *p)
+{
+  int held = 0;
+
+  if (!t || !p || p->park_ep_idx < 0 || p->park_ep_idx >= t->n_eps) return 0;
+  pthread_mutex_lock(&t->pd_parked_lock);
+  held = pd_parked_holds(&t->pd_parked[p->park_ep_idx], p->fd,
+                         atomic_load_explicit(&p->gen, memory_order_relaxed));
+  pthread_mutex_unlock(&t->pd_parked_lock);
+  return held;
+}
+
 /* Remove the entry matching want_fd (and, if want_gen!=0, also want_gen) from the
  * FIFO regardless of position, preserving FIFO order of the survivors. Returns 1
  * if removed, 0 if not found. O(count). Used by the reap path to drop a specific

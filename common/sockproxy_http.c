@@ -13077,6 +13077,16 @@ pd_resume_parked(int fd)
    * (FC_RESUME_WAIT returned above): it stays parked as it is (reads paused,
    * hang-up armed) until its turn, its deadline or its client's departure. */
 
+  /* The same for the P/D FIFO: its entry is popped for its turn (a slot
+   * returned, a drain) before the wake. A wake of another kind meanwhile (a
+   * late one of an earlier request on this connection: the generation is the
+   * connection's) finds the entry still there, and leaving the park now would
+   * strand the entry: a later pop would wake whatever request the connection
+   * holds then, out of turn, and the head's turn would be spent on it. */
+  if (pd_parked_turn_pending((proxy_epval_t *)pfe->epv, pfe)) {
+    return;
+  }
+
   /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
   pfe->read_paused = 0;
   sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);

@@ -300,6 +300,40 @@ static void queues(void)
   puts("PASS bounded FIFO/overflow, unreserved park, slot-free wake/owner re-drive, "
        "production FIFO generation/remove primitives");
 }
+/* A wake that is not a parked request's turn (a late one of an earlier
+ * request on the same connection: (fd, gen) names the connection) leaves it
+ * parked with its FIFO entry, so the entry is popped for this request's own
+ * turn and never for a later one on the connection. */
+static void resume_not_its_turn(void)
+{
+  init_admission_epval(&ev, 1);
+  proxy_fd_ent_t h, p;
+  int ep = -1;
+  uint32_t token = 0;
+  init_admission_pfe(&h, 30);
+  assert(!pd_reserve_prefill(&ev, &h, &ep, 0, 1));
+  pd_load_commit(&ev, &token, ep);
+  init_admission_pfe(&p, 31);
+  p.epv = &ev;
+  assert(pd_reserve_prefill(&ev, &p, &ep, 0, 1) == PD_PREFILL_PARKED);
+  p.pd_phase = PD_PHASE_PARKED;
+  uint64_t gen = atomic_load(&p.gen);
+  assert(p.park_ep_idx == 0 && pd_parked_holds(&ev.pd_parked[0], 31, gen));
+  assert(!pd_parked_holds(&ev.pd_parked[0], 31, gen + 1));
+  int prev = nwoken;
+  /* The check pd_resume_parked makes before it leaves the park. */
+  assert(pd_parked_turn_pending(&ev, &p));
+  assert(ev.pd_parked[0].count == 1);
+  /* Its turn: the returned unit pops its entry and wakes it. */
+  pd_load_release(&ev, &token);
+  assert(nwoken == prev + 1 && woken[prev] == 31);
+  assert(!ev.pd_parked[0].count && !pd_parked_turn_pending(&ev, &p));
+  p.pd_phase = PD_PHASE_NONE;
+  p.park_ep_idx = -1;
+  registry[30] = registry[31] = NULL;
+  clean(&ev);
+  puts("PASS a parked request whose entry is still queued is not at its turn; popped, it is");
+}
 static void real_cleanup(void)
 {
   proxy_fd_ent_t *p = calloc(1, sizeof(*p));
@@ -450,6 +484,7 @@ int main(int argc, char **argv)
   capacity();
   ownership();
   queues();
+  resume_not_its_turn();
   real_cleanup();
   return 0;
 #else
