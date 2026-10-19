@@ -142,5 +142,23 @@ if [ "$calls" -lt 1 ] || [ "$calls" != "$handled" ]; then
   fail=1
 fi
 
+# 5. A completed decode leg is recorded by its status. In sockproxy_http.c the
+#    only completion allowed a literal success (0) is the SSE [DONE] one, whose
+#    stream exists only for a 2xx event-stream; the non-SSE completions (the
+#    Content-Length/chunked one and the decode-backend EOF one) take
+#    pd_decode_error_phase(metric_response_status).
+lit0=$(awk '/llb_ai_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
+            if (buf ~ /, 0\);/ && buf !~ /sse_model/) print NR": "buf}' ./sockproxy_http.c)
+if [ -n "$lit0" ]; then
+  echo "sockproxy_http.c: a P/D completion records a literal success (0) whatever its status; use pd_decode_error_phase():"
+  printf '%s\n' "$lit0"
+  fail=1
+fi
+n=$(grep -c 'pd_decode_error_phase([a-z_]*->metric_response_status)' ./sockproxy_http.c || true)
+if [ "$n" != "2" ]; then
+  echo "sockproxy_http.c: expected the two non-SSE decode completions to use pd_decode_error_phase(...->metric_response_status); found $n"
+  fail=1
+fi
+
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status)"

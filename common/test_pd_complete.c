@@ -362,6 +362,29 @@ test_prefill_status_verdict(void)
   printf("  [PASS] pd_prefill_status_verdict: 4xx relay, 5xx/408/429/unknown/truncated decode\n");
 }
 
+/* pd_decode_error_phase: a completed decode leg is recorded by the status its
+ * client received. An unread status is its own outcome (7), never a success. */
+static void
+test_decode_error_phase(void)
+{
+  static const struct { int status, phase; } cases[] = {
+    {   0, 7 }, { 100, 7 }, { 199, 7 },            /* no final status line read */
+    { 200, 0 }, { 204, 0 }, { 301, 0 }, { 399, 0 }, /* complete / success */
+    { 400, 6 }, { 404, 6 }, { 429, 6 }, { 499, 6 }, /* decode / rejected */
+    { 500, 2 }, { 502, 2 }, { 503, 2 }, { 599, 2 }, /* decode / error */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    if (pd_decode_error_phase(cases[i].status) != cases[i].phase) {
+      fprintf(stderr, "pd_decode_error_phase(%d) = %d, want %d\n", cases[i].status,
+              pd_decode_error_phase(cases[i].status), cases[i].phase);
+      assert(0);
+    }
+  }
+  /* composed with the parser: a status line too short to read is unknown */
+  assert(pd_decode_error_phase(pd_http_resp_status((const uint8_t *)"HTTP/1.1 5", 10)) == 7);
+  printf("  [PASS] pd_decode_error_phase: 2xx/3xx 0, 4xx 6, 5xx 2, unread 7\n");
+}
+
 int
 main(void)
 {
@@ -378,6 +401,7 @@ main(void)
   test_http_resp_status();
   test_resp_error_excerpt();
   test_prefill_status_verdict();
+  test_decode_error_phase();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }

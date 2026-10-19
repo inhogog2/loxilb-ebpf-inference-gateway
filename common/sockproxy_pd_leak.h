@@ -219,6 +219,30 @@ pd_prefill_status_verdict(int status, int truncated)
           !truncated) ? PD_PR_RELAY : PD_PR_DECODE;
 }
 
+/*
+ * pd_decode_error_phase - the llb_ai_pd_record error_phase of a P/D request
+ * whose decode leg delivered its whole response, from the status the client
+ * received (the decode leg's; the prefill reply is not captured).
+ *
+ *   2xx, 3xx -> 0  complete / success
+ *   4xx      -> 6  decode / rejected  (origin refused; relayed verbatim)
+ *   5xx      -> 2  decode / error
+ *   0, 1xx   -> 7  decode / unknown   (no final status line was read)
+ *
+ * An unknown status is not a success. The capture reads the status line at
+ * the start of the decode leg's first read; a first read of 16 bytes or less,
+ * a status line split across reads, or a reply that is not HTTP/1.x leaves it
+ * unread, and no other record names that request's outcome.
+ */
+static inline int
+pd_decode_error_phase(int status)
+{
+  if (status < 200) return 7;
+  if (status < 400) return 0;
+  if (status < 500) return 6;
+  return 2;
+}
+
 /* PD_MSG_END_TAIL_KEEP - bytes of trailing context carried between successive
  * reads so a message-end terminator that straddles two TCP segments is still
  * detected. Must be >= the longest terminator pd_detect_http_msg_end matches:

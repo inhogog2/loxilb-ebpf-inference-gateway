@@ -543,6 +543,9 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                        3 = decode   / timeout   (decode leg produced no byte)
  *                        4 = prefill  / error     (prefill leg failed or died)
  *                        5 = prefill  / rejected  (origin refused; relayed verbatim)
+ *                        6 = decode   / rejected  (origin refused; relayed verbatim)
+ *                        7 = decode   / unknown   (decode completed; its status
+ *                                                  line was never read)
  *
  * Returns void.
  */

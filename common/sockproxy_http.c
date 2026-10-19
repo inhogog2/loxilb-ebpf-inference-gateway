@@ -2304,7 +2304,8 @@ skip_deferred_masking:
         }
         int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
         const char *ns_model = proxy_effective_model(rfd_ent);
-        llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv, 0);
+        llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv,
+                         pd_decode_error_phase(rfd_ent->metric_response_status));
         rfd_ent->pd_phase = PD_PHASE_COMPLETE;
         /* The disaggregated response is complete: its capacity units go back
          * here, not at the teardown of a connection that may stay open. */
@@ -6376,7 +6377,8 @@ proxy_pdestroy(void *priv)
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
                      pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
-            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
+            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv,
+                             pd_decode_error_phase(client_pfe->metric_response_status));
           }
           pd_cleanup(client_pfe);
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
