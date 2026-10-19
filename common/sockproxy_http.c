@@ -1950,6 +1950,8 @@ skip_deferred_masking:
                   "Content-Type: application/json\r\n"
                   "Connection: close\r\n\r\n"
                   "{\"error\":\"pd_pool_unavailable\",\"detail\":\"decode endpoint unreachable\"}";
+              /* The client's answer: completed with the status written. */
+              proxy_record_local_completion(rfd_ent, 503);
               if (rfd_ent->fd > 0) {
                 /* Use SSL_write when client connection is TLS to avoid
                  * sending plaintext over an encrypted channel (T9 fix). */
@@ -6255,6 +6257,8 @@ proxy_pdestroy(void *priv)
               llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv,
                                4 /*prefill error*/);
             }
+            /* The client's answer: completed with the status written. */
+            proxy_record_local_completion(client_pfe, 503);
             if (client_pfe->fd > 0) {
               send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
                    MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -6448,6 +6452,8 @@ proxy_pdestroy(void *priv)
                     client_pfe->fd, pfe->fd);
           atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
           atomic_fetch_add(&global_stats.pd_decode_zero_byte_eof, 1);
+          /* The client's answer: completed with the status written. */
+          proxy_record_local_completion(client_pfe, 502);
           if (client_pfe->fd > 0) {
             send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
                  MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -10195,6 +10201,10 @@ handle_on_message_complete(llhttp_t* parser)
             "{\"error\":\"Request blocked by LlamaFirewall\",\"reason\":\"Security threat detected\"}\r\n";
 
           size_t response_len = strlen(block_response);
+          /* A refusal before any backend was chosen, recorded as every
+           * answer the gateway writes itself, at its own stage. */
+          proxy_note_local_answer(pfe, 403);
+          proxy_record_local_deny(pfe, AI_GW_STAGE_SECURITY, 403, "llamafirewall_block");
           ssize_t sent = send(pfe->fd, block_response, response_len, MSG_NOSIGNAL);
 
           if (sent > 0) {
@@ -10376,6 +10386,8 @@ handle_on_message_complete(llhttp_t* parser)
                 "Connection: close\r\n"
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\",\"detail\":\"decode response processing failed\"}";
+            /* The client's answer: completed with the status written. */
+            proxy_record_local_completion(client_pfe, 503);
             if (client_pfe->fd > 0) {
               /* Use SSL_write when client connection is TLS to avoid
                * sending plaintext over an encrypted channel (T9 fix). */
@@ -12620,6 +12632,9 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
           "\r\n"
           "{\"error\":\"backend_unreachable\","
           "\"detail\":\"the selected backend endpoint did not accept the connection\"}\r\n";
+      /* No backend took the request: completed with the status written,
+       * as proxy_send_backend_unreachable records it. */
+      proxy_record_local_completion(client, 502);
       send(client->fd, lb_502, sizeof(lb_502) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
       client->connect_wait = 0;
     }

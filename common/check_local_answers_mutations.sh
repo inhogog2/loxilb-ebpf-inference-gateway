@@ -98,18 +98,32 @@ fresh
 mut sockproxy_http.c 'if (proxy_send_local_response(pfe, response, sizeof(response) - 1) != 0) {' 'if (sp_send_raw(pfe, response, sizeof(response) - 1) != 0) {'
 expect "rule 1: an allowlist entry that matches nothing" "allowlist entry covers 1 call(s), found 0"
 
-# Rule 1b: a new P/D dialect answer.
+# Rule 1b: a raw write of a built response records first.
 fresh
-mut sockproxy_pd_vllm.c '                        size_t orig_body_len)
-{' '                        size_t orig_body_len)
-{
-  static const char pd_new_err[] = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-  (void)pd_new_err;'
-expect "rule 1b: a P/D answer built in an unlisted function" "the functions that build a response are not the listed ones"
+mut sockproxy_http.c '      proxy_record_local_completion(client, 502);
+' ''
+expect "rule 1b: the connect-failure 502 written raw without its record" "sockproxy_http.c:proxy_backend_connect_event:raw:lb_502"
 
 fresh
-mut sockproxy_pd_sglang.c '"HTTP/1.1 502 Bad Gateway\r\n"' '"HTTP/2 502\r\n"'
-expect "rule 1b: a listed P/D function that no longer builds one" "the functions that build a response are not the listed ones"
+mut sockproxy_pd_sglang.c '  proxy_record_local_completion(client_pfe, 502);
+' ''
+expect "rule 1b: a SGLang pair abort written raw without its record" "sockproxy_pd_sglang.c:pd_sg_abort_pair:raw:pd_sg_err"
+
+fresh
+mut sockproxy_pd_vllm.c '    proxy_record_local_completion(client_pfe, 503);
+' ''
+expect "rule 1b: the vLLM prefill failover 503 written raw without its record" "sockproxy_pd_vllm.c:pd_retry_prefill:raw:pd_prefill_err"
+
+fresh
+mut sockproxy_http.c '          proxy_note_local_answer(pfe, 403);
+          proxy_record_local_deny(pfe, AI_GW_STAGE_SECURITY, 403, "llamafirewall_block");
+' ''
+expect "rule 1b: the LlamaFirewall block written raw without its record" "sockproxy_http.c:handle_on_message_complete:raw:block_response"
+
+fresh
+mut sockproxy_http.c '              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);' '              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);
+              send(pfe->fd, smuggle_400, 0, MSG_NOSIGNAL);'
+expect "rule 1b: a second raw write under one allowlist key" "allowlist entry covers 1 call(s), found 2"
 
 # Rule 2: a local answer never samples TTFB.
 fresh

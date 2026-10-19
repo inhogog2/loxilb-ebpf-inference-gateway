@@ -789,6 +789,8 @@ fail:
       int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
       llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 4 /*prefill error*/);
     }
+    /* The client's answer: completed with the status written. */
+    proxy_record_local_completion(client_pfe, 503);
     if (client_pfe->fd > 0) {
       if (client_pfe->ssl) {
         SSL_write(client_pfe->ssl, pd_prefill_err, sizeof(pd_prefill_err) - 1);

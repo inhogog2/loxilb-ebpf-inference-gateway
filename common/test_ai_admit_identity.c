@@ -2683,7 +2683,7 @@ test_local_refusals_are_recorded_at_their_stage(void)
          AI_GW_STAGE_CONFLICT == 2 && AI_GW_STAGE_RATELIMIT == 3 &&
          AI_GW_STAGE_RESERVE == 4 && AI_GW_STAGE_CAPACITY == 5 &&
          AI_GW_STAGE_OBJECTIVE == 6 && AI_GW_STAGE_ROUTE == 7 &&
-         AI_GW_STAGE_FRAMING == 8);
+         AI_GW_STAGE_FRAMING == 8 && AI_GW_STAGE_SECURITY == 9);
 }
 
 int

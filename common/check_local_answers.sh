@@ -20,10 +20,12 @@
 #   1. Every call of a local sender is inside a function that records, or is
 #      on the allowlist below with the reason it does not. A new answer fails
 #      until it records or is listed; an entry that matches nothing fails too.
-#   1b. The P/D dialects (sockproxy_pd_*.c) write their own answers with the
-#      raw relay writes, which rule 1 cannot tell from the relay: every
-#      function there that builds an HTTP status line is listed below by
-#      name, with the reason, so a new one fails until it is.
+#   1b. A raw write (send, SSL_write) of a response built in the same
+#      function (a buffer initialised with an HTTP status line) is preceded,
+#      within 12 lines of that function, by its record: the paths that write
+#      on a worker that must not block (the P/D legs, the connect event, the
+#      LlamaFirewall block) keep their raw write and record before it. Or it
+#      is allowlisted, keyed by its buffer.
 #   2. proxy_note_local_answer never samples TTFB: it is
 #      proxy_note_response_(pfe, status, 0), proxy_note_client_response is
 #      (..., 1), and the writer samples only under RESP_NOTE_TTFB. That the
@@ -59,17 +61,8 @@ sockproxy_h2.c:proxy_h2_forward_to_backend:h2_send_deny_frame:-|2|MCP outage on 
 sockproxy_h2.c:proxy_h2_forward_to_backend:proxy_h2_send_ai_deny:-|1|the gate verdict on HTTP/2: the deny record is ai_gw_admit'"'"'s, at the verdict; no class counter on HTTP/2 (F-7)
 sockproxy_h2.c:proxy_h2_backend_leg_unanswered:proxy_h2_send_ai_deny:backend_unreachable|1|post-dispatch: the backend leg closed before it answered; F-6
 sockproxy_h2.c:proxy_h2_forward_to_backend:proxy_h2_send_ai_deny:backend_unreachable|1|post-dispatch: the backend connect failed after the pick; F-6
+sockproxy_http.c:handle_client_data:raw:smuggle_400|1|request-smuggling parse error (Content-Length with Transfer-Encoding): refused before a request exists to record
 sockproxy_health.c:pd_reap_respond:send:-|1|reaper fallback when the owner worker cannot be woken (no owner, ring full): the health thread may not write the request'"'"'s record fields, which the owner owns; F-6
-'
-
-# P/D dialect functions that build a response: file:function|reason.
-PD_BUILT='
-sockproxy_pd_sglang.c:pd_sg_abort_pair|post-dispatch: a SGLang pair aborted after both legs were dispatched; F-6
-sockproxy_pd_sglang.c:pd_sg_oversize_reject|post-admission SGLang prefill refusal of an oversize prompt; F-6
-sockproxy_pd_sglang.c:pd_sg_dual_dispatch|post-dispatch: the SGLang dual dispatch failed; F-6
-sockproxy_pd_sglang.c:pd_sg_prepare_request|post-admission SGLang request build failure; F-6
-sockproxy_pd_vllm.c:pd_retry_prefill|post-dispatch: prefill failover exhausted, recorded by llb_ai_pd_record (prefill error); F-6
-sockproxy_pd_trtllm.c:pd_trt_early_exit_relay|a backend reply relayed from the prefill leg, recorded by its caller (check_pd_status_sites.sh rule 2)
 '
 
 # Functions that record their answer, each with the pattern its body must
@@ -116,10 +109,24 @@ fnbody() {
 # closing brace in column 0. Raw send() is a local sender in the two files
 # whose answers are built text; elsewhere it is the relay.
 CALLS=$(awk '
-  FNR == 1 { fn = "" }
-  /^}/ { fn = ""; next }
+  FNR == 1 { fn = ""; reset() }
+  /^}/ { fn = ""; reset(); next }
   /^[A-Za-z_]/ && /\(/ && !/;[[:space:]]*$/ && !/^#/ {
-    t = $0; sub(/\(.*/, "", t); n = split(t, a, /[ *]+/); fn = a[n]; next
+    t = $0; sub(/\(.*/, "", t); n = split(t, a, /[ *]+/); fn = a[n]; reset(); next
+  }
+  # A buffer initialised with an HTTP status line (on its line or the next
+  # two) is a built response; the last record call bounds rule 1b.
+  /char[^=;(]*[ *][A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[ \t]*=/ {
+    t = $0; sub(/[ \t]*(\[[^]]*\])?[ \t]*=.*/, "", t); n = split(t, a, /[ *]+/); bname = a[n]; bleft = 3
+  }
+  bleft > 0 { if ($0 ~ /"HTTP\/1\.[01] [1-5][0-9][0-9]/) built[bname] = 1; bleft-- }
+  /proxy_record_local_completion\(|proxy_note_local_answer\(|proxy_record_local_deny\(/ &&
+  !/^[[:space:]]*(\*|\/\*|\/\/)/ { lastrec = FNR }
+  pend == "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write)\(/) {
+    r = substr($0, RSTART + RLENGTH); split(r, args, ","); buf = args[2]
+    gsub(/^[ \t]+|[ \t]+$/, "", buf)
+    if (buf in built && !(lastrec > 0 && FNR - lastrec <= 12))
+      print FILENAME ":" fn ":raw:" buf
   }
   pend != "" {
     acc = acc " " $0
@@ -136,6 +143,7 @@ CALLS=$(awk '
     } else next
     if (acc ~ /;/) { emit(); pend = "" }
   }
+  function reset(  k) { for (k in built) delete built[k]; lastrec = 0; bleft = 0 }
   function emit(  c, d, i, ch) {
     # The call'"'"'s own arguments only: up to its closing parenthesis.
     d = 1
@@ -184,19 +192,6 @@ printf '%s\n' "$ALLOW" | while IFS='|' read -r a n _; do
   [ "$got" = "$n" ] || { echo "allowlist entry covers $n call(s), found $got: $a"; echo x >> "$FAILF"; }
 done
 
-# 1b. Every P/D dialect function that builds a response is listed.
-built=$(awk '
-  /^}/ {fn = ""; next}
-  /^[A-Za-z_]/ && /\(/ && !/;[[:space:]]*$/ && !/^#/ {t = $0; sub(/\(.*/, "", t); n = split(t, a, /[ *]+/); fn = a[n]; next}
-  /"HTTP\/1\.[01] [1-5][0-9][0-9]/ {print FILENAME ":" fn}' sockproxy_pd_*.c | sort -u)
-listed=$(printf '%s\n' "$PD_BUILT" | awk -F'|' 'NF {print $1}' | sort -u)
-if [ "$built" != "$listed" ]; then
-  echo "sockproxy_pd_*.c: the functions that build a response are not the listed ones:"
-  printf '  built:  %s\n' $built
-  printf '  listed: %s\n' $listed
-  fail=1
-fi
-
 # 2. A local answer never samples TTFB.
 w=$(fnbody sockproxy_http.c proxy_note_response_)
 la=$(fnbody sockproxy_http.c proxy_note_local_answer)
@@ -242,7 +237,7 @@ bad=$(awk '
   !/^[A-Za-z_]/ && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
     acc = $0; k = 0
     while (acc !~ /;/ && k++ < 4 && (getline nl) > 0) acc = acc " " nl
-    if (acc ~ /(sp_send_local_refusal|proxy_record_local_deny|h2_send_local_refusal)\(pfe, (stream, )?(stage|AI_GW_STAGE_[A-Z]+)/ ||
+    if (acc ~ /(sp_send_local_refusal|proxy_record_local_deny|h2_send_local_refusal)\([a-z_]+, (stream, )?(stage|AI_GW_STAGE_[A-Z]+)/ ||
         acc ~ /ai_gw_record_local_deny\((stage|\(int\)AI_GW_STAGE_[A-Z]+),/) {
       if (acc !~ /AI_GW_STAGE_NONE/) next
     }

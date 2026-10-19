@@ -93,11 +93,12 @@ typedef enum {
   AI_GW_STAGE_RESERVE,         /* pre-admission token reservation (429) */
   AI_GW_STAGE_CAPACITY,        /* service/endpoint capacity, after policy (429/503) */
   AI_GW_STAGE_OBJECTIVE,       /* the objective a request named is not its to use (403, strict rules) */
-  /* The two below refuse outside ai_gw_admit, before any backend is chosen,
+  /* The three below refuse outside ai_gw_admit, before any backend is chosen,
    * and report through ai_gw_record_local_deny. Appended: a recorded value
    * never moves. */
   AI_GW_STAGE_ROUTE,           /* no pool for the named model, no rule matched (503) */
   AI_GW_STAGE_FRAMING,         /* the request cannot be admitted as framed (400/413) */
+  AI_GW_STAGE_SECURITY,        /* a content-security scanner blocked the request (403) */
 } ai_gw_admit_stage_t;
 
 /* How the tenant was decided. BEARER is set once a bearer token has
@@ -273,7 +274,8 @@ int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
 
 /* Record a refusal the gateway made outside ai_gw_admit's verdict frame, at
  * `stage`: capacity once the pool is known (AI_GW_STAGE_CAPACITY), routing
- * (AI_GW_STAGE_ROUTE) or framing (AI_GW_STAGE_FRAMING). The same record
+ * (AI_GW_STAGE_ROUTE), framing (AI_GW_STAGE_FRAMING) or a content-security
+ * block (AI_GW_STAGE_SECURITY). The same record
  * export as the gate's own refusals, so every refusal is counted in one
  * place whichever stage made it. */
 void ai_gw_record_local_deny(int stage, const char *request_id, int producer_id,
