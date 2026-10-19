@@ -444,13 +444,13 @@ sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
 {
   switch (kind) {
   case SP_REAP_FC_QUEUE_TIMEOUT:      /* deny record: sp_reap_fc_format */
-    proxy_note_local_answer(pfe, 504);
+    proxy_note_local_refusal(pfe, 504);
     break;
   case SP_REAP_FC_DRAINED:            /* deny record: sp_reap_fc_format */
-    proxy_note_local_answer(pfe, 503);
+    proxy_note_local_refusal(pfe, 503);
     break;
   case SP_REAP_PD_PARK_TIMEOUT:
-    proxy_note_local_answer(pfe, 504);
+    proxy_note_local_refusal(pfe, 504);
     proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504,
                             "pd_admission_park_timeout");
     break;

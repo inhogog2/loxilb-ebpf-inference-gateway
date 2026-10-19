@@ -1838,6 +1838,9 @@ int proxy_note_client_response(struct proxy_fd_ent *pfe, uint16_t status);
 /* The same record for a response the gateway wrote itself (a refusal, an
  * outage answer): status and class counter, no TTFB sample. */
 int proxy_note_local_answer(struct proxy_fd_ent *pfe, uint16_t status);
+/* proxy_note_local_answer for a refusal: also marks the request recorded, so
+ * no completion is owed beside its deny record. */
+int proxy_note_local_refusal(struct proxy_fd_ent *pfe, uint16_t status);
 
 static inline int
 proxy_status_is_2xx(unsigned int status)

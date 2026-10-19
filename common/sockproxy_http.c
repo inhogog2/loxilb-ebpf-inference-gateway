@@ -453,6 +453,23 @@ proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                           pfe->adm_objective);
 }
 
+/* The response record of a refusal: status and class, as every local
+ * answer, and the request marked as recorded. Its request record is the deny
+ * record (the caller's, or the gate's at its verdict); the status the note
+ * sets would otherwise leave a completion owed (proxy_owes_completion), and
+ * the next request on the connection or its teardown would count the refusal
+ * a second time, as completed. Marked only when this note took the latch: a
+ * response already recorded for the request keeps its own completion. */
+int
+proxy_note_local_refusal(proxy_fd_ent_t *pfe, uint16_t status)
+{
+  int noted = proxy_note_local_answer(pfe, status);
+
+  if (noted)
+    pfe->metric_ai_recorded = 1;
+  return noted;
+}
+
 /* The records of an answer that completes the request with the status
  * written (an outage, a backend failure, a configured redirect). The
  * completion keeps the normal guard: a later teardown must not emit it a
@@ -477,7 +494,7 @@ int
 sp_send_local_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
                       const char *code, const void *buf, size_t len)
 {
-  proxy_note_local_answer(pfe, status);
+  proxy_note_local_refusal(pfe, status);
   proxy_record_local_deny(pfe, stage, status, code);
   return proxy_send_local_response(pfe, buf, len);
 }
@@ -8894,7 +8911,7 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
   n = sp_h1_format_admit_deny(resp_buf, sizeof(resp_buf), status,
                               retry_after, retry_body, code, msg);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
-    proxy_note_local_answer(pfe, (uint16_t)status);
+    proxy_note_local_refusal(pfe, (uint16_t)status);
     if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
       log_error("[AIGateway] fd=%d failed to send complete bounded %d "
                 "refusal", pfe->fd, status);
@@ -8962,7 +8979,7 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     /* The request record is the caller's (ai_gw_record_capacity_deny). */
-    proxy_note_local_answer(pfe, (uint16_t)status);
+    proxy_note_local_refusal(pfe, (uint16_t)status);
     rc = keep ? proxy_send_local_response(pfe, resp_buf, (size_t)n)
               : proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n);
     if (rc != 0)
@@ -9748,7 +9765,7 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
 
   {
     static const char model_late[] = SP_MODEL_REQUIRED_EARLY_RESPONSE;
-    proxy_note_local_answer(pfe, 400);
+    proxy_note_local_refusal(pfe, 400);
     proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400, "model_required_early");
     if (proxy_send_local_response_and_shutdown(
             pfe, model_late, sizeof(model_late) - 1) != 0)
@@ -10203,7 +10220,7 @@ handle_on_message_complete(llhttp_t* parser)
           size_t response_len = strlen(block_response);
           /* A refusal before any backend was chosen, recorded as every
            * answer the gateway writes itself, at its own stage. */
-          proxy_note_local_answer(pfe, 403);
+          proxy_note_local_refusal(pfe, 403);
           proxy_record_local_deny(pfe, AI_GW_STAGE_SECURITY, 403, "llamafirewall_block");
           ssize_t sent = send(pfe->fd, block_response, response_len, MSG_NOSIGNAL);
 

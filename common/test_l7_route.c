@@ -69,6 +69,8 @@ int proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
  * answers every request in these tests. */
 int proxy_note_local_answer(proxy_fd_ent_t *pfe, uint16_t status)
 { (void)pfe; (void)status; return 0; }
+int proxy_note_local_refusal(proxy_fd_ent_t *pfe, uint16_t status)
+{ (void)pfe; (void)status; return 0; }
 void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                              const char *code)
 { (void)pfe; (void)stage; (void)status; (void)code; }

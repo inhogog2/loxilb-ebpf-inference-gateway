@@ -437,7 +437,7 @@ int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
   if (n > 0 && n < (int)sizeof(resp)) {
     /* A refusal before any backend was chosen, recorded as every answer the
      * gateway writes itself: the response, and a deny record at ROUTE. */
-    proxy_note_local_answer(pfe, (uint16_t)code);
+    proxy_note_local_refusal(pfe, (uint16_t)code);
     proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code, "l7_policy_reject");
     send(pfe->fd, resp, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL);
   }

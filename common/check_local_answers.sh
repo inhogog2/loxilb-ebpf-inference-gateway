@@ -35,6 +35,12 @@
 #      response also takes its deny record, or its callers do, and every
 #      local deny record passes an AI_GW_STAGE_* other than NONE.
 #   4. The 100 Continue never records: the latch belongs to the real response.
+#   5. A refusal's response record is proxy_note_local_refusal, which marks
+#      the request recorded when it took the latch: the status the note sets
+#      would otherwise leave a completion owed, and the refusal would be
+#      counted again, as completed, at the next request or the teardown.
+#      proxy_note_local_answer is called only by that wrapper and by
+#      proxy_record_local_completion, whose answers complete the request.
 #
 #   sh check_local_answers.sh [dir]   (dir defaults to this script's directory)
 set -eu
@@ -72,15 +78,15 @@ sockproxy_health.c:pd_reap_respond:send:-|1|reaper fallback when the owner worke
 # request that timed out on its legs completes with the status written; the
 # SSE events are body bytes inside a response in progress, not a response.
 RECORDS='
-sockproxy_http.c:sp_send_local_refusal:proxy_note_local_answer(pfe, status);proxy_record_local_deny(pfe, stage
+sockproxy_http.c:sp_send_local_refusal:proxy_note_local_refusal(pfe, status);proxy_record_local_deny(pfe, stage
 sockproxy_http.c:sp_send_local_outage:proxy_record_local_completion(pfe, status)
 sockproxy_http.c:proxy_send_backend_unreachable:proxy_record_local_completion(pfe, 502)
-sockproxy_http.c:sp_h1_send_admit_deny:proxy_note_local_answer(pfe
-sockproxy_http.c:sp_h1_send_capacity_deny:proxy_note_local_answer(pfe
-sockproxy_http.c:sp_h1_stream_model_unresolvable:proxy_note_local_answer(pfe, 400);proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING
+sockproxy_http.c:sp_h1_send_admit_deny:proxy_note_local_refusal(pfe
+sockproxy_http.c:sp_h1_send_capacity_deny:proxy_note_local_refusal(pfe
+sockproxy_http.c:sp_h1_stream_model_unresolvable:proxy_note_local_refusal(pfe, 400);proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING
 sockproxy_health.c:sp_reap_finish:sp_reap_record(pfe, kind)
-sockproxy_health.c:sp_reap_record:proxy_note_local_answer(pfe, 504);proxy_note_local_answer(pfe, 503);proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504;proxy_record_local_completion(pfe, 504);proxy_record_local_completion(pfe, 502)
-sockproxy_l7policy.c:l7_send_reject:proxy_note_local_answer(pfe, (uint16_t)code);proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code
+sockproxy_health.c:sp_reap_record:proxy_note_local_refusal(pfe, 504);proxy_note_local_refusal(pfe, 503);proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504;proxy_record_local_completion(pfe, 504);proxy_record_local_completion(pfe, 502)
+sockproxy_l7policy.c:l7_send_reject:proxy_note_local_refusal(pfe, (uint16_t)code);proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code
 sockproxy_l7policy.c:l7_send_redirect:proxy_record_local_completion(pfe, (uint16_t)code)
 sockproxy_h2.c:proxy_h2_send_l7_synthetic:l7_stream->metric_response_status = status_code;h2_record_local_deny(pfe, l7_stream, AI_GW_STAGE_ROUTE
 sockproxy_h2.c:h2_send_local_refusal:h2_record_local_deny(pfe, stream, stage
@@ -120,7 +126,7 @@ CALLS=$(awk '
     t = $0; sub(/[ \t]*(\[[^]]*\])?[ \t]*=.*/, "", t); n = split(t, a, /[ *]+/); bname = a[n]; bleft = 3
   }
   bleft > 0 { if ($0 ~ /"HTTP\/1\.[01] [1-5][0-9][0-9]/) built[bname] = 1; bleft-- }
-  /proxy_record_local_completion\(|proxy_note_local_answer\(|proxy_record_local_deny\(/ &&
+  /proxy_record_local_completion\(|proxy_note_local_answer\(|proxy_note_local_refusal\(|proxy_record_local_deny\(/ &&
   !/^[[:space:]]*(\*|\/\*|\/\/)/ { lastrec = FNR }
   pend == "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write)\(/) {
     r = substr($0, RSTART + RLENGTH); split(r, args, ","); buf = args[2]
@@ -252,6 +258,22 @@ fi
 # 4. The 100 Continue never records.
 if fnbody sockproxy_http.c proxy_send_local_100_continue | grep -qE 'proxy_note_|proxy_record_local|llb_ai_record'; then
   echo "sockproxy_http.c: proxy_send_local_100_continue records; the latch belongs to the real response"
+  fail=1
+fi
+
+# 5. A refusal leaves no completion owed.
+fnbody sockproxy_http.c proxy_note_local_refusal | tr -d '\n' |
+  grep -qE 'int noted = proxy_note_local_answer\(pfe, status\);[[:space:]]*if \(noted\)[[:space:]]*pfe->metric_ai_recorded = 1;' ||
+  { echo "sockproxy_http.c: proxy_note_local_refusal must mark the request recorded when its note took the latch"; fail=1; }
+stray=$(awk '
+  /^}/ {fn = ""; next}
+  /^[A-Za-z_]/ && /\(/ && !/;[[:space:]]*$/ && !/^#/ {t = $0; sub(/\(.*/, "", t); n = split(t, a, /[ *]+/); fn = a[n]; next}
+  /^[[:space:]]*(\*|\/\*|\/\/)/ {next}
+  /(^|[^a-z_])proxy_note_local_answer\(/ && fn != "proxy_note_local_refusal" &&
+    fn != "proxy_record_local_completion" && fn != "" {print FILENAME ":" FNR ": " fn}' $SRCS)
+if [ -n "$stray" ]; then
+  printf '%s\n' "$stray"
+  echo "  ^ proxy_note_local_answer outside a completion: a refusal records through proxy_note_local_refusal, or it is counted again as completed"
   fail=1
 fi
 

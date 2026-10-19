@@ -115,7 +115,7 @@ mut sockproxy_pd_vllm.c '    proxy_record_local_completion(client_pfe, 503);
 expect "rule 1b: the vLLM prefill failover 503 written raw without its record" "sockproxy_pd_vllm.c:pd_retry_prefill:raw:pd_prefill_err"
 
 fresh
-mut sockproxy_http.c '          proxy_note_local_answer(pfe, 403);
+mut sockproxy_http.c '          proxy_note_local_refusal(pfe, 403);
           proxy_record_local_deny(pfe, AI_GW_STAGE_SECURITY, 403, "llamafirewall_block");
 ' ''
 expect "rule 1b: the LlamaFirewall block written raw without its record" "sockproxy_http.c:handle_on_message_complete:raw:block_response"
@@ -178,6 +178,30 @@ fresh
 mut sockproxy_http.c '  pfe->json_stream_continue_sent = 1;' '  pfe->json_stream_continue_sent = 1;
   proxy_note_local_answer(pfe, 100);'
 expect "rule 4: the 100 Continue takes the latch" "proxy_send_local_100_continue records"
+
+# Rule 5: a refusal leaves no completion owed.
+fresh
+mut sockproxy_http.c '  if (noted)
+    pfe->metric_ai_recorded = 1;
+  return noted;' '  return noted;'
+expect "rule 5: the refusal note leaves a completion owed" "proxy_note_local_refusal must mark the request recorded when its note took the latch"
+
+fresh
+mut sockproxy_http.c '  if (noted)
+    pfe->metric_ai_recorded = 1;
+  return noted;' '  pfe->metric_ai_recorded = 1;
+  return noted;'
+expect "rule 5: the refusal note marks a request whose response it did not record" "proxy_note_local_refusal must mark the request recorded when its note took the latch"
+
+fresh
+mut sockproxy_pd_sglang.c 'proxy_note_local_refusal(client_pfe, 503);' 'proxy_note_local_answer(client_pfe, 503);'
+expect "rule 5: a refusal recorded with the completion note" "proxy_note_local_answer outside a completion"
+
+fresh
+mut sockproxy_http.c '    /* The request record is the caller'"'"'s (ai_gw_record_capacity_deny). */
+    proxy_note_local_refusal(pfe, (uint16_t)status);' '    /* The request record is the caller'"'"'s (ai_gw_record_capacity_deny). */
+    proxy_note_local_answer(pfe, (uint16_t)status);'
+expect "rule 5: the capacity refusal recorded with the completion note" "sp_h1_send_capacity_deny must record: proxy_note_local_refusal(pfe"
 
 [ "$survived" = "0" ] || { echo "check_local_answers.sh: a mutation survived"; exit 1; }
 echo "check_local_answers.sh mutations: $n/$n killed"
