@@ -1474,6 +1474,7 @@ struct proxy_fd_ent {
   uint8_t  ai_gw_mode;                // 1=AI Gateway connection; copied from the rule at accept
   uint8_t  apikey_auth;               // 0=unset 1=required 2=declared-disabled; copied from the rule at accept
   uint8_t  metric_ai_recorded;       // 1=this request already counted in ai_requests_total (dedup guard)
+  uint8_t  metric_resp_noted;        // 1=this request's client-visible response is recorded (proxy_note_client_response latch)
 
   // HTTP/HTTPS Trace Context (: Protocol Analyzer)
 #ifdef HAVE_HTTP_TRACE
@@ -1831,6 +1832,10 @@ pfe_rcv_note(proxy_fd_ent_t *pfe)
  * status parser latches the FIRST status line it sees and never overwrites
  * it, so a 100-Continue exchange leaves metric_response_status at 100 with
  * the real status never recorded. */
+/* Record the response the client receives, once per request: status,
+ * responses-by-status class counter, TTFB sample (sockproxy_http.c). */
+int proxy_note_client_response(struct proxy_fd_ent *pfe, uint16_t status);
+
 static inline int
 proxy_status_is_2xx(unsigned int status)
 {

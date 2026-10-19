@@ -199,7 +199,13 @@ int pd_seq_prepare_request(struct proxy_fd_ent *pfe,
  * Shared verbatim by the vLLM and TRT-LLM dialect tables. */
 int pd_vllm_dispatch(struct proxy_fd_ent *pfe);
 
-/* Initiate the decode phase after prefill completes. */
+/* Initiate the decode phase after prefill completes. Returns 0 when the decode
+ * request is sent, < 0 when decode could not be started (the caller answers
+ * the client), or PD_DECODE_ANSWERED when the prefill leg's reply already
+ * answered the client (an origin 4xx relayed verbatim, or the TensorRT-LLM
+ * early exit): no decode leg, and the caller writes the request's completion
+ * record. */
+#define PD_DECODE_ANSWERED 1
 int pd_initiate_decode(struct proxy_fd_ent *client_pfe);
 
 /* Mid-request prefill failover (deferred from proxy_pdestroy; owns and frees

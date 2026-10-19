@@ -37,6 +37,8 @@ struct proxy_fd_ent {
 };
 
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_resp_note.h"
+#include <pthread.h>
 
 /* A per-"connection" sliding-tail fixture, mirroring the proxy_fd_ent.sse_tail /
  * .sse_tail_len fields the production call site rides on. Zero-initialised =
@@ -51,6 +53,50 @@ scan(struct tail_state *ts, const char *pkt)
 {
   return pd_scan_msg_end_window(ts->tail, &ts->tail_len,
                                 (const uint8_t *)pkt, strlen(pkt));
+}
+
+/* The response-record latch (proxy_note_client_response): one record per
+ * request whichever site reaches it first (the decode capture or a prefill-leg
+ * answer); every later call for that request is a no-op; the next request on
+ * the connection records again. */
+static uint8_t race_latch;
+static int race_wins;
+
+static void *
+race_claim(void *arg)
+{
+  (void)arg;
+  if (resp_note_claim(&race_latch)) __atomic_fetch_add(&race_wins, 1, __ATOMIC_RELAXED);
+  return NULL;
+}
+
+static void
+test_resp_note_latch(void)
+{
+  uint8_t noted = 0;   /* pfe_alloc zeroes the field: the latch starts open */
+
+  assert(resp_note_claim(&noted) == 1 && "first site records");
+  assert(resp_note_claim(&noted) == 0 && "second site for the same request is a no-op");
+  assert(resp_note_claim(&noted) == 0);
+  resp_note_rearm(&noted);   /* next request on the kept-alive connection */
+  assert(resp_note_claim(&noted) == 1 && "re-armed per request");
+  assert(resp_note_claim(&noted) == 0);
+
+  /* the two sites run on different workers: exactly one wins a race */
+  for (int round = 0; round < 200; round++) {
+    pthread_t th[8];
+    race_latch = 0;
+    race_wins = 0;
+    for (int i = 0; i < 8; i++) assert(pthread_create(&th[i], NULL, race_claim, NULL) == 0);
+    for (int i = 0; i < 8; i++) pthread_join(th[i], NULL);
+    assert(race_wins == 1 && "exactly one record per request under a race");
+  }
+
+  assert(resp_status_class(0) == 0 && resp_status_class(100) == 0 && resp_status_class(199) == 0);
+  assert(resp_status_class(200) == 2 && resp_status_class(299) == 2);
+  assert(resp_status_class(302) == 3 && resp_status_class(404) == 4 && resp_status_class(429) == 4);
+  assert(resp_status_class(500) == 5 && resp_status_class(599) == 5 && resp_status_class(600) == 0);
+  printf("  [PASS] resp_note latch: once per request, no-op after, re-armed, one winner in a race\n");
 }
 
 /* ---- Case 1: terminator wholly inside one packet still completes ---- */
@@ -238,10 +284,112 @@ test_http_resp_status(void)
   printf("  [PASS] pd_http_resp_status: codes parsed, malformed -> unknown\n");
 }
 
+/* pd_resp_error_excerpt: the engine's error string for the relay's log line,
+ * from either vLLM error shape, else the body's leading bytes; bounded, and
+ * one log line whatever the body holds. */
+static void
+test_resp_error_excerpt(void)
+{
+  char out[64];
+  static const char flat[] =
+      "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\r\n"
+      "{\"object\":\"error\",\"message\":\"The model `mon03-alias` does not exist.\","
+      "\"type\":\"NotFoundError\",\"param\":null,\"code\":404}";
+  static const char nested[] =
+      "HTTP/1.1 400 Bad Request\r\n\r\n"
+      "{\"error\": {\"message\" : \"max_tokens \\\"1\\\" invalid\", \"code\": 400}}";
+  static const char plain[] = "HTTP/1.1 413 Payload Too Large\r\n\r\ntoo\r\nlarge";
+  static const char nobody[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 0";
+
+  assert(pd_resp_error_excerpt((const uint8_t *)flat, sizeof(flat) - 1, out, sizeof(out)) > 0);
+  assert(strcmp(out, "The model `mon03-alias` does not exist.") == 0);
+  pd_resp_error_excerpt((const uint8_t *)nested, sizeof(nested) - 1, out, sizeof(out));
+  assert(strcmp(out, "max_tokens \\\"1\\\" invalid") == 0 && "an escaped quote does not end it");
+  pd_resp_error_excerpt((const uint8_t *)plain, sizeof(plain) - 1, out, sizeof(out));
+  assert(strcmp(out, "too..large") == 0 && "no message key: the body, control bytes masked");
+  assert(pd_resp_error_excerpt((const uint8_t *)nobody, sizeof(nobody) - 1, out, sizeof(out)) == 0 &&
+         out[0] == '\0');
+  assert(pd_resp_error_excerpt(NULL, 0, out, sizeof(out)) == 0 && out[0] == '\0');
+  {
+    char small[8];
+    assert(pd_resp_error_excerpt((const uint8_t *)flat, sizeof(flat) - 1, small, sizeof(small)) == 7);
+    assert(strcmp(small, "The mod") == 0 && "bounded by cap");
+    /* bounded by len: the message is cut where the buffer ends */
+    size_t cut = (size_t)(strstr(flat, "does") - flat);
+    pd_resp_error_excerpt((const uint8_t *)flat, cut, out, sizeof(out));
+    assert(strcmp(out, "The model `mon03-alias` ") == 0);
+  }
+  printf("  [PASS] pd_resp_error_excerpt: message of either shape, else body; bounded\n");
+}
+
+/* pd_prefill_status_verdict: an origin 4xx prefill reply is relayed verbatim
+ * and decode is not called; a 5xx, a 408 and a 429 keep the decode-recompute
+ * degradation; an unknown status is neither; a truncated reply is never
+ * relayed. */
+static void
+test_prefill_status_verdict(void)
+{
+  assert(pd_prefill_status_verdict(0, 0)   == PD_PR_DECODE && "unknown -> decode");
+  assert(pd_prefill_status_verdict(200, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(204, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(301, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(399, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(400, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(404, 0) == PD_PR_RELAY && "unknown model is a reject");
+  assert(pd_prefill_status_verdict(408, 0) == PD_PR_DECODE && "engine timeout is transient");
+  assert(pd_prefill_status_verdict(409, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(413, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(422, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(429, 0) == PD_PR_DECODE && "engine backpressure is transient");
+  assert(pd_prefill_status_verdict(499, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(404, 1) == PD_PR_DECODE &&
+         "a truncated reply is not the origin's response: never relayed");
+  assert(pd_prefill_status_verdict(500, 0) == PD_PR_DECODE && "5xx keeps decode recompute");
+  assert(pd_prefill_status_verdict(503, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(599, 0) == PD_PR_DECODE);
+  /* composed with the parser, as pd_initiate_decode uses them */
+  {
+    static const char nf404[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\n{}";
+    static const char ok200[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)nf404, sizeof(nf404) - 1), 0) == PD_PR_RELAY);
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)ok200, sizeof(ok200) - 1), 0) == PD_PR_DECODE);
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)"HTTP/1.1 40", 11), 0) == PD_PR_DECODE &&
+           "an unparsable status line is unknown, not a reject");
+  }
+  printf("  [PASS] pd_prefill_status_verdict: 4xx relay, 5xx/408/429/unknown/truncated decode\n");
+}
+
+/* pd_decode_error_phase: a completed decode leg is recorded by the status its
+ * client received. An unread status is its own outcome (7), never a success. */
+static void
+test_decode_error_phase(void)
+{
+  static const struct { int status, phase; } cases[] = {
+    {   0, 7 }, { 100, 7 }, { 199, 7 },            /* no final status line read */
+    { 200, 0 }, { 204, 0 }, { 301, 0 }, { 399, 0 }, /* complete / success */
+    { 400, 6 }, { 404, 6 }, { 429, 6 }, { 499, 6 }, /* decode / rejected */
+    { 500, 2 }, { 502, 2 }, { 503, 2 }, { 599, 2 }, /* decode / error */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    if (pd_decode_error_phase(cases[i].status) != cases[i].phase) {
+      fprintf(stderr, "pd_decode_error_phase(%d) = %d, want %d\n", cases[i].status,
+              pd_decode_error_phase(cases[i].status), cases[i].phase);
+      assert(0);
+    }
+  }
+  /* composed with the parser: a status line too short to read is unknown */
+  assert(pd_decode_error_phase(pd_http_resp_status((const uint8_t *)"HTTP/1.1 5", 10)) == 7);
+  printf("  [PASS] pd_decode_error_phase: 2xx/3xx 0, 4xx 6, 5xx 2, unread 7\n");
+}
+
 int
 main(void)
 {
   printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
+  test_resp_note_latch();
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();
@@ -251,6 +399,9 @@ main(void)
   test_graceful_slow_stream_not_reaped();
   test_graceful_guards();
   test_http_resp_status();
+  test_resp_error_excerpt();
+  test_prefill_status_verdict();
+  test_decode_error_phase();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }

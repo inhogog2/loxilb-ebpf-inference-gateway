@@ -55,6 +55,7 @@
 #include "sockproxy_in_ifindex.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
+#include "sockproxy_resp_note.h" /* once-per-request response record latch */
 #include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
@@ -1296,6 +1297,37 @@ proxy_usage_ops(proxy_fd_ent_t *pfe)
   return &pd_dialect_plain;
 }
 
+/* Record the response the client receives, once per request: its status
+ * (metric_response_status), the responses-by-status class counter and the
+ * TTFB sample, taken now. Called by the backend response capture and by every
+ * path that answers the client from the P/D prefill leg, whose reply the
+ * capture skips, just before it relays; so TTFB is the client's first byte
+ * whichever leg delivered it. The latch makes a second call for the same
+ * request a no-op (sockproxy_resp_note.h). Returns 1 when it recorded. */
+int
+proxy_note_client_response(proxy_fd_ent_t *pfe, uint16_t status)
+{
+  if (!pfe || !resp_note_claim(&pfe->metric_resp_noted)) return 0;
+  pfe->metric_response_status = status;
+  // Every final or interim status counts in the total; 1xx has no class.
+  atomic_fetch_add(&global_stats.http_responses_total, 1);
+  switch (resp_status_class(status)) {
+  case 2: atomic_fetch_add(&global_stats.http_status_2xx, 1); break;
+  case 3: atomic_fetch_add(&global_stats.http_status_3xx, 1); break;
+  case 4: atomic_fetch_add(&global_stats.http_status_4xx, 1); break;
+  case 5: atomic_fetch_add(&global_stats.http_status_5xx, 1); break;
+  default: break;
+  }
+  // TTFB latency — recorded unconditionally (see request-start capture in
+  // handle_on_message_complete); the histogram is a first-class L7 metric,
+  // not gated behind the optional HAVE_HTTP_TRACE trace subsystem.
+  if (pfe->metric_req_start_ns > 0) {
+    uint64_t latency_us = (get_timestamp_ns() - pfe->metric_req_start_ns) / 1000;
+    record_latency_sample(latency_us);
+  }
+  return 1;
+}
+
 int
 proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 {
@@ -1590,9 +1622,11 @@ skip_deferred_masking:
 
 #ifdef HAVE_HTTP_TRACE
     // Parse HTTP response status and Content-Length for tracing (ONCE per connection)
-    // Only parse from backend connections (odir=1) when we haven't captured status yet
+    // Only parse from backend connections (odir=1) when we haven't captured status yet.
+    // Not a P/D prefill reply: the client never sees it (see the L7 METRICS block).
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
-        rfd_ent->response_status_code == 0 && len > 16) {
+        rfd_ent->response_status_code == 0 && len > 16 &&
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
 
       const char *buf = (const char *)msg;
       size_t header_search_len = (len < 2048) ? len : 2048;  // Only search first 2KB
@@ -1638,8 +1672,16 @@ skip_deferred_masking:
 #endif
 
     // L7 METRICS: Parse HTTP response status (independent of Jaeger tracing)
+    /* The status of the response the CLIENT receives. On the sequential P/D
+     * machine the first status line to arrive is the prefill leg's, which is
+     * buffered and never relayed; taking it made every P/D request report its
+     * prefill status (and its TTFB at the prefill reply) whatever the decode
+     * leg answered. The capture waits for the decode leg. A path that answers
+     * the client from the prefill leg itself records the response where it
+     * relays (proxy_note_client_response). */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
-        rfd_ent->metric_response_status == 0 && len > 16) {
+        rfd_ent->metric_response_status == 0 && len > 16 &&
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
       const char *buf = (const char *)msg;
       if (memcmp(buf, "HTTP/1.", 7) == 0 && len > 12) {
         const char *status_start = buf + 9;
@@ -1650,25 +1692,8 @@ skip_deferred_masking:
           uint16_t status = (status_start[0] - '0') * 100 +
                             (status_start[1] - '0') * 10 +
                             (status_start[2] - '0');
-          rfd_ent->metric_response_status = status;
-          // Count by status class (skip 1xx interim responses)
-          atomic_fetch_add(&global_stats.http_responses_total, 1);
-          if (status >= 200 && status < 300) {
-            atomic_fetch_add(&global_stats.http_status_2xx, 1);
-          } else if (status >= 300 && status < 400) {
-            atomic_fetch_add(&global_stats.http_status_3xx, 1);
-          } else if (status >= 400 && status < 500) {
-            atomic_fetch_add(&global_stats.http_status_4xx, 1);
-          } else if (status >= 500 && status < 600) {
-            atomic_fetch_add(&global_stats.http_status_5xx, 1);
-          }
-          // TTFB latency — recorded unconditionally (see request-start capture in
-          // handle_on_message_complete); the histogram is a first-class L7 metric,
-          // not gated behind the optional HAVE_HTTP_TRACE trace subsystem.
-          if (rfd_ent->metric_req_start_ns > 0) {
-            uint64_t latency_us = (get_timestamp_ns() - rfd_ent->metric_req_start_ns) / 1000;
-            record_latency_sample(latency_us);
-          }
+          // Status, class counter and TTFB sample, once per request.
+          int noted = proxy_note_client_response(rfd_ent, status);
           // Origin-error breaker feed for plain (non-P/D) relay: an endpoint
           // that accepts TCP but keeps answering 5xx never trips the
           // connect-level breaker, and prefix affinity keeps re-selecting it.
@@ -1678,7 +1703,7 @@ skip_deferred_masking:
           // for load accounting). 4xx neither extends nor resets the streak:
           // engines answer 4xx/5xx to client-fault bodies, and only a
           // consecutive-5xx streak should demote.
-          if (rfd_ent->pd_phase == PD_PHASE_NONE &&
+          if (noted && rfd_ent->pd_phase == PD_PHASE_NONE &&
               rfd_ent->epv && rfd_ent->ep_num >= 0) {
             proxy_epval_t *repval = (proxy_epval_t *)rfd_ent->epv;
             if (status >= 500) {
@@ -1798,7 +1823,14 @@ skip_deferred_masking:
             PROXY_ENT_UNLOCK(rfd_ent);
 
             /* Initiate decode phase */
-            if (pd_initiate_decode(rfd_ent) < 0) {
+            int dec_rc = pd_initiate_decode(rfd_ent);
+            if (dec_rc == PD_DECODE_ANSWERED) {
+              /* The prefill leg's reply answered the client: no decode leg,
+               * so nothing later on this path records the request. */
+              PROXY_ENT_LOCK(rfd_ent);
+              proxy_ai_record_completion(rfd_ent);
+              PROXY_ENT_UNLOCK(rfd_ent);
+            } else if (dec_rc < 0) {
               log_error("Failed to initiate decode — client_fd=%d",
                         rfd_ent->fd);
               atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
@@ -2272,7 +2304,8 @@ skip_deferred_masking:
         }
         int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
         const char *ns_model = proxy_effective_model(rfd_ent);
-        llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv, 0);
+        llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv,
+                         pd_decode_error_phase(rfd_ent->metric_response_status));
         rfd_ent->pd_phase = PD_PHASE_COMPLETE;
         /* The disaggregated response is complete: its capacity units go back
          * here, not at the teardown of a connection that may stay open. */
@@ -6344,7 +6377,8 @@ proxy_pdestroy(void *priv)
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
                      pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
-            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
+            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv,
+                             pd_decode_error_phase(client_pfe->metric_response_status));
           }
           pd_cleanup(client_pfe);
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
@@ -8869,6 +8903,7 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->http_pok = 0;
   pfe->http_hok = 0;
   pfe->http_hvok = 0;
+  pfe->host_url[0] = '\0';
   pfe->http_hdrs_done = 0;
   pfe->http_body_complete = 0;
   pfe->http_content_length = 0;
@@ -9749,6 +9784,7 @@ handle_on_message_complete(llhttp_t* parser)
     pfe->metric_req_start_ns = get_timestamp_ns();
     pfe->metric_response_status = 0;
     pfe->metric_ai_recorded = 0;   // re-arm per request (keep-alive connection reuse)
+    resp_note_rearm(&pfe->metric_resp_noted);
   }
 
   // AI Gateway: Enforce X-Api-Key validation and per-key / per-tenant RPS limits.
@@ -10156,7 +10192,13 @@ handle_on_message_complete(llhttp_t* parser)
                  client_pfe->fd, pfe->fd, client_pfe->pd_prefill_resp_len);
 
         /* Trigger decode phase — connect to decode EP and send request */
-        if (pd_initiate_decode(client_pfe) < 0) {
+        int dec_rc = pd_initiate_decode(client_pfe);
+        if (dec_rc == PD_DECODE_ANSWERED) {
+          /* Answered from the prefill leg: record the request here. */
+          PROXY_ENT_LOCK(client_pfe);
+          proxy_ai_record_completion(client_pfe);
+          PROXY_ENT_UNLOCK(client_pfe);
+        } else if (dec_rc < 0) {
           log_error("Failed to initiate decode — client_fd=%d",
                     client_pfe->fd);
           atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
@@ -12084,6 +12126,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->http_pok = 0;
     pfe->http_hok = 0;
     pfe->http_hvok = 0;
+    pfe->host_url[0] = '\0';
     pfe->http_hdrs_done = 0;
     pfe->http_body_complete = 0;
     pfe->http_content_length = 0;
@@ -12952,6 +12995,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
         // Reset flags before parsing
         int json_stream_was_pending = pfe->json_stream_route_pending;
+        int hdrs_were_done = pfe->http_hdrs_done;  /* header block completed in an earlier read */
         pfe->http_pok = 0;
         pfe->http_hok = 0;
         pfe->http_hvok = 0;
@@ -12989,10 +13033,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         pfe->parsed_off = pfe->rcv_off;
 
         /* llhttp reports the Host callbacks only while parsing the headers.
-         * An oversize JSON request deliberately spans another read while we
-         * wait for its body model, so restore the already-proven header state
-         * for that continuation read. */
-        if (json_stream_was_pending || (sp_mcp_enabled(pfe) && pfe->http_hdrs_done)) {
+         * A continuation read of the same request — an oversize JSON request
+         * waiting for its body model, or any request whose header block
+         * completed in an earlier read and whose body arrives in this one —
+         * sees none of them, so restore the already-proven header state.
+         * Without it the body read selects with no Host and bypasses model
+         * routing. host_url is cleared at every request boundary, so it holds
+         * this request's Host or nothing. */
+        if (json_stream_was_pending || pfe->http_hdrs_done) {
           pfe->http_hok = 1;
           pfe->http_hvok = pfe->host_url[0] != '\0';
         }
@@ -13031,8 +13079,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // - File uploads (>64KB) benefit from streaming → prevents buffer overflow
           // - Conservative threshold ensures we catch 250KB uploads (customer case)
 
-          // upload detection instrument: one line per request, so debug level only
-          if (pfe->http_hok) {
+          // upload detection instrument: one line per request, so debug level only.
+          // Logged on the read that completes the header block: the header state
+          // is restored on every later read of the request, so http_hok alone
+          // would repeat it for each buffered body read.
+          if (pfe->http_hdrs_done && !hdrs_were_done) {
             log_debug("[UPLOAD_DEBUG] fd=%d: pok=%d hok=%d hvok=%d Content-Length=%zu threshold=%d",
                      fd, pfe->http_pok, pfe->http_hok, pfe->http_hvok,
                      pfe->http_content_length, (64 * 1024));
@@ -13460,6 +13511,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->http_pok = 0;
           pfe->http_hok = 0;
           pfe->http_hvok = 0;
+          pfe->host_url[0] = '\0';
           pfe->http_hdrs_done = 0;
           pfe->http_body_complete = 0;
           pfe->http_content_length = 0;
