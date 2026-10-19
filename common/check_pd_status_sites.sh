@@ -113,5 +113,34 @@ else
   fi
 fi
 
+# 3. An origin 4xx prefill reply is decided before the decode leg is built:
+#    pd_initiate_decode consults pd_prefill_status_verdict ahead of the
+#    transfer-params extract, and the relay that answers from it sets the status.
+fn=$(awk '/^pd_initiate_decode\(/ {on = 1} on {print} on && /^}/ {exit}' ./sockproxy_pd_vllm.c)
+verdict_ln=$(printf '%s\n' "$fn" | grep -n 'pd_prefill_status_verdict(pr_status' | head -1 | cut -d: -f1)
+extract_ln=$(printf '%s\n' "$fn" | grep -n '1. Extract the transfer params' | head -1 | cut -d: -f1)
+if [ -z "$verdict_ln" ] || [ -z "$extract_ln" ] || [ "$verdict_ln" -gt "$extract_ln" ]; then
+  echo "sockproxy_pd_vllm.c: pd_initiate_decode must call pd_prefill_status_verdict(pr_status, ...) before the transfer-params extract"
+  fail=1
+fi
+relay=$(awk '/^pd_prefill_reject_relay\(/ {on = 1} on {print} on && /^}/ {exit}' ./sockproxy_pd_vllm.c)
+if ! printf '%s\n' "$relay" | grep -q 'proxy_note_client_response(client_pfe'; then
+  echo "sockproxy_pd_vllm.c: pd_prefill_reject_relay must record the response (proxy_note_client_response)"
+  fail=1
+fi
+if ! printf '%s\n' "$trt" | grep -q 'ret = PD_DECODE_ANSWERED;'; then
+  echo "sockproxy_pd_vllm.c: the TensorRT-LLM early exit must return PD_DECODE_ANSWERED so its caller records the request"
+  fail=1
+fi
+
+# 4. Every caller of pd_initiate_decode records a request the prefill leg
+#    answered: nothing later on that path does.
+calls=$(grep 'pd_initiate_decode(' ./sockproxy_http.c | grep -cvE '^[[:space:]]*(\*|/\*|//)' || true)
+handled=$(grep -A4 '== PD_DECODE_ANSWERED' ./sockproxy_http.c | grep -c 'proxy_ai_record_completion(' || true)
+if [ "$calls" -lt 1 ] || [ "$calls" != "$handled" ]; then
+  echo "sockproxy_http.c: $calls pd_initiate_decode() call(s), $handled record a PD_DECODE_ANSWERED request (proxy_ai_record_completion)"
+  fail=1
+fi
+
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded)"

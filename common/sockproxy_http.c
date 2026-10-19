@@ -1823,7 +1823,14 @@ skip_deferred_masking:
             PROXY_ENT_UNLOCK(rfd_ent);
 
             /* Initiate decode phase */
-            if (pd_initiate_decode(rfd_ent) < 0) {
+            int dec_rc = pd_initiate_decode(rfd_ent);
+            if (dec_rc == PD_DECODE_ANSWERED) {
+              /* The prefill leg's reply answered the client: no decode leg,
+               * so nothing later on this path records the request. */
+              PROXY_ENT_LOCK(rfd_ent);
+              proxy_ai_record_completion(rfd_ent);
+              PROXY_ENT_UNLOCK(rfd_ent);
+            } else if (dec_rc < 0) {
               log_error("Failed to initiate decode — client_fd=%d",
                         rfd_ent->fd);
               atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
@@ -10183,7 +10190,13 @@ handle_on_message_complete(llhttp_t* parser)
                  client_pfe->fd, pfe->fd, client_pfe->pd_prefill_resp_len);
 
         /* Trigger decode phase — connect to decode EP and send request */
-        if (pd_initiate_decode(client_pfe) < 0) {
+        int dec_rc = pd_initiate_decode(client_pfe);
+        if (dec_rc == PD_DECODE_ANSWERED) {
+          /* Answered from the prefill leg: record the request here. */
+          PROXY_ENT_LOCK(client_pfe);
+          proxy_ai_record_completion(client_pfe);
+          PROXY_ENT_UNLOCK(client_pfe);
+        } else if (dec_rc < 0) {
           log_error("Failed to initiate decode — client_fd=%d",
                     client_pfe->fd);
           atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);

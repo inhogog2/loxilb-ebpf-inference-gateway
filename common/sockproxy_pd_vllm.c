@@ -78,6 +78,50 @@ pd_receipt_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
  * Creates a new backend connection to the decode EP, builds the decode request
  * (original body + kv_params), and sends it. The decode response will flow to
  * the client via normal proxy path (including SSE streaming). */
+/* Hand an origin 4xx prefill reply to the client verbatim and end the P/D
+ * flow without a decode leg. The response is recorded here because the
+ * response path does not capture the prefill leg's; the caller writes the
+ * completion record (PD_DECODE_ANSWERED). Runs with no proxy locks held, as
+ * the TensorRT-LLM early exit does.
+ *
+ * The engine answered a request the gateway rewrote, so the log line names
+ * the rewrite (the dialect's prefill rewriter, the failover's receipt rewrite,
+ * the body before and after) beside the engine's own error string: a reject
+ * of the client's request reads apart from a reject of the rewrite. */
+static void
+pd_prefill_reject_relay(proxy_fd_ent_t *client_pfe, const uint8_t *resp,
+                        size_t resp_len, int status, int is_trt,
+                        size_t orig_body_len)
+{
+  char engine_err[160];
+
+  pd_resp_error_excerpt(resp, resp_len, engine_err, sizeof(engine_err));
+  proxy_note_client_response(client_pfe, (uint16_t)status);
+  if (client_pfe->fd > 0 && resp && resp_len > 0) {
+    if (client_pfe->ssl) {
+      SSL_write(client_pfe->ssl, resp, (int)resp_len);
+    } else {
+      send(client_pfe->fd, resp, resp_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+  }
+  log_warn("prefill EP%d answered origin %d — relaying it verbatim, no decode "
+           "leg (client_fd=%d rewrite=%s failover=%u body=%zu->%zu "
+           "engine=\"%s\")", client_pfe->pd_prefill_ep_idx, status,
+           client_pfe->fd,
+           is_trt ? "trtllm-context-splice"
+                  : "vllm-probe(max_tokens=1,stream=false,+kv_transfer_params)",
+           (unsigned)client_pfe->pd_prefill_retries, orig_body_len,
+           client_pfe->pd_prefill_body_len, engine_err);
+  {
+    /* Nothing in the gateway failed and nothing timed out: the request was
+     * rejected upstream (the SGLang dialect records the same reject). */
+    const char *pd_model = proxy_effective_model(client_pfe);
+    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 5 /*prefill rejected*/);
+  }
+  client_pfe->pd_phase = PD_PHASE_COMPLETE;
+  pd_cleanup(client_pfe);
+}
+
 int
 pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 {
@@ -191,6 +235,16 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 
   int is_trt = (tepval->pd_engine == PD_ENGINE_TRTLLM);
 
+  /* An origin 4xx answers the request: relay it verbatim and do not call the
+   * decode leg (pd_prefill_status_verdict). A 5xx, a 408 or 429 and an unknown
+   * status keep the decode-recompute degradation below. */
+  if (pd_prefill_status_verdict(pr_status, l_prefill_truncated) == PD_PR_RELAY) {
+    pd_prefill_reject_relay(client_pfe, l_prefill, l_prefill_len, pr_status,
+                            is_trt, l_body_len);
+    ret = PD_DECODE_ANSWERED;
+    goto out;
+  }
+
   /* TRT-LLM early exit: a 200 context response whose finish_reason is
    * neither "length" nor "not_finished" already finished the request in
    * the context step — relay it and skip the decode leg entirely. Gated on
@@ -203,7 +257,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     proxy_note_client_response(client_pfe, (uint16_t)pr_status);
     pd_trt_early_exit_relay(client_pfe, l_prefill, l_prefill_len,
                             pd_trt_stream_requested(l_body, l_body_len));
-    ret = 0;
+    ret = PD_DECODE_ANSWERED;
     goto out;
   }
 

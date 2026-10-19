@@ -284,6 +284,84 @@ test_http_resp_status(void)
   printf("  [PASS] pd_http_resp_status: codes parsed, malformed -> unknown\n");
 }
 
+/* pd_resp_error_excerpt: the engine's error string for the relay's log line,
+ * from either vLLM error shape, else the body's leading bytes; bounded, and
+ * one log line whatever the body holds. */
+static void
+test_resp_error_excerpt(void)
+{
+  char out[64];
+  static const char flat[] =
+      "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\r\n"
+      "{\"object\":\"error\",\"message\":\"The model `mon03-alias` does not exist.\","
+      "\"type\":\"NotFoundError\",\"param\":null,\"code\":404}";
+  static const char nested[] =
+      "HTTP/1.1 400 Bad Request\r\n\r\n"
+      "{\"error\": {\"message\" : \"max_tokens \\\"1\\\" invalid\", \"code\": 400}}";
+  static const char plain[] = "HTTP/1.1 413 Payload Too Large\r\n\r\ntoo\r\nlarge";
+  static const char nobody[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 0";
+
+  assert(pd_resp_error_excerpt((const uint8_t *)flat, sizeof(flat) - 1, out, sizeof(out)) > 0);
+  assert(strcmp(out, "The model `mon03-alias` does not exist.") == 0);
+  pd_resp_error_excerpt((const uint8_t *)nested, sizeof(nested) - 1, out, sizeof(out));
+  assert(strcmp(out, "max_tokens \\\"1\\\" invalid") == 0 && "an escaped quote does not end it");
+  pd_resp_error_excerpt((const uint8_t *)plain, sizeof(plain) - 1, out, sizeof(out));
+  assert(strcmp(out, "too..large") == 0 && "no message key: the body, control bytes masked");
+  assert(pd_resp_error_excerpt((const uint8_t *)nobody, sizeof(nobody) - 1, out, sizeof(out)) == 0 &&
+         out[0] == '\0');
+  assert(pd_resp_error_excerpt(NULL, 0, out, sizeof(out)) == 0 && out[0] == '\0');
+  {
+    char small[8];
+    assert(pd_resp_error_excerpt((const uint8_t *)flat, sizeof(flat) - 1, small, sizeof(small)) == 7);
+    assert(strcmp(small, "The mod") == 0 && "bounded by cap");
+    /* bounded by len: the message is cut where the buffer ends */
+    size_t cut = (size_t)(strstr(flat, "does") - flat);
+    pd_resp_error_excerpt((const uint8_t *)flat, cut, out, sizeof(out));
+    assert(strcmp(out, "The model `mon03-alias` ") == 0);
+  }
+  printf("  [PASS] pd_resp_error_excerpt: message of either shape, else body; bounded\n");
+}
+
+/* pd_prefill_status_verdict: an origin 4xx prefill reply is relayed verbatim
+ * and decode is not called; a 5xx, a 408 and a 429 keep the decode-recompute
+ * degradation; an unknown status is neither; a truncated reply is never
+ * relayed. */
+static void
+test_prefill_status_verdict(void)
+{
+  assert(pd_prefill_status_verdict(0, 0)   == PD_PR_DECODE && "unknown -> decode");
+  assert(pd_prefill_status_verdict(200, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(204, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(301, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(399, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(400, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(404, 0) == PD_PR_RELAY && "unknown model is a reject");
+  assert(pd_prefill_status_verdict(408, 0) == PD_PR_DECODE && "engine timeout is transient");
+  assert(pd_prefill_status_verdict(409, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(413, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(422, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(429, 0) == PD_PR_DECODE && "engine backpressure is transient");
+  assert(pd_prefill_status_verdict(499, 0) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(404, 1) == PD_PR_DECODE &&
+         "a truncated reply is not the origin's response: never relayed");
+  assert(pd_prefill_status_verdict(500, 0) == PD_PR_DECODE && "5xx keeps decode recompute");
+  assert(pd_prefill_status_verdict(503, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(599, 0) == PD_PR_DECODE);
+  /* composed with the parser, as pd_initiate_decode uses them */
+  {
+    static const char nf404[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\n{}";
+    static const char ok200[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)nf404, sizeof(nf404) - 1), 0) == PD_PR_RELAY);
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)ok200, sizeof(ok200) - 1), 0) == PD_PR_DECODE);
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)"HTTP/1.1 40", 11), 0) == PD_PR_DECODE &&
+           "an unparsable status line is unknown, not a reject");
+  }
+  printf("  [PASS] pd_prefill_status_verdict: 4xx relay, 5xx/408/429/unknown/truncated decode\n");
+}
+
 int
 main(void)
 {
@@ -298,6 +376,8 @@ main(void)
   test_graceful_slow_stream_not_reaped();
   test_graceful_guards();
   test_http_resp_status();
+  test_resp_error_excerpt();
+  test_prefill_status_verdict();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }
