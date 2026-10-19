@@ -97,6 +97,9 @@ pd_connect_decode(proxy_fd_ent_t *c, int fd, uint64_t gen, int *selected,
   proxy_epval_t *t = c->epv;
   int original = *selected;
   uint32_t owned = __atomic_load_n(&c->pd_decode_load_token, __ATOMIC_ACQUIRE);
+  /* The endpoint the request's own unit is on (the token), not the routing
+   * hint: a candidate is provisional unless the unit is already there. */
+  int owned_ep = owned ? (int)owned - 1 : -1;
   uint32_t excluded = 0;
   int attempts = 0;
   while (attempts < 2 && pd_decode_connect_valid(c, fd, gen)) {
@@ -104,7 +107,7 @@ pd_connect_decode(proxy_fd_ent_t *c, int fd, uint64_t gen, int *selected,
     if (pd_select_decode_excluding(t, c, &ep, excluded) < 0)
       break;
     c->pd_decode_ep_idx = original; /* Selection is not ownership publication. */
-    int provisional = ep != original || !owned;
+    int provisional = ep != owned_ep;
     if (provisional && !pd_load_try_reserve(t, ep, 0)) {
       excluded |= UINT32_C(1) << ep;
       continue; /* Saturated candidates do not consume a dial attempt. */
@@ -117,6 +120,9 @@ pd_connect_decode(proxy_fd_ent_t *c, int fd, uint64_t gen, int *selected,
       if (provisional) pd_load_put(t, ep);
       if (connected >= 0) close(connected);
       if (!valid) return -1;
+      /* A refused connect is the endpoint's failure, not only this
+       * request's: the breaker counts it, as the prefill retries do. */
+      circuit_breaker_record_failure(t, ep);
       excluded |= UINT32_C(1) << ep;
       log_warn("[PD_DECODE_CONNECT] client_fd=%d failed_ep=%d attempt=%d/2",
                fd, ep, attempts);

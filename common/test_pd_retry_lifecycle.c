@@ -420,7 +420,7 @@ static void run_decode_case(int owned, int mode, int nth_alloc)
   reset_pool();
   pool->pd_engine = PD_ENGINE_VLLM;
   initiate_mode = 1; d_dials = 0;
-  first_d_fails = mode != 1 && mode != 8;
+  first_d_fails = mode != 1 && mode != 8 && mode != 15;
   fail_decode = mode == 2;
   cancel_at = mode == 3 ? 1 : mode == 4 ? 2 : 0;
   if (mode == 5) pool->eps[4].inv = 1;
@@ -443,13 +443,19 @@ static void run_decode_case(int owned, int mode, int nth_alloc)
   c->pd_phase = PD_PHASE_PREFILL_DONE;
   atomic_store(&pool->pd_ep_loads[0].active_conns, 1);
   atomic_store(&pool->pd_ep_loads[3].active_conns, 1 + owned);
+  if (mode == 15) {
+    /* The request's unit is on Decode 4 while the routing hint names 3. */
+    c->pd_decode_load_token = 5;
+    atomic_store(&pool->pd_ep_loads[3].active_conns, 1);
+    atomic_store(&pool->pd_ep_loads[4].active_conns, 1);
+  }
   const char *body = "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":\"retry\"}],\"max_tokens\":32,\"stream\":true}";
   const char *headers = "POST /v1/chat/completions HTTP/1.1\r\nHost: fixture\r\nX-Request-ID: stable-retry-id\r\nContent-Length: 0\r\n\r\n";
   const char *prefill = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"kv_transfer_params\":{\"remote_engine_id\":\"fixture-kv\"}}";
   c->pd_saved_body = (uint8_t *)strdup(body); c->pd_saved_body_len = strlen(body);
   c->pd_saved_headers = (uint8_t *)strdup(headers); c->pd_saved_headers_len = strlen(headers);
   c->pd_prefill_resp_buf = (uint8_t *)strdup(prefill); c->pd_prefill_resp_len = strlen(prefill);
-  if (mode >= 9) {
+  if (mode >= 9 && mode <= 14) {
     if (mode == 9) c->pd_phase = PD_PHASE_DECODE_SENDING;
     if (mode == 10) c->pd_phase = PD_PHASE_DECODE_STREAMING;
     if (mode == 11) c->pd_decode_bytes_received = 1;
@@ -461,12 +467,20 @@ static void run_decode_case(int owned, int mode, int nth_alloc)
   int result = pd_initiate_decode(c);
   allocation_armed = 0;
   int allocations = allocation_calls;
-  if (mode >= 9) {
+  if (mode >= 9 && mode <= 14) {
     assert(result < 0 && !d_dials && c->pd_saved_body && c->pd_prefill_resp_buf);
   } else if (!nth_alloc && !fail_shell_at && !write_failure) {
-    if (mode == 0 || mode == 1 || mode == 8) {
+    if (mode == 0 || mode == 1 || mode == 8 || mode == 15) {
       assert(!result && registrations == 1 && !p_dials);
-      int selected = mode == 1 ? 3 : 4;
+      int selected = mode == 1 || mode == 15 ? 3 : 4;
+      if (mode == 15) {
+        /* Dialled 3, so the unit moved there: reserved on 3 at the handoff,
+         * the one on 4 returned. */
+        assert(atomic_load(&pool->pd_ep_loads[3].active_conns) == 2);
+        assert(atomic_load(&pool->pd_ep_loads[4].active_conns) == 0);
+      }
+      if (mode == 0) /* the refused connect counts on Decode 3's breaker */
+        assert(pool->circuit_breakers[3].state == CB_STATE_OPEN);
       assert(c->pd_decode_load_token == (unsigned)selected + 1);
       assert(c->pd_decode_ep_idx == selected && c->pd_prefill_load_token == 1);
       assert(d_dials == (mode == 0 ? 2 : 1));
@@ -547,6 +561,7 @@ int main(void)
     fail_shell_at = 1; run_decode_case(owned, 0, 0); fail_shell_at = 0;
     write_failure = 2; run_decode_case(owned, 0, 0); write_failure = 0;
   }
+  run_decode_case(1, 15, 0);
   pthread_rwlock_destroy(&instance.lock);
   puts("real retry TUs: commit, alternate dial, all-P/decode failure, invalid JSON, "
        "allocation matrix, shell and write failures, duplicate cleanup, "
