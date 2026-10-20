@@ -162,11 +162,27 @@ p = sys.argv[1]; s = open(p).read()
 a = s.index("  /* Every path from here goes to the decode leg.")
 b = s.index("pd_prefill_fallback_reason(pr_status, l_prefill_truncated);", a) + len("pd_prefill_fallback_reason(pr_status, l_prefill_truncated);")
 blk = s[a:b]; s = s[:a] + s[b:]
-r = s.index("  if (pd_prefill_status_verdict(pr_status, l_prefill_truncated) == PD_PR_RELAY) {")
+r = s.index("  if (pd_prefill_status_verdict(pr_status) == PD_PR_RELAY) {")
 s = s[:r] + blk + "\n\n" + s[r:]
 open(p, "w").write(s)
 PY
 expect "8b: the fallback reason is set before the relay verdict" "the fallback reason must be set once, after the relay verdict"
+
+# 3b: a cut 4xx is relayed by its status with the gateway's body.
+fresh
+mut sockproxy_pd_leak.h 'pd_prefill_status_verdict(int status)
+{
+  return (status >= 400 && status < 500 && status != 408 && status != 429)' 'pd_prefill_status_verdict(int status, int truncated)
+{
+  return (status >= 400 && status < 500 && status != 408 && status != 429 &&
+          !truncated)'
+expect "3b: the verdict sends a cut 4xx to decode again" "pd_prefill_status_verdict must decide by the status alone"
+fresh
+mut sockproxy_pd_vllm.c '                            is_trt, l_body_len, l_prefill_truncated);' '                            is_trt, l_body_len, 0);'
+expect "3b: the relay is not told the reply was cut" "must be relayed with the gateway's body"
+fresh
+mut sockproxy_pd_vllm.c '    resp = cl ? (const uint8_t *)cut : NULL;' '    (void)cl;'
+expect "3b: the cut reply is written as it is" "must be relayed with the gateway's body"
 
 # 7c: the helper's unit (test_pd_record.py) catches a helper that keeps the
 # values for a second record, or reports milliseconds.

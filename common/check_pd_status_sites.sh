@@ -122,12 +122,24 @@ fn=$(awk '/^pd_initiate_decode\(/ {on = 1} on {print} on && /^}/ {exit}' ./sockp
 verdict_ln=$(printf '%s\n' "$fn" | grep -n 'pd_prefill_status_verdict(pr_status' | head -1 | cut -d: -f1)
 extract_ln=$(printf '%s\n' "$fn" | grep -n '1. Extract the transfer params' | head -1 | cut -d: -f1)
 if [ -z "$verdict_ln" ] || [ -z "$extract_ln" ] || [ "$verdict_ln" -gt "$extract_ln" ]; then
-  echo "sockproxy_pd_vllm.c: pd_initiate_decode must call pd_prefill_status_verdict(pr_status, ...) before the transfer-params extract"
+  echo "sockproxy_pd_vllm.c: pd_initiate_decode must call pd_prefill_status_verdict(pr_status) before the transfer-params extract"
   fail=1
 fi
 relay=$(awk '/^pd_prefill_reject_relay\(/ {on = 1} on {print} on && /^}/ {exit}' ./sockproxy_pd_vllm.c)
 if ! printf '%s\n' "$relay" | grep -q 'proxy_note_client_response(client_pfe'; then
   echo "sockproxy_pd_vllm.c: pd_prefill_reject_relay must record the response (proxy_note_client_response)"
+  fail=1
+fi
+# 3b. A 4xx reply cut at the buffer cap is relayed by its status, not sent to
+#     the decode leg (F-12): the verdict does not read the cut, the relay is
+#     told of it, and writes the gateway's short body in place of the cut one.
+if ! grep -q '^pd_prefill_status_verdict(int status)$' ./sockproxy_pd_leak.h; then
+  echo "sockproxy_pd_leak.h: pd_prefill_status_verdict must decide by the status alone (a cut 4xx is relayed, not recomputed)"
+  fail=1
+fi
+if ! printf '%s\n' "$fn" | tr '\n' ' ' | grep -q 'pd_prefill_reject_relay(client_pfe, l_prefill, l_prefill_len, pr_status, *is_trt, l_body_len, l_prefill_truncated);' || \
+   ! printf '%s\n' "$relay" | tr '\n' ' ' | grep -q 'if (truncated) { *size_t cl = pd_prefill_cut_reject(status, cut, sizeof(cut)); *resp = cl ? (const uint8_t \*)cut : NULL;'; then
+  echo "sockproxy_pd_vllm.c: a prefill 4xx cut at the buffer cap must be relayed with the gateway's body (pd_prefill_cut_reject), not the cut reply"
   fail=1
 fi
 if ! printf '%s\n' "$trt" | grep -q 'ret = PD_DECODE_ANSWERED;'; then
@@ -278,7 +290,7 @@ fi
 fbw=$(grep -n 'pd_fallback_reason =' ./sockproxy*.c | grep -v '= 0;' || true)
 fbn=$(printf '%s\n' "$fbw" | grep -c . || true)
 fbl=$(printf '%s\n' "$fbw" | grep '^./sockproxy_pd_vllm.c:' | cut -d: -f2)
-relay=$(grep -n 'pd_prefill_status_verdict(pr_status, l_prefill_truncated) == PD_PR_RELAY' ./sockproxy_pd_vllm.c | cut -d: -f1)
+relay=$(grep -n 'pd_prefill_status_verdict(pr_status) == PD_PR_RELAY' ./sockproxy_pd_vllm.c | cut -d: -f1)
 early=$(grep -n 'pd_trt_ctx_early_exit_check(l_prefill, l_prefill_len)' ./sockproxy_pd_vllm.c | cut -d: -f1)
 if [ "$fbn" != "1" ] || [ -z "$fbl" ] || [ -z "$relay" ] || [ -z "$early" ] || \
    [ "$fbl" -le "$relay" ] || [ "$fbl" -le "$early" ]; then
