@@ -180,31 +180,56 @@ if [ "$g" != "1" ]; then
   fail=1
 fi
 
-# 6. A P/D request a reaper or a dying decode leg ends has a lifecycle record.
-#    The stream timeout (ERR-01), the generic idle reaper, the duration cap and
-#    the stalled-client abort each call pd_reap_lifecycle right before handing
-#    the connection to pd_reap_respond, and the decode EOF mid-stream records
-#    decode/error and moves the request to ERROR before the sweep can see it.
-for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_PD_IDLE_TIMEOUT SP_REAP_SSE_CAP SP_REAP_SSE_STALL; do
+# 6. A P/D request a reaper or a dying decode leg ends is recorded by its
+#    cause, never by the mechanism that ended it. The stream timeout (ERR-01),
+#    the generic idle reaper and the duration cap each call pd_reap_lifecycle
+#    right before handing the connection to pd_reap_respond; ERR-01 and the cap
+#    name decode/truncated (8): engine silence, a policy cap. The stalled-client
+#    abort makes no record (pd_reap_unrecorded): it is the client's, not the
+#    engine's. No reaper records decode/error (2), and pd_reap_error_phase never
+#    returns it: 2 is the engine's death, which the decode EOF mid-stream
+#    records, moving the request to ERROR before the sweep can see it.
+for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_PD_IDLE_TIMEOUT SP_REAP_SSE_CAP; do
   ok=$(grep -B3 "pd_reap_respond(pfe, $kind);" ./sockproxy_health.c | grep -c 'pd_reap_lifecycle(pfe, ' || true)
   if [ "$ok" != "1" ]; then
     echo "sockproxy_health.c: the $kind reap is not preceded by its lifecycle record (pd_reap_lifecycle)"
     fail=1
   fi
 done
+for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_SSE_CAP; do
+  ok=$(grep -B3 "pd_reap_respond(pfe, $kind);" ./sockproxy_health.c | grep -c 'pd_reap_lifecycle(pfe, 8 /\*decode truncated\*/);' || true)
+  if [ "$ok" != "1" ]; then
+    echo "sockproxy_health.c: the $kind reap must record decode/truncated (8): the gateway ended the answer, the engine did not die"
+    fail=1
+  fi
+done
+st=$(grep -B3 'pd_reap_respond(pfe, SP_REAP_SSE_STALL);' ./sockproxy_health.c)
+if ! printf '%s' "$st" | grep -q 'pd_reap_unrecorded(pfe);' || printf '%s' "$st" | grep -q 'pd_reap_lifecycle('; then
+  echo "sockproxy_health.c: the stalled-client reap must make no lifecycle record and leave the in-flight phases (pd_reap_unrecorded)"
+  fail=1
+fi
+r2=$(grep -n '2 /\*decode error\*/' ./sockproxy_health.c || true)
+r2f=$(awk '/^pd_reap_error_phase\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_pd_leak.h | grep -n 'return 2;' || true)
+if [ -n "$r2" ] || [ -n "$r2f" ]; then
+  echo "a reaper records decode/error (2), the engine's death, for an answer the gateway ended:"
+  printf '%s\n' "$r2" "$r2f" | sed '/^$/d'
+  fail=1
+fi
 eofb=$(awk '/decode backend EOF mid-stream/ {on = 1} on && /pd_sg_close_drain\(/ {exit} on' ./sockproxy_http.c | tr '\n' ' ')
 if ! printf '%s' "$eofb" | grep -q 'sp_pd_record([^;]*2 /\*decode error\*/);.*pd_phase = PD_PHASE_ERROR;'; then
   echo "sockproxy_http.c: the decode EOF mid-stream must record decode/error and move the request to ERROR"
   fail=1
 fi
 
-# 6b. The stream the sweep ended cleanly has its request record: the reaper's
-#     record for that kind writes the completion with the status the client
-#     received (the [DONE] scanner, which writes it otherwise, never ran).
+# 6b. An answer a teardown reaper ended has its request record. A teardown
+#     kind frees the client inline (pd_teardown_conn), so neither the [DONE]
+#     scanner nor the teardown writes it: sp_reap_record writes what is owed for
+#     every teardown kind, with the status the client received
+#     (test_reap_request_record.py drives each reaper after a 200).
 gd=$(awk '/^sp_reap_record\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_health.c | tr '\n' ' ' \
-     | grep -c 'case SP_REAP_PD_GRACEFUL_DONE:[^}]*proxy_record_reaped_stream(pfe);' || true)
+     | grep -c 'if (sp_reap_texts\[kind\].teardown) {[ ]*proxy_record_reaped_answer(pfe);' || true)
 if [ "$gd" != "1" ]; then
-  echo "sockproxy_health.c: sp_reap_record must write the request record of a stream the sweep ended (proxy_record_reaped_stream)"
+  echo "sockproxy_health.c: sp_reap_record must write the request record of an answer a teardown reaper ended (proxy_record_reaped_answer)"
   fail=1
 fi
 
@@ -262,4 +287,4 @@ if [ "$fbn" != "1" ] || [ -z "$fbl" ] || [ -z "$relay" ] || [ -z "$early" ] || \
 fi
 
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded; each record crosses as both calls; the first event and the fallback reason have one writer each)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; each record crosses as both calls; the first event and the fallback reason have one writer each)"

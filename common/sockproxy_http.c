@@ -247,14 +247,15 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
   proxy_ai_record_completion_(pfe, 0);
 }
 
-/* A stream the client was receiving, ended by a reaper with a clean end of its
- * own (the graceful-[DONE] sweep's terminator), never reaches the [DONE]
- * scanner's record: its request record is written here, once, with the status
- * the client received. */
+/* An answer the client was receiving, ended by a reaper that frees the
+ * connection inline (the graceful-[DONE] sweep's terminator, a stream-silence
+ * or idle cut after the 200), never reaches the [DONE] scanner's record nor the
+ * teardown's: its request record is written here, once, with the status the
+ * client received. A stream is one the client was sent as a stream. */
 void
-proxy_record_reaped_stream(proxy_fd_ent_t *pfe)
+proxy_record_reaped_answer(proxy_fd_ent_t *pfe)
 {
-  proxy_ai_record_completion_(pfe, 1);
+  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0);
 }
 
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {

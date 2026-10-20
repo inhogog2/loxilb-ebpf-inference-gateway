@@ -446,8 +446,9 @@ test_prefill_fallback_reason(void)
 }
 
 /* pd_reap_error_phase: a request a reaper ends is named by the phase it was
- * in; anything not in flight has no record to make, which is what keeps the
- * record to one once the reaper moves the request to ERROR. */
+ * in; a begun answer the gateway ended is decode/truncated, never the engine's
+ * death (2); anything not in flight has no record to make, which is what keeps
+ * the record to one once the reaper moves the request to ERROR. */
 static void
 test_reap_error_phase(void)
 {
@@ -455,7 +456,7 @@ test_reap_error_phase(void)
     { 0, -1 },                         /* NONE: not a P/D request */
     { 1, 1 }, { 2, 1 }, { 3, 1 },      /* prefill legs: prefill / timeout */
     { 4, 3 },                          /* decode dispatched, no byte: decode / timeout */
-    { 5, 2 },                          /* the answer began: decode / error */
+    { 5, 8 },                          /* the answer began: decode / truncated */
     { 6, -1 }, { 7, -1 }, { 8, -1 },   /* COMPLETE, ERROR, PARKED */
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -465,7 +466,7 @@ test_reap_error_phase(void)
       assert(0);
     }
   }
-  printf("  [PASS] pd_reap_error_phase: prefill 1, decode-sending 3, streaming 2, else none\n");
+  printf("  [PASS] pd_reap_error_phase: prefill 1, decode-sending 3, streaming 8, else none\n");
 }
 
 int

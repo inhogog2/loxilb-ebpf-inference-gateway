@@ -18,6 +18,7 @@ prefix = r'''
 typedef struct {
  int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc, noted;
  uint64_t metric_req_start_ns;
+ long stream_start_ts;
  int usage_prompt_toks, usage_complet_toks, auth_src, adm_priority;
  int adm_class_set, adm_class, adm_objective_denied, adm_hint_not_applied;
  char tenant_id[32], auth_user_id[32], auth_key_id[32], l7_peer_ip[32];
@@ -145,20 +146,24 @@ int main(void){
  proxy_ai_record_completion(&p);
  assert(emitted==4 && observed_status==200);
  assert(observed_stream==0);
- /* A stream the reaper ended cleanly (the sweep's terminator): its request
-  * record is written once, as a stream, with the status the client received;
-  * not again, and not for a connection outside the AI population. */
- p=request();p.noted=1;p.metric_response_status=200;
- proxy_record_reaped_stream(&p);
+ /* An answer a reaper ended after its 200 (the sweep's terminator, a cut):
+  * its request record is written once, with the status the client received,
+  * as a stream when it was sent as one; not again, and not for a connection
+  * outside the AI population. */
+ p=request();p.noted=1;p.metric_response_status=200;p.stream_start_ts=100;
+ proxy_record_reaped_answer(&p);
  assert(emitted==5 && observed_status==200 && observed_stream==1 && p.metric_ai_recorded);
- proxy_record_reaped_stream(&p);
+ proxy_record_reaped_answer(&p);
  proxy_ai_record_completion(&p);
  assert(emitted==5);
- p=request();p.ai_gw_mode=0;p.metric_response_status=200;proxy_record_reaped_stream(&p);
- p=request();proxy_record_reaped_stream(&p); /* no status seen: nothing owed */
- assert(emitted==5);
+ p=request();p.noted=1;p.metric_response_status=200;
+ proxy_record_reaped_answer(&p);
+ assert(emitted==6 && observed_status==200 && observed_stream==0);
+ p=request();p.ai_gw_mode=0;p.metric_response_status=200;proxy_record_reaped_answer(&p);
+ p=request();proxy_record_reaped_answer(&p); /* no status seen: nothing owed */
+ assert(emitted==6);
  puts("backend-failure audit: identity/status, once-only, send failure, non-AI/backend/started guards PASS");
- puts("reaped stream: recorded once, as a stream, with the status the client received PASS");
+ puts("reaped answer: recorded once, with the status the client received, as a stream when sent as one PASS");
  puts("local answers: an outage completes with its status, a refusal is one deny record at its stage and never a completion, both record the response PASS");
 }
 '''

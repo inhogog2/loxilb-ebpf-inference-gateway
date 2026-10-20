@@ -365,6 +365,19 @@ pd_reap_lifecycle(proxy_fd_ent_t *pfe, int error_phase)
   pfe->pd_phase = PD_PHASE_ERROR;
 }
 
+/* A P/D request a reaper ends for a cause the lifecycle record cannot name
+ * yet: a client that stopped reading (the client's abort). It gets no record,
+ * because none of the existing phases would name the client rather than the
+ * engine. The request still leaves every in-flight phase, so no later pass and
+ * no decode EOF records it under another cause. */
+static void
+pd_reap_unrecorded(proxy_fd_ent_t *pfe)
+{
+  if (pd_reap_error_phase(pfe->pd_phase) >= 0) {
+    pfe->pd_phase = PD_PHASE_ERROR;
+  }
+}
+
 static void
 pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
 {
@@ -489,8 +502,10 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
  * writes itself"). A request still queued or parked never reached a backend:
  * its ending is a capacity refusal. A P/D request that timed out on its legs
  * was dispatched: its ending is a completion with the status written, unless
- * a response had already begun (the guards make that a no-op). The SSE events
- * are body bytes inside a response in progress, not a response. */
+ * a response had already begun (the guards make that a no-op, and the answer
+ * begun is recorded below). The SSE events are body bytes inside a response in
+ * progress, not a response; their connection is shut, not freed here, and its
+ * teardown writes what it owes. */
 static void
 sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
 {
@@ -514,13 +529,16 @@ sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
   case SP_REAP_PD_STREAM_TIMEOUT:
     proxy_record_local_completion(pfe, 502);
     break;
-  case SP_REAP_PD_GRACEFUL_DONE:
-    /* The stream ended cleanly, with the gateway's terminator: completed,
-     * with the status the client received. */
-    proxy_record_reaped_stream(pfe);
-    break;
   default:
     break;
+  }
+  /* A teardown kind frees the client inline (pd_teardown_conn), so the record
+   * a teardown owes is never written there. An answer the client was already
+   * receiving (the sweep's terminator, or a stream-silence or idle cut after
+   * its 200) is recorded here, once: completed, with the status the client
+   * received. Anything recorded above owes nothing more. */
+  if (sp_reap_texts[kind].teardown) {
+    proxy_record_reaped_answer(pfe);
   }
 }
 
@@ -1135,8 +1153,10 @@ check_draining_endpoints(void)
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;
             pfe->bp_since = 0;
-            /* A P/D stream cut for its stalled client: decode/error. */
-            pd_reap_lifecycle(pfe, 2 /*decode error*/);
+            /* A P/D stream ended for its stalled client: the client's
+             * abort, not the engine's. No lifecycle record
+             * (pd_reap_unrecorded). */
+            pd_reap_unrecorded(pfe);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);
             pfe = pfe_next;
             continue;
@@ -1167,9 +1187,10 @@ check_draining_endpoints(void)
             pfe->sse_active = 0;  /* Reset so eviction suppression no longer blocks cleanup */
             /* An error SSE event so the client can react, then both
              * directions shut; the event loop cleans up. Written by the
-             * socket's owner worker (pd_reap_respond). A P/D stream cut at
-             * its duration cap: decode/error. */
-            pd_reap_lifecycle(pfe, 2 /*decode error*/);
+             * socket's owner worker (pd_reap_respond). A P/D answer the
+             * duration cap ended: decode/truncated, the gateway's policy
+             * ended it, not the engine. */
+            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
             pd_reap_respond(pfe, SP_REAP_SSE_CAP);
           }
         }
@@ -1726,8 +1747,10 @@ check_draining_endpoints(void)
                       pfe->fd, (long)elapsed);
             /* real two-leg teardown (see above), the 502 first; both
              * written by the socket's owner worker (pd_reap_respond). The
-             * stream went silent and is cut with an error: decode/error. */
-            pd_reap_lifecycle(pfe, 2 /*decode error*/);
+             * engine went silent, the sweep's cause: decode/truncated. That
+             * this answer was cut rather than given a terminator is what
+             * pd_terminator_synthesized does not count. */
+            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_reap_respond(pfe, SP_REAP_PD_STREAM_TIMEOUT);
           }
@@ -1794,7 +1817,8 @@ check_draining_endpoints(void)
             log_error("generic P/D idle reaper — fd=%d pd_phase=%d "
                       "elapsed=%lds >= cap=%us",
                       pfe->fd, (int)pfe->pd_phase, (long)elapsed, idle_cap);
-            /* Named by the phase it wedged in (pd_reap_error_phase). */
+            /* Named by the phase it wedged in (pd_reap_error_phase): a
+             * silent stream is decode/truncated, as at ERR-01. */
             pd_reap_lifecycle(pfe, pd_reap_error_phase(pfe->pd_phase));
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_reap_respond(pfe, SP_REAP_PD_IDLE_TIMEOUT);

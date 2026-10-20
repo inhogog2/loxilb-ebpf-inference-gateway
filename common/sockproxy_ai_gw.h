@@ -544,29 +544,31 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                      failure mode is an operator-visible lie:
  *                        0 = complete / success
  *                        1 = prefill  / timeout   (prefill leg ran out of time)
- *                        2 = decode   / error     (decode leg failed or died: the
- *                                                  engine closed or the leg broke
- *                                                  before its answer was complete,
- *                                                  an EOF mid-stream included; or
- *                                                  a reaper cut the stream with an
- *                                                  error: the stream timeout, the
- *                                                  idle cap, the duration cap, a
- *                                                  stalled client)
+ *                        2 = decode   / error     (the engine died: it closed its
+ *                                                  connection, or the decode leg
+ *                                                  broke, before its answer was
+ *                                                  complete, an EOF mid-stream
+ *                                                  included. Never a reaper's:
+ *                                                  the cause is the engine's
+ *                                                  death, seen by the decode leg)
  *                        3 = decode   / timeout   (decode leg produced no byte)
  *                        4 = prefill  / error     (prefill leg failed or died)
  *                        5 = prefill  / rejected  (origin refused; relayed verbatim)
  *                        6 = decode   / rejected  (origin refused; relayed verbatim)
  *                        7 = decode   / unknown   (decode completed; its status
  *                                                  line was never read)
- *                        8 = decode   / truncated (the engine went silent with
- *                                                  its connection open and no
- *                                                  terminator; the gateway ended
- *                                                  the answer cleanly, with one,
- *                                                  where a reaper's cut ends it
- *                                                  with an error (2). Never 2:
- *                                                  once the engine has closed, the
- *                                                  EOF path records 2 and ends the
- *                                                  request before the sweep can)
+ *                        8 = decode   / truncated (the gateway ended or cut an
+ *                                                  in-progress answer for a cause
+ *                                                  other than engine death: engine
+ *                                                  silence (the graceful-[DONE]
+ *                                                  sweep, the stream timeout, the
+ *                                                  idle cap) or a policy cap (the
+ *                                                  duration cap). Whether it wrote
+ *                                                  a terminator or cut the answer
+ *                                                  with an error is what
+ *                                                  pd_terminator_synthesized
+ *                                                  counts. A client that stopped
+ *                                                  reading is not recorded here)
  *
  * Returns void.
  */

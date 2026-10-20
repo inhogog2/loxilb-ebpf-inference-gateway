@@ -59,17 +59,21 @@ expect "5: the body-complete record is a literal success" "a P/D completion reco
 
 # 5b: the graceful-[DONE] sweep records decode/truncated.
 fresh
-mut sockproxy_health.c '8 /*decode truncated*/);' '0);'
+mut sockproxy_health.c '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             0);'
 expect "5b: the sweep records a success again" "a reaper records a literal success (0)"
 fresh
-mut sockproxy_health.c '8 /*decode truncated*/);' '2 /*decode error*/);'
+mut sockproxy_health.c '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             2 /*decode error*/);'
 expect "5b: the sweep records decode/error" "the graceful-[DONE] sweep must record decode/truncated (8) once"
 fresh
 mut sockproxy_health.c 'sp_pd_record(pfe, pd_tmo_model, t_prefill_ms, 0, t_kv, 1);' 'sp_pd_record(pfe, pd_tmo_model, t_prefill_ms, 0, t_kv, 0);'
 expect "5b: another reaper records a success" "a reaper records a literal success (0)"
 
-# 6: every reaper and the decode EOF mid-stream record the request.
-for k in PD_STREAM_TIMEOUT PD_IDLE_TIMEOUT SSE_CAP SSE_STALL; do
+# 6: every reaper and the decode EOF mid-stream record the request, by cause.
+for k in PD_STREAM_TIMEOUT PD_IDLE_TIMEOUT SSE_CAP; do
   fresh
   python3 - "$work/src/sockproxy_health.c" "$k" <<'PY'
 import sys
@@ -83,6 +87,31 @@ open(p, "w").write(s)
 PY
   expect "6: the $k reap makes no lifecycle record" "the SP_REAP_$k reap is not preceded by its lifecycle record"
 done
+for k in PD_STREAM_TIMEOUT SSE_CAP; do
+  fresh
+  python3 - "$work/src/sockproxy_health.c" "$k" <<'PY'
+import sys
+p, k = sys.argv[1], sys.argv[2]
+s = open(p).read()
+i = s.index("pd_reap_respond(pfe, SP_REAP_%s);" % k)
+j = s.rindex("pd_reap_lifecycle(pfe, 8 /*decode truncated*/);", 0, i)
+s = s[:j] + "pd_reap_lifecycle(pfe, 2 /*decode error*/);" + s[j + len("pd_reap_lifecycle(pfe, 8 /*decode truncated*/);"):]
+open(p, "w").write(s)
+PY
+  expect "6: the $k reap names the engine's death" "the SP_REAP_$k reap must record decode/truncated (8)"
+done
+fresh
+mut sockproxy_health.c '            pd_reap_unrecorded(pfe);
+            pd_reap_respond(pfe, SP_REAP_SSE_STALL);' '            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
+            pd_reap_respond(pfe, SP_REAP_SSE_STALL);'
+expect "6: the stalled client is recorded as the engine's" "the stalled-client reap must make no lifecycle record"
+fresh
+mut sockproxy_health.c '            pd_reap_unrecorded(pfe);
+            pd_reap_respond(pfe, SP_REAP_SSE_STALL);' '            pd_reap_respond(pfe, SP_REAP_SSE_STALL);'
+expect "6: the stalled client stays in flight" "the stalled-client reap must make no lifecycle record"
+fresh
+mut sockproxy_pd_leak.h '  if (pd_phase == 5) return 8;' '  if (pd_phase == 5) return 2;'
+expect "6: the idle reaper names a begun answer decode/error" "a reaper records decode/error (2)"
 fresh
 mut sockproxy_http.c '            sp_pd_record(client_pfe, pd_model, prefill_ms, 0, pd_kv,
                              2 /*decode error*/);
@@ -96,11 +125,12 @@ mut sockproxy_http.c '                             2 /*decode error*/);
           }'
 expect "6: the decode EOF mid-stream leaves the request to the sweep" "the decode EOF mid-stream must record decode/error"
 
-# 6b: the reaped stream's request record.
+# 6b: the request record of an answer a teardown reaper ended.
 fresh
-mut sockproxy_health.c '    proxy_record_reaped_stream(pfe);
-    break;' '    break;'
-expect "6b: the stream the sweep ended has no request record" "sp_reap_record must write the request record of a stream the sweep ended"
+mut sockproxy_health.c '  if (sp_reap_texts[kind].teardown) {
+    proxy_record_reaped_answer(pfe);
+  }' ''
+expect "6b: an answer a teardown reaper ended has no request record" "sp_reap_record must write the request record of an answer a teardown reaper ended"
 
 # 7: one record, both calls, through the helper only.
 fresh

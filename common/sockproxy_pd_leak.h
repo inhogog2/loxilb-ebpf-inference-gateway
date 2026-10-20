@@ -285,21 +285,25 @@ pd_decode_error_phase(int status)
  *
  *   1..3  PREFILL_SENDING / _WAITING / _DONE -> 1  prefill / timeout
  *   4     DECODE_SENDING  (no decode byte)   -> 3  decode / timeout
- *   5     DECODE_STREAMING (the answer began) -> 2  decode / error
+ *   5     DECODE_STREAMING (the answer began) -> 8  decode / truncated
  *   else  not in flight                       -> -1 nothing to record
  *
- * A stream a reaper cuts with an error (the stream timeout, the idle cap, the
- * duration cap, a stalled client) is decode/error. Only the graceful-[DONE]
- * sweep, which ends the answer with its terminator, records decode/truncated.
- * -1 for every other phase is what makes the record once: the reaper moves the
- * request to ERROR after recording it.
+ * The phase names the cause. A begun answer a reaper ends was ended by the
+ * gateway: the engine went silent (the sweep, the stream timeout, the idle
+ * cap) or a policy cap ended it (the duration cap), so it is decode/truncated
+ * whether the gateway wrote a terminator or cut it with an error;
+ * pd_terminator_synthesized tells the two apart. decode/error (2) is the
+ * engine's death, which only the decode leg sees. A client that stopped
+ * reading is no reaper record at all (pd_reap_unrecorded). -1 for every other
+ * phase is what makes the record once: the reaper moves the request to ERROR
+ * after recording it.
  */
 static inline int
 pd_reap_error_phase(int pd_phase)
 {
   if (pd_phase >= 1 && pd_phase <= 3) return 1;
   if (pd_phase == 4) return 3;
-  if (pd_phase == 5) return 2;
+  if (pd_phase == 5) return 8;
   return -1;
 }
 

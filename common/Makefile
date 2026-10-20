@@ -736,6 +736,7 @@ test_answer: test_answer_track
 	python3 test_eof_answer.py
 	python3 test_reap_framing.py
 	python3 test_reap_framing_mutations.py
+	python3 test_reap_request_record.py
 
 .PHONY: test_admit test_uc5 test_backend_failure_audit
 test_backend_failure_audit:
