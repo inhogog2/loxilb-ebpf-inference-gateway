@@ -51,6 +51,8 @@ typedef struct {
   int metric_ai_recorded;
   int metric_response_status;
   int sse_active;              /* a stream was started and never ended */
+  int pd_in_flight;            /* a P/D request still in its prefill or decode
+                                * (pd_reap_error_phase(pd_phase) >= 0) */
 } teardown_conn_t;
 
 /* 2xx, matching proxy_status_is_2xx. Restated rather than included so this
@@ -86,6 +88,22 @@ teardown_owes_completion(const teardown_conn_t *c)
 {
   return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
          c->metric_response_status != 0;
+}
+
+/*
+ * A P/D request the client left before any answer: in flight, no status was
+ * sent, nothing recorded it. It is aborted by the client
+ * (sockproxy_end_cause.h), and both its records are owed here: the request
+ * record with status 0 and the P/D lifecycle's aborted (9). Without this the
+ * client giving up before the first token reached neither family. HTTP/2 is
+ * not walked for it (#415).
+ */
+static inline int
+teardown_owes_abort_record(const teardown_conn_t *c)
+{
+  return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
+         c->metric_response_status == 0 && c->pd_in_flight &&
+         !c->has_h2_session;
 }
 
 /*
@@ -157,7 +175,7 @@ teardown_conn_owes_settle(int shape, const teardown_conn_t *c)
 {
   (void)shape;   /* the shape decides the walk set, never the settle */
   return teardown_owes_resv_rel(c) || teardown_owes_completion(c) ||
-         teardown_owes_usage_missing(c) ||
+         teardown_owes_abort_record(c) || teardown_owes_usage_missing(c) ||
          teardown_owes_h2_collect(c) || teardown_owes_stream_end(c);
 }
 

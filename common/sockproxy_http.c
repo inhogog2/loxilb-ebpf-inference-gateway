@@ -6043,6 +6043,7 @@ proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
   v->metric_ai_recorded    = pfe->metric_ai_recorded ? 1 : 0;
   v->metric_response_status = pfe->metric_response_status;
   v->sse_active            = pfe->sse_active ? 1 : 0;
+  v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
 }
 
 /*
@@ -6095,10 +6096,11 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     pfe->usage_res_epoch = 0;
   }
 
-  /* Last response on this connection, finished with no readable usage object.
-   * Identity is copied here because the pfe may be recycled by the time this
-   * is emitted. */
-  if ((teardown_owes_completion(&v) || teardown_owes_usage_missing(&v)) &&
+  /* Last response on this connection, finished with no readable usage object,
+   * or a P/D request its client left before any answer. Identity is copied
+   * here because the pfe may be recycled by the time this is emitted. */
+  if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||
+       teardown_owes_usage_missing(&v)) &&
       proxy_settle_grow((void **)&b->umiss, &b->c_umiss, b->n_umiss,
                         sizeof(*b->umiss))) {
     const char *um_model = proxy_effective_model(pfe);
@@ -6132,22 +6134,28 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
                                  pfe->metric_req_start_ns) / 1000000ULL);
     }
     /* Read before the stream-end block below, which leaves the answer as it
-     * is: an HTTP/1.1 answer the client's framer is still inside was cut. */
+     * is: an HTTP/1.1 answer the client's framer is still inside was cut; a
+     * P/D request in flight with no status had no answer yet. */
     u->end = sp_end_cause_at_teardown(
         pfe->end_cause, shape == TEARDOWN_LISTENER,
         !pfe->h2_session &&
-            atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed));
+            atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed),
+        teardown_owes_abort_record(&v));
+    /* Before any answer the record is owed only when the client left
+     * (status 0, client_abort_before_answer). */
+    if (u->end == SP_END_CLIENT_NO_ANSWER) {
+      u->owes_record = 1;
+    }
     /* Claimed under the lock: whatever this entry owes, it owes once. */
     pfe->metric_ai_recorded = 1;
     pfe->usage_consumed = 1;
 
-    /* A P/D client that left with its answer open: the request's lifecycle
-     * record is decode/aborted (9), the cause the request record names
-     * (client_abort), once. A request still in its prefill has no answer and
-     * no status, so neither record is made for it; nor for one a leg's death
-     * or a reaper already recorded (they moved it out of the in-flight
-     * phases, or named another cause). */
-    if (u->owes_record && u->end == SP_END_CLIENT_GONE &&
+    /* A P/D client that left, with its answer open or before any answer: the
+     * request's lifecycle record is aborted (9), the cause the request record
+     * names (client_abort, client_abort_before_answer), once. Not for one a
+     * leg's death or a reaper already recorded (they moved it out of the
+     * in-flight phases, or named another cause). */
+    if (u->owes_record && sp_end_client_left(u->end) &&
         pd_reap_error_phase(pfe->pd_phase) >= 0) {
       int64_t prefill_ms = 0;
 
@@ -6157,7 +6165,7 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
                                 pfe->pd_prefill_start_ns) / 1000000ULL);
       }
       sp_pd_record(pfe, um_model ? um_model : "", prefill_ms, 0,
-                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*decode aborted*/);
+                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*aborted*/);
       pfe->pd_phase = PD_PHASE_ERROR;
     }
   }

@@ -573,12 +573,16 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                                                  pd_terminator_synthesized
  *                                                  counts. A client that left or
  *                                                  stopped reading is 9)
- *                        9 = decode   / aborted   (the client left with its answer
- *                                                  open, or stopped reading: the
- *                                                  request record names
- *                                                  client_abort / client_stall.
- *                                                  A request still in its prefill
- *                                                  has no answer, and no record)
+ *                        9 = aborted  / client    (the client left, at any stage:
+ *                                                  before any answer (the
+ *                                                  prefill, or the decode leg's
+ *                                                  first byte still to come),
+ *                                                  with its answer open, or it
+ *                                                  stopped reading. The request
+ *                                                  record names
+ *                                                  client_abort_before_answer
+ *                                                  (status 0: none was sent),
+ *                                                  client_abort or client_stall)
  *
  * Returns void.
  */

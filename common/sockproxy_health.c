@@ -1184,10 +1184,10 @@ check_draining_endpoints(void)
             pfe->sse_active = 0;
             pfe->bp_since = 0;
             /* A P/D stream ended for its stalled client: the client's
-             * abort, not the engine's: decode/aborted (9), as for a
-             * client that left. The request record (the event loop's
-             * teardown) names client_stall. */
-            pd_reap_lifecycle(pfe, 9 /*decode aborted*/);
+             * abort, not the engine's: aborted (9), as for a client that
+             * left. The request record (the event loop's teardown) names
+             * client_stall. */
+            pd_reap_lifecycle(pfe, 9 /*aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);
             pfe = pfe_next;
             continue;

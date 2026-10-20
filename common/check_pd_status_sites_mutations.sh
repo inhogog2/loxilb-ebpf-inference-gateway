@@ -101,18 +101,18 @@ PY
   expect "6: the $k reap names the engine's death" "the SP_REAP_$k reap must record decode/truncated (8)"
 done
 fresh
-mut sockproxy_health.c '            pd_reap_lifecycle(pfe, 9 /*decode aborted*/);
+mut sockproxy_health.c '            pd_reap_lifecycle(pfe, 9 /*aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);' '            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);'
-expect "6: the stalled client is recorded as the gateway's" "the stalled-client reap must record decode/aborted (9)"
+expect "6: the stalled client is recorded as the gateway's" "the stalled-client reap must record aborted (9)"
 fresh
-mut sockproxy_health.c '            pd_reap_lifecycle(pfe, 9 /*decode aborted*/);
+mut sockproxy_health.c '            pd_reap_lifecycle(pfe, 9 /*aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);' '            pd_reap_respond(pfe, SP_REAP_SSE_STALL);'
-expect "6: the stalled client makes no lifecycle record" "the stalled-client reap must record decode/aborted (9)"
+expect "6: the stalled client makes no lifecycle record" "the stalled-client reap must record aborted (9)"
 fresh
 mut sockproxy_health.c '            pfe->end_cause = SP_END_CLIENT_STALL;
 ' ''
-expect "6: the stall does not name its end" "the stalled-client reap must record decode/aborted (9) and name its end client_stall"
+expect "6: the stall does not name its end" "the stalled-client reap must record aborted (9) and name its end client_stall"
 fresh
 mut sockproxy_pd_leak.h '  if (pd_phase == 5) return 8;' '  if (pd_phase == 5) return 2;'
 expect "6: the idle reaper names a begun answer decode/error" "a reaper records decode/error (2)"
@@ -148,12 +148,12 @@ mut sockproxy_http.c '        pfe->end_cause, shape == TEARDOWN_LISTENER,' '    
 expect "6c: the teardown ignores the end recorded when the answer ended" "the teardown record must read how the answer ended"
 fresh
 mut sockproxy_http.c '        !pfe->h2_session &&
-            atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed));' '        0);'
+            atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed),' '        0,'
 expect "6c: an open answer at teardown reads as whole" "the teardown record must read how the answer ended"
 fresh
-mut sockproxy_http.c '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*decode aborted*/);
-      pfe->pd_phase = PD_PHASE_ERROR;' '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*decode aborted*/);'
-expect "6c: the P/D client's abort can be recorded twice" "a P/D client that left record decode/aborted (9) once"
+mut sockproxy_http.c '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*aborted*/);
+      pfe->pd_phase = PD_PHASE_ERROR;' '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*aborted*/);'
+expect "6c: the P/D client's abort can be recorded twice" "a P/D client that left record aborted (9) once"
 fresh
 mut sockproxy_http.c '                            (char *)sp_end_code(u->end),
                             u->request_id,' '                            "",
@@ -162,6 +162,38 @@ expect "6c: the teardown record drops the end" "the teardown's request record mu
 fresh
 mut sockproxy_http.c '            cl->end_cause = SP_END_BACKEND_DIED;' '            (void)0;'
 expect "6c: a dying leg does not name the engine" "must name the engine (SP_END_BACKEND_DIED)"
+fresh
+mut sockproxy_http.c '        teardown_owes_abort_record(&v));' '        0);'
+expect "6c: the teardown reads no request as left before its answer" "the teardown record must read how the answer ended"
+fresh
+mut sockproxy_http.c '    if (u->owes_record && sp_end_client_left(u->end) &&' '    if (u->owes_record && u->end == SP_END_CLIENT_GONE &&'
+expect "6c: the client leaving before an answer gets no aborted (9)" "a P/D client that left record aborted (9) once"
+
+# 6d: a P/D request its client left before any answer reaches both families.
+fresh
+mut sockproxy_teardown_settle.h '         teardown_owes_abort_record(c) || teardown_owes_usage_missing(c) ||' '         teardown_owes_usage_missing(c) ||'
+expect "6d: the teardown rule owes nothing for a request left before its answer" "must be owed its abort record by the teardown rule"
+fresh
+mut sockproxy_teardown_settle.h '         c->metric_response_status == 0 && c->pd_in_flight &&' '         c->pd_in_flight &&'
+expect "6d: a request a status accounts for is recorded again" "must be owed its abort record by the teardown rule"
+fresh
+mut sockproxy_teardown_settle.h '  return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
+         c->metric_response_status == 0' '  return c && c->odir == 0 && c->ai_gw_mode &&
+         c->metric_response_status == 0'
+expect "6d: a recorded request is owed its abort record again" "must be owed its abort record by the teardown rule"
+fresh
+mut sockproxy_http.c '  v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
+' ''
+expect "6d: the view does not say the request is in flight" "the teardown must collect and record a P/D request its client left before any answer"
+fresh
+mut sockproxy_http.c '  if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||' '  if ((teardown_owes_completion(&v) ||'
+expect "6d: the teardown does not collect it" "the teardown must collect and record a P/D request its client left before any answer"
+fresh
+mut sockproxy_http.c '    if (u->end == SP_END_CLIENT_NO_ANSWER) {
+      u->owes_record = 1;
+    }
+' ''
+expect "6d: its request record is not owed" "the teardown must collect and record a P/D request its client left before any answer"
 
 # 7: one record, both calls, through the helper only.
 fresh
