@@ -51,7 +51,8 @@ struct proxy_fd_ent {
 };
 enum { SP_REAP_NONE = 0, SP_REAP_SSE_CAP, SP_REAP_PD_PREFILL_TIMEOUT, SP_REAP_PD_DECODE_TIMEOUT,
   SP_REAP_PD_PARK_TIMEOUT, SP_REAP_PD_GRACEFUL_DONE, SP_REAP_PD_STREAM_TIMEOUT, SP_REAP_PD_IDLE_TIMEOUT,
-  SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED, SP_REAP_SSE_STALL, SP_REAP_KINDS };
+  SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED, SP_REAP_SSE_STALL, SP_REAP_FC_SHED,
+  SP_REAP_FC_TTL, SP_REAP_KINDS };
 static char wrote[1024]; static size_t wrote_len;
 static void take(const void *b, size_t n) { memcpy(wrote + wrote_len, b, n); wrote_len += n; }
 static struct { void *ns; } proxy_struct_v = { (void *)1 }, *proxy_struct = &proxy_struct_v;
@@ -66,7 +67,7 @@ static struct { _Atomic unsigned long long reap_fallback; } global_stats;
 #define PROXY_UNLOCK() ((void)0)
 static ssize_t send(int fd, const void *b, size_t n, int flags) { (void)fd; (void)flags; take(b, n); return (ssize_t)n; }
 static int shutdown(int fd, int how) { (void)fd; (void)how; return 0; }
-static size_t sp_reap_fc_format(proxy_fd_ent_t *p, uint8_t k, char *o, size_t c) { (void)p; (void)k; (void)o; (void)c; return 0; }
+static size_t sp_reap_fc_format(proxy_fd_ent_t *p, uint8_t k, int keep, char *o, size_t c) { (void)p; (void)k; (void)keep; (void)o; (void)c; return 0; }
 static void sp_reap_record(proxy_fd_ent_t *p, uint8_t k) { (void)p; (void)k; }
 static int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *p, const void *b, size_t n) { (void)p; take(b, n); return 0; }
 static int sp_answer_started(proxy_fd_ent_t *p) { return atomic_load(&p->cresp_in_msg) || atomic_load(&p->cresp_answer_open); }

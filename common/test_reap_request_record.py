@@ -128,7 +128,8 @@ struct proxy_fd_ent {
 };
 enum { SP_REAP_NONE = 0, SP_REAP_SSE_CAP, SP_REAP_PD_PREFILL_TIMEOUT, SP_REAP_PD_DECODE_TIMEOUT,
   SP_REAP_PD_PARK_TIMEOUT, SP_REAP_PD_GRACEFUL_DONE, SP_REAP_PD_STREAM_TIMEOUT, SP_REAP_PD_IDLE_TIMEOUT,
-  SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED, SP_REAP_SSE_STALL, SP_REAP_KINDS };
+  SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED, SP_REAP_SSE_STALL, SP_REAP_FC_SHED,
+  SP_REAP_FC_TTL, SP_REAP_KINDS };
 static int records, record_status, record_stream, freed_inline, pd_aborted;
 static char record_code[64];
 static void capture(int status, int stream, const char *code) {
@@ -154,7 +155,7 @@ static int proxy_note_local_refusal(proxy_fd_ent_t *p, uint16_t s) {
   int n = proxy_note_local_answer(p, s); if (n) p->metric_ai_recorded = 1; return n;
 }
 static void proxy_record_local_deny(proxy_fd_ent_t *p, int st, int s, const char *c) { (void)p; (void)st; (void)s; (void)c; }
-static size_t sp_reap_fc_format(proxy_fd_ent_t *p, uint8_t k, char *o, size_t c) { (void)p; (void)k; (void)o; (void)c; return 0; }
+static size_t sp_reap_fc_format(proxy_fd_ent_t *p, uint8_t k, int keep, char *o, size_t c) { (void)p; (void)k; (void)keep; (void)o; (void)c; return 0; }
 static int sp_answer_started(proxy_fd_ent_t *p) { return atomic_load(&p->cresp_in_msg) || atomic_load(&p->cresp_answer_open); }
 static void sp_end_started_answer(proxy_fd_ent_t *p, const void *b, size_t n) { (void)p; (void)b; (void)n; }
 static int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *p, const void *b, size_t n) { (void)p; (void)b; (void)n; return 0; }
