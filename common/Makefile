@@ -456,6 +456,7 @@ check_client_eof_keep:
 .PHONY: check_pd_status_sites
 check_pd_status_sites:
 	sh ./check_pd_status_sites.sh
+	sh ./check_pd_status_sites_mutations.sh
 
 # A response the gateway writes itself is recorded as the client receives it
 # (status and class, no TTFB sample), and once as a request: a staged

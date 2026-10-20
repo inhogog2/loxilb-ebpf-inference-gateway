@@ -150,7 +150,7 @@ fi
 #    Content-Length/chunked one and the decode-backend EOF one) take
 #    pd_decode_error_phase(metric_response_status).
 lit0=$(awk '/llb_ai_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
-            if (buf ~ /, 0\);/ && buf !~ /sse_model/) print NR": "buf}' ./sockproxy_http.c)
+            if (buf ~ /,[ \t]*0\);/ && buf !~ /sse_model/) print NR": "buf}' ./sockproxy_http.c)
 if [ -n "$lit0" ]; then
   echo "sockproxy_http.c: a P/D completion records a literal success (0) whatever its status; use pd_decode_error_phase():"
   printf '%s\n' "$lit0"
@@ -162,5 +162,23 @@ if [ "$n" != "2" ]; then
   fail=1
 fi
 
+# 5b. A stream the gateway ended is not a success. In sockproxy_health.c no
+#     P/D record is a literal success (0): the graceful-[DONE] sweep, the one
+#     completion there, records decode/truncated (8), the engine having gone
+#     silent and the gateway having written the terminator.
+lit0h=$(awk '/llb_ai_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
+             if (buf ~ /,[ \t]*0\);/) print NR": "buf}' ./sockproxy_health.c)
+if [ -n "$lit0h" ]; then
+  echo "sockproxy_health.c: a reaper records a literal success (0) for an answer the gateway ended:"
+  printf '%s\n' "$lit0h"
+  fail=1
+fi
+g=$(awk '/\[PD_GRACEFUL_DONE\]/ {on = 1} on && /pd_reap_respond\(/ {exit} on' ./sockproxy_health.c \
+    | tr '\n' ' ' | grep -c 'llb_ai_pd_record([^;]*8 /\*decode truncated\*/);' || true)
+if [ "$g" != "1" ]; then
+  echo "sockproxy_health.c: the graceful-[DONE] sweep must record decode/truncated (8) once; found $g"
+  fail=1
+fi
+
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated)"

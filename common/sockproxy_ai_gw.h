@@ -541,13 +541,23 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                      failure mode is an operator-visible lie:
  *                        0 = complete / success
  *                        1 = prefill  / timeout   (prefill leg ran out of time)
- *                        2 = decode   / error     (decode leg failed or died)
+ *                        2 = decode   / error     (decode leg failed or died: the
+ *                                                  engine closed or the leg broke
+ *                                                  before its answer was complete,
+ *                                                  an EOF mid-stream included)
  *                        3 = decode   / timeout   (decode leg produced no byte)
  *                        4 = prefill  / error     (prefill leg failed or died)
  *                        5 = prefill  / rejected  (origin refused; relayed verbatim)
  *                        6 = decode   / rejected  (origin refused; relayed verbatim)
  *                        7 = decode   / unknown   (decode completed; its status
  *                                                  line was never read)
+ *                        8 = decode   / truncated (the engine went silent with
+ *                                                  its connection open and no
+ *                                                  terminator; the gateway ended
+ *                                                  the answer with one. Never 2:
+ *                                                  once the engine has closed, the
+ *                                                  EOF path records 2 and ends the
+ *                                                  request before the sweep can)
  *
  * Returns void.
  */

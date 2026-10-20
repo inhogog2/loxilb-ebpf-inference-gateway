@@ -1614,7 +1614,10 @@ check_draining_endpoints(void)
           pfe->stream_end_ts = now;
           pfe->sse_active = 0;
 
-          /* 3) Record P/D metrics, mirroring the :1255 SSE_DONE success path. */
+          /* 3) Record P/D metrics. The lifecycle outcome is decode/truncated
+           * (8), not a success: the engine went silent and the gateway ended
+           * the answer. The client still received a 200 stream, and the request
+           * record says so; the lifecycle record says how it ended. */
           {
             struct timespec _pdts;
             clock_gettime(CLOCK_MONOTONIC, &_pdts);
@@ -1630,7 +1633,8 @@ check_draining_endpoints(void)
                                     1000000ULL);
             }
             int pd_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)gc_model, prefill_ms, decode_ms, pd_kv, 0);
+            llb_ai_pd_record((char *)gc_model, prefill_ms, decode_ms, pd_kv,
+                             8 /*decode truncated*/);
           }
 
           /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as
