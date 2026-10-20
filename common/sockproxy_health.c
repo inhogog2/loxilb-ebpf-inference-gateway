@@ -595,6 +595,10 @@ sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
   case SP_REAP_FC_DRAINED:            /* deny record: sp_reap_fc_format */
     proxy_note_local_refusal(pfe, 503);
     break;
+  case SP_REAP_FC_SHED:               /* deny record: sp_reap_fc_format */
+  case SP_REAP_FC_TTL:
+    proxy_note_local_refusal(pfe, 429);
+    break;
   case SP_REAP_PD_PARK_TIMEOUT:
     proxy_note_local_refusal(pfe, 504);
     proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504,
@@ -636,6 +640,8 @@ sp_fc_shed_answer_kept(proxy_fd_ent_t *pfe)
   char framed[512];
   size_t len = sp_reap_fc_format(pfe, SP_REAP_FC_SHED, 1, framed, sizeof(framed));
 
+  /* Both answers below are the 429; the deny record is the formatter's. */
+  proxy_note_local_refusal(pfe, 429);
   if (len > 0 && proxy_send_local_response(pfe, framed, len) == 0)
     return 0;
   if (len == 0) {

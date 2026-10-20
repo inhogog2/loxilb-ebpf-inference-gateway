@@ -84,6 +84,8 @@ sockproxy_health.c:pd_reap_respond:send:-|1|reaper fallback when the owner worke
 # Functions that record their answer, each with the pattern its body must
 # hold: the response record and, where the function owns it, the request
 # record. Rule 3's "the callers take the deny record" cases are below.
+# sp_fc_shed_answer_kept: an eviction answered by its own worker, the 429
+# admission_shed; the deny record is sp_reap_fc_format's (rule 3 below).
 # sp_reap_record: a queued or parked request is refused (capacity); a P/D
 # request that timed out on its legs completes with the status written; the
 # SSE events are body bytes inside a response in progress, not a response.
@@ -95,7 +97,8 @@ sockproxy_http.c:sp_h1_send_admit_deny:proxy_note_local_refusal(pfe
 sockproxy_http.c:sp_h1_send_capacity_deny:proxy_note_local_refusal(pfe
 sockproxy_http.c:sp_h1_stream_model_unresolvable:proxy_note_local_refusal(pfe, 400);proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING
 sockproxy_health.c:sp_reap_finish:sp_reap_record(pfe, kind)
-sockproxy_health.c:sp_reap_record:proxy_note_local_refusal(pfe, 504);proxy_note_local_refusal(pfe, 503);proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504;proxy_record_local_completion(pfe, 504);proxy_record_local_completion(pfe, 502)
+sockproxy_health.c:sp_reap_record:proxy_note_local_refusal(pfe, 504);proxy_note_local_refusal(pfe, 503);proxy_note_local_refusal(pfe, 429);proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504;proxy_record_local_completion(pfe, 504);proxy_record_local_completion(pfe, 502)
+sockproxy_health.c:sp_fc_shed_answer_kept:proxy_note_local_refusal(pfe, 429)
 sockproxy_l7policy.c:l7_send_reject:proxy_note_local_refusal(pfe, (uint16_t)code);proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code
 sockproxy_l7policy.c:l7_send_redirect:proxy_record_local_completion(pfe, (uint16_t)code)
 sockproxy_h2.c:proxy_h2_send_l7_synthetic:l7_stream->metric_response_status = status_code;h2_record_local_deny(pfe, l7_stream, AI_GW_STAGE_ROUTE
