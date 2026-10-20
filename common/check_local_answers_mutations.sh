@@ -121,8 +121,10 @@ mut sockproxy_http.c '          proxy_note_local_refusal(pfe, 403);
 expect "rule 1b: the LlamaFirewall block written raw without its record" "sockproxy_http.c:handle_on_message_complete:raw:block_response"
 
 fresh
-mut sockproxy_http.c '              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);' '              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);
-              send(pfe->fd, smuggle_400, 0, MSG_NOSIGNAL);'
+mut sockproxy_http.c '              sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
+                                  MSG_NOSIGNAL);' '              sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
+                                  MSG_NOSIGNAL);
+              sp_raw_status_write(pfe, smuggle_400, 0, MSG_NOSIGNAL);'
 expect "rule 1b: a second raw write under one allowlist key" "allowlist entry covers 1 call(s), found 2"
 
 # Rule 2: a local answer never samples TTFB.
@@ -202,6 +204,59 @@ mut sockproxy_http.c '    /* The request record is the caller'"'"'s (ai_gw_recor
     proxy_note_local_refusal(pfe, (uint16_t)status);' '    /* The request record is the caller'"'"'s (ai_gw_record_capacity_deny). */
     proxy_note_local_answer(pfe, (uint16_t)status);'
 expect "rule 5: the capacity refusal recorded with the completion note" "sp_h1_send_capacity_deny must record: proxy_note_local_refusal(pfe"
+
+# Rule 6: a started answer takes no new status line.
+fresh
+mut sockproxy_http.c '  if (sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)) {
+    sp_end_started_answer(pfe, buf, len);
+    return -1;
+  }
+  return sp_send_all_bounded(proxy_send_local_once' '  return sp_send_all_bounded(proxy_send_local_once'
+expect "rule 6: the sender writes a status line into an answer in progress" "proxy_send_local_response must hold"
+
+fresh
+mut sockproxy_http.c '  if (sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)) {
+    sp_end_started_answer(pfe, buf, len);
+    return -1;
+  }
+  return sp_send_all_bounded_then_shutdown(' '  return sp_send_all_bounded_then_shutdown('
+expect "rule 6: the closing sender writes a status line into an answer in progress" "proxy_send_local_response_and_shutdown must hold"
+
+fresh
+mut sockproxy_http.c '  if (sp_answer_started(pfe)) {
+    sp_end_started_answer(pfe, buf, len);
+    return -1;
+  }
+  if (pfe->ssl)
+    return SSL_write(' '  if (pfe->ssl)
+    return SSL_write('
+expect "rule 6: the raw-write helper writes into an answer in progress" "sp_raw_status_write must hold"
+
+fresh
+mut sockproxy_health.c '    if (!t->body && sp_answer_started(pfe)) {
+      /* A whole response cannot follow' '    if (0) {
+      /* A whole response cannot follow'
+expect "rule 6: the reaper writes its status line into an answer in progress" "sp_reap_finish must hold"
+
+fresh
+mut sockproxy_health.c '    if (!t->body && sp_answer_started(pfe)) {
+      /* An answer is in progress' '    if (0) {
+      /* An answer is in progress'
+expect "rule 6: the reaper fallback writes its status line into an answer in progress" "pd_reap_respond must hold"
+
+fresh
+mut sockproxy_pd_sglang.c 'sp_raw_status_write(client_pfe, pd_sg_err, sizeof(pd_sg_err) - 1,' 'send(client_pfe->fd, pd_sg_err, sizeof(pd_sg_err) - 1,'
+expect "rule 6: the SGLang pair abort writes its 502 with a bare send" "a status line written by a bare send()/SSL_write()"
+
+fresh
+mut sockproxy_http.c '    sp_answer_msg_begin(&pfe->cresp_in_msg);
+' ''
+expect "rule 6: the framer does not mark the start of a message" "cresp_on_message_begin must hold"
+
+fresh
+mut sockproxy_http.c '    sp_answer_framing_lost(&client->cresp_in_msg);
+' ''
+expect "rule 6: a framer that lost the framing reads as outside a message" "cresp_feed must hold"
 
 [ "$survived" = "0" ] || { echo "check_local_answers.sh: a mutation survived"; exit 1; }
 echo "check_local_answers.sh mutations: $n/$n killed"

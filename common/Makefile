@@ -721,6 +721,18 @@ test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
 test_admit_response: test_admit_response.c sockproxy_admit_response.h llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
 
+# A started answer takes no new status line (sockproxy_answer.h): the framer's
+# in-message state at every cut, and the production senders and reaper finish
+# against a begun answer and its twin, a fresh one.
+test_answer_track: test_answer_track.c sockproxy_answer.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
+
+.PHONY: test_answer
+test_answer: test_answer_track
+	./test_answer_track
+	python3 test_answer_started.py
+	python3 test_eof_answer.py
+
 .PHONY: test_admit test_uc5 test_backend_failure_audit
 test_backend_failure_audit:
 	python3 test_backend_failure_audit.py

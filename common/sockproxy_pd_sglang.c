@@ -174,12 +174,8 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason,
   /* The client's answer: completed with the status written. */
   proxy_record_local_completion(client_pfe, 502);
   if (client_pfe->fd > 0) {
-    if (client_pfe->ssl) {
-      SSL_write(client_pfe->ssl, pd_sg_err, sizeof(pd_sg_err) - 1);
-    } else {
-      send(client_pfe->fd, pd_sg_err, sizeof(pd_sg_err) - 1,
-           MSG_DONTWAIT | MSG_NOSIGNAL);
-    }
+    sp_raw_status_write(client_pfe, pd_sg_err, sizeof(pd_sg_err) - 1,
+                        MSG_DONTWAIT | MSG_NOSIGNAL);
   }
   client_pfe->pd_phase = PD_PHASE_ERROR;
   pd_cleanup(client_pfe);
@@ -220,12 +216,8 @@ pd_sg_oversize_reject(proxy_fd_ent_t *client_pfe)
   proxy_record_local_deny(client_pfe, AI_GW_STAGE_FRAMING, 503,
                           "pd_sg_oversize_unroutable");
   if (client_pfe->fd > 0) {
-    if (client_pfe->ssl) {
-      SSL_write(client_pfe->ssl, pd_sg_503, sizeof(pd_sg_503) - 1);
-    } else {
-      send(client_pfe->fd, pd_sg_503, sizeof(pd_sg_503) - 1,
-           MSG_DONTWAIT | MSG_NOSIGNAL);
-    }
+    sp_raw_status_write(client_pfe, pd_sg_503, sizeof(pd_sg_503) - 1,
+                        MSG_DONTWAIT | MSG_NOSIGNAL);
   }
   if (client_pfe->fd > 0) {
     shutdown(client_pfe->fd, SHUT_RDWR);
@@ -587,13 +579,8 @@ fail:
     /* The client's answer: completed with the status written. */
     proxy_record_local_completion(client_pfe, 503);
     if (client_pfe->fd > 0) {
-      if (client_pfe->ssl) {
-        SSL_write(client_pfe->ssl, pd_sg_dispatch_err,
-                  sizeof(pd_sg_dispatch_err) - 1);
-      } else {
-        send(client_pfe->fd, pd_sg_dispatch_err,
-             sizeof(pd_sg_dispatch_err) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
-      }
+      sp_raw_status_write(client_pfe, pd_sg_dispatch_err, sizeof(pd_sg_dispatch_err) - 1,
+                          MSG_DONTWAIT | MSG_NOSIGNAL);
     }
     client_pfe->pd_phase = PD_PHASE_ERROR;
     pd_cleanup(client_pfe);
@@ -1060,12 +1047,8 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
               "(failing closed)", pfe->fd, sg_pidx);
     /* The client's answer: completed with the status written. */
     proxy_record_local_completion(pfe, 503);
-    if (pfe->ssl) {
-      SSL_write(pfe->ssl, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1);
-    } else {
-      send(pfe->fd, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1,
-           MSG_DONTWAIT | MSG_NOSIGNAL);
-    }
+    sp_raw_status_write(pfe, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1,
+                        MSG_DONTWAIT | MSG_NOSIGNAL);
     pd_free_claim(&pfe->pd_saved_body);
     pfe->pd_saved_body_len = 0;
     shutdown(pfe->fd, SHUT_RDWR);

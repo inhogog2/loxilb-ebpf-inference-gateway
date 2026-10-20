@@ -191,6 +191,14 @@ void pd_cleanup(proxy_fd_ent_t *fd_ent);
 int proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len);
 int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                            const void *buf, size_t len);
+/* Both senders refuse a status line once the client's answer has begun
+ * (sockproxy_answer.h): sp_answer_started says so, and sp_end_started_answer
+ * ends that answer instead - an SSE error event for a stream, then the close.
+ * A raw write of a status line checks sp_answer_started itself. */
+int sp_answer_started(proxy_fd_ent_t *pfe);
+void sp_end_started_answer(proxy_fd_ent_t *pfe, const void *buf, size_t len);
+ssize_t sp_raw_status_write(proxy_fd_ent_t *pfe, const void *buf, size_t len,
+                            int flags);
 /* The 502 of a request no backend took, framed with its length. */
 int proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail);
 /* Responses the gateway writes itself, recorded as the client receives them
