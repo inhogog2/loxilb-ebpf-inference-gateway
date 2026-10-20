@@ -792,12 +792,8 @@ fail:
     /* The client's answer: completed with the status written. */
     proxy_record_local_completion(client_pfe, 503);
     if (client_pfe->fd > 0) {
-      if (client_pfe->ssl) {
-        SSL_write(client_pfe->ssl, pd_prefill_err, sizeof(pd_prefill_err) - 1);
-      } else {
-        send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
-             MSG_DONTWAIT | MSG_NOSIGNAL);
-      }
+      sp_raw_status_write(client_pfe, pd_prefill_err, sizeof(pd_prefill_err) - 1,
+                          MSG_DONTWAIT | MSG_NOSIGNAL);
     }
     pd_cleanup(client_pfe);
     client_pfe->pd_phase = PD_PHASE_ERROR;

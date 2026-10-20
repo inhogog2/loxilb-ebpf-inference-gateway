@@ -130,6 +130,15 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
   (void)pfe;
 }
 
+/* The reaper's fallback asks whether an answer is in progress; none is
+ * here, so it writes its status text as before. */
+int
+sp_answer_started(proxy_fd_ent_t *pfe)
+{
+  (void)pfe;
+  return 0;
+}
+
 /* 1 when e was marked with reason and leg. */
 static int
 marked(proxy_fd_ent_t *e, int reason, const proxy_fd_ent_t *leg)

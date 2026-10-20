@@ -42,6 +42,16 @@
 #      proxy_note_local_answer is called only by that wrapper and by
 #      proxy_record_local_completion, whose answers complete the request.
 #
+#   6. An answer the client has begun to receive takes no new status line
+#      (sockproxy_answer.h). The two senders and sp_raw_status_write check
+#      sp_answer_started before writing a status line, and the reaper checks
+#      it before its own; the response framer keeps that state, from the
+#      first status-line byte to the end of the message, and when it loses
+#      the framing; and no status line goes out through a bare send() or
+#      SSL_write(): a path that keeps a raw write uses sp_raw_status_write.
+#      The stream behaviours follow the framer's Content-Type on every
+#      AI-gateway connection, not only where sse_mode asks for them.
+#
 #   sh check_local_answers.sh [dir]   (dir defaults to this script's directory)
 set -eu
 cd "${1:-$(dirname "$0")}"
@@ -128,7 +138,7 @@ CALLS=$(awk '
   bleft > 0 { if ($0 ~ /"HTTP\/1\.[01] [1-5][0-9][0-9]/) built[bname] = 1; bleft-- }
   /proxy_record_local_completion\(|proxy_note_local_answer\(|proxy_note_local_refusal\(|proxy_record_local_deny\(/ &&
   !/^[[:space:]]*(\*|\/\*|\/\/)/ { lastrec = FNR }
-  pend == "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write)\(/) {
+  pend == "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write|sp_raw_status_write)\(/) {
     r = substr($0, RSTART + RLENGTH); split(r, args, ","); buf = args[2]
     gsub(/^[ \t]+|[ \t]+$/, "", buf)
     if (buf in built && !(lastrec > 0 && FNR - lastrec <= 12))
@@ -277,6 +287,41 @@ if [ -n "$stray" ]; then
   fail=1
 fi
 
+# 6. A started answer takes no new status line.
+for spec in \
+  'sockproxy_http.c:proxy_send_local_response:sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)' \
+  'sockproxy_http.c:proxy_send_local_response_and_shutdown:sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)' \
+  'sockproxy_http.c:sp_raw_status_write:if (sp_answer_started(pfe))' \
+  'sockproxy_health.c:sp_reap_finish:!t->body && sp_answer_started(pfe)' \
+  'sockproxy_health.c:pd_reap_respond:!t->body && sp_answer_started(pfe)' \
+  'sockproxy_http.c:cresp_on_message_begin:sp_answer_msg_begin(&pfe->cresp_in_msg)' \
+  'sockproxy_http.c:cresp_on_message_complete:sp_answer_msg_done(&pfe->cresp_in_msg)' \
+  'sockproxy_http.c:cresp_feed:sp_answer_framing_lost(&client->cresp_in_msg)' \
+  'sockproxy_http.c:proxy_sse_activate:sp_stream_recognised(pfe->sse_mode, pfe->ai_gw_mode)'; do
+  f=${spec%%:*}; rest=${spec#*:}; fn=${rest%%:*}; pat=${rest#*:}
+  fnbody "$f" "$fn" | grep -qF "$pat" ||
+    { echo "$f: $fn must hold: $pat (a started answer takes no new status line)"; fail=1; }
+done
+bare=$(for f in $SRCS; do awk '
+  FNR == 1 { fn = ""; reset() }
+  /^}/ { fn = ""; reset(); next }
+  /^[A-Za-z_]/ && /\(/ && !/;[[:space:]]*$/ && !/^#/ { t = $0; sub(/\(.*/, "", t); n = split(t, a, /[ *]+/); fn = a[n]; reset(); next }
+  /char[^=;(]*[ *][A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[ \t]*=/ {
+    t = $0; sub(/[ \t]*(\[[^]]*\])?[ \t]*=.*/, "", t); n = split(t, a, /[ *]+/); bname = a[n]; bleft = 3
+  }
+  bleft > 0 { if ($0 ~ /"HTTP\/1\.[01] [1-5][0-9][0-9]/) built[bname] = 1; bleft-- }
+  !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write)\(/) {
+    r = substr($0, RSTART + RLENGTH); split(r, args, ","); b = args[2]
+    gsub(/^[ \t]+|[ \t]+$/, "", b)
+    if (b in built) print FILENAME ":" FNR ": " fn ": " b
+  }
+  function reset(  k) { for (k in built) delete built[k]; bleft = 0 }' "$f"; done)
+if [ -n "$bare" ]; then
+  printf '%s\n' "$bare"
+  echo "  ^ a status line written by a bare send()/SSL_write(): use sp_raw_status_write, which will not write it into an answer in progress"
+  fail=1
+fi
+
 [ -s "$FAILF" ] && fail=1
 [ "$fail" = "0" ] || exit 1
-echo "Local answers: OK (every gateway answer records its response without a TTFB sample, and its request as a staged refusal or an outage completion; $(printf '%s\n' "$ALLOW" | grep -c '|') allowlisted with reasons)"
+echo "Local answers: OK (every gateway answer records its response without a TTFB sample, and its request as a staged refusal or an outage completion; none is written into an answer in progress; $(printf '%s\n' "$ALLOW" | grep -c '|') allowlisted with reasons)"

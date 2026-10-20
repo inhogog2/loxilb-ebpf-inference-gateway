@@ -373,6 +373,10 @@ proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
 int
 proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len)
 {
+  if (sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)) {
+    sp_end_started_answer(pfe, buf, len);
+    return -1;
+  }
   return sp_send_all_bounded(proxy_send_local_once, pfe, buf, len,
                              SP_LOCAL_SEND_RETRY_MAX);
 }
@@ -395,9 +399,73 @@ int
 proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                        const void *buf, size_t len)
 {
+  if (sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)) {
+    sp_end_started_answer(pfe, buf, len);
+    return -1;
+  }
   return sp_send_all_bounded_then_shutdown(
       proxy_send_local_once, proxy_shutdown_local, pfe, buf, len,
       SP_LOCAL_SEND_RETRY_MAX);
+}
+
+/* Has the client begun to receive an answer? The response framer is inside a
+ * message (its status line included), or inside an answer by the hold's
+ * account. Read on the client's worker, where the framer runs. */
+int
+sp_answer_started(proxy_fd_ent_t *pfe)
+{
+  return atomic_load_explicit(&pfe->cresp_in_msg, memory_order_relaxed) ||
+         atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed);
+}
+
+/* The raw write of a status line, for the paths that keep a non-blocking
+ * write on a worker that must not block (the P/D legs, the connect event,
+ * the parse refusal, the LlamaFirewall block): the senders' guard, then the
+ * write, through SSL_write on a TLS client. Returns what the write returned,
+ * -1 when the answer in progress was ended instead. check_local_answers.sh
+ * rule 6 holds every raw status-line write to this function. */
+ssize_t
+sp_raw_status_write(proxy_fd_ent_t *pfe, const void *buf, size_t len, int flags)
+{
+  if (sp_answer_started(pfe)) {
+    sp_end_started_answer(pfe, buf, len);
+    return -1;
+  }
+  if (pfe->ssl)
+    return SSL_write(pfe->ssl, buf, len > INT_MAX ? INT_MAX : (int)len);
+  return send(pfe->fd, buf, len, flags);
+}
+
+/* A status line in place of an answer the client is already receiving would
+ * land inside that answer's body. A stream whose headers have gone out is
+ * ended in-band, with an SSE error event naming the code the status line
+ * carried; anything else is cut by the close, which the client reads as a
+ * short body or a missing chunked terminator. One non-blocking attempt at
+ * the event: the close is what ends the answer. */
+void
+sp_end_started_answer(proxy_fd_ent_t *pfe, const void *buf, size_t len)
+{
+  char code[64], ev[192];
+  size_t n = 0;
+
+  if (pfe->fd <= 0)
+    return;
+  if (atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed) &&
+      pfe->cresp_sse.is_sse) {
+    sp_answer_error_code((const char *)buf, len, code, sizeof(code));
+    n = sp_answer_sse_end(code, (pfe->cresp_parser.flags & F_CHUNKED) != 0,
+                          ev, sizeof(ev));
+  }
+  if (n > 0) {
+    if (pfe->ssl)
+      (void)SSL_write(pfe->ssl, ev, (int)n);
+    else
+      (void)send(pfe->fd, ev, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
+  log_warn("[ANSWER_STARTED] fd=%d: a %.12s answer would have followed bytes "
+           "of the answer in progress; %s", pfe->fd, (const char *)buf,
+           n > 0 ? "ended the stream with an error event and closed" : "closed");
+  (void)proxy_shutdown_local(pfe);
 }
 
 /* ---- responses the gateway writes itself -----------------------------------
@@ -1970,14 +2038,10 @@ skip_deferred_masking:
               /* The client's answer: completed with the status written. */
               proxy_record_local_completion(rfd_ent, 503);
               if (rfd_ent->fd > 0) {
-                /* Use SSL_write when client connection is TLS to avoid
-                 * sending plaintext over an encrypted channel (T9 fix). */
-                if (rfd_ent->ssl) {
-                  SSL_write(rfd_ent->ssl, pd_dec_err, sizeof(pd_dec_err) - 1);
-                } else {
-                  send(rfd_ent->fd, pd_dec_err, sizeof(pd_dec_err) - 1,
-                       MSG_DONTWAIT | MSG_NOSIGNAL);
-                }
+                /* Through SSL_write on a TLS client, never plaintext inside the
+                 * TLS stream (T9 fix). */
+                sp_raw_status_write(rfd_ent, pd_dec_err, sizeof(pd_dec_err) - 1,
+                                    MSG_DONTWAIT | MSG_NOSIGNAL);
               }
               /* Record the decode failure (errorPhase=2) — this call site sent
                * the 503 but never recorded it, so decode-init failures on THIS
@@ -6277,8 +6341,8 @@ proxy_pdestroy(void *priv)
             /* The client's answer: completed with the status written. */
             proxy_record_local_completion(client_pfe, 503);
             if (client_pfe->fd > 0) {
-              send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              sp_raw_status_write(client_pfe, pd_prefill_err, sizeof(pd_prefill_err) - 1,
+                                  MSG_DONTWAIT | MSG_NOSIGNAL);
             }
             pd_cleanup(client_pfe);
             client_pfe->pd_phase = PD_PHASE_ERROR;
@@ -6472,8 +6536,8 @@ proxy_pdestroy(void *priv)
           /* The client's answer: completed with the status written. */
           proxy_record_local_completion(client_pfe, 502);
           if (client_pfe->fd > 0) {
-            send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
-                 MSG_DONTWAIT | MSG_NOSIGNAL);
+            sp_raw_status_write(client_pfe, pd_decode_err, sizeof(pd_decode_err) - 1,
+                                MSG_DONTWAIT | MSG_NOSIGNAL);
           }
           {
             const char *pd_model = proxy_effective_model(client_pfe);
@@ -7532,7 +7596,7 @@ proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
     return PROXY_LEG_ANSWERED_H2;
   }
   PROXY_ENT_LOCK(client);
-  if (!atomic_load_explicit(&client->cresp_answer_open, memory_order_relaxed)) {
+  if (!sp_answer_started(client)) {
     if (proxy_send_backend_unreachable(client,
             "the backend endpoint closed the connection before it answered") == 0) {
       cresp_note_local_answer(client);
@@ -10222,7 +10286,8 @@ handle_on_message_complete(llhttp_t* parser)
            * answer the gateway writes itself, at its own stage. */
           proxy_note_local_refusal(pfe, 403);
           proxy_record_local_deny(pfe, AI_GW_STAGE_SECURITY, 403, "llamafirewall_block");
-          ssize_t sent = send(pfe->fd, block_response, response_len, MSG_NOSIGNAL);
+          ssize_t sent = sp_raw_status_write(pfe, block_response, response_len,
+                                             MSG_NOSIGNAL);
 
           if (sent > 0) {
             log_info("[LlamaFirewall] Sent 403 response: fd=%d sent=%zd bytes", pfe->fd, sent);
@@ -10406,14 +10471,10 @@ handle_on_message_complete(llhttp_t* parser)
             /* The client's answer: completed with the status written. */
             proxy_record_local_completion(client_pfe, 503);
             if (client_pfe->fd > 0) {
-              /* Use SSL_write when client connection is TLS to avoid
-               * sending plaintext over an encrypted channel (T9 fix). */
-              if (client_pfe->ssl) {
-                SSL_write(client_pfe->ssl, pd_decode_err, sizeof(pd_decode_err) - 1);
-              } else {
-                send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
-                     MSG_DONTWAIT | MSG_NOSIGNAL);
-              }
+              /* Through SSL_write on a TLS client, never plaintext inside the
+               * TLS stream (T9 fix). */
+              sp_raw_status_write(client_pfe, pd_decode_err, sizeof(pd_decode_err) - 1,
+                                  MSG_DONTWAIT | MSG_NOSIGNAL);
             }
           }
           client_pfe->pd_phase = PD_PHASE_ERROR;
@@ -10755,7 +10816,9 @@ cresp_is_answer(int status)
 static void
 proxy_sse_activate(proxy_fd_ent_t *pfe)
 {
-  if (!pfe || pfe->sse_mode != 1 || pfe->sse_active) return;
+  if (!pfe || pfe->sse_active ||
+      !sp_stream_recognised(pfe->sse_mode, pfe->ai_gw_mode))
+    return;
   pfe->sse_active = 1;
   pfe->stream_start_ts = time(NULL);
   {
@@ -10791,6 +10854,7 @@ cresp_on_message_begin(llhttp_t *parser)
   if (pfe) {
     memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
     creq_block_msg_begin(&pfe->cresp_blk);
+    sp_answer_msg_begin(&pfe->cresp_in_msg);
   }
   return 0;
 }
@@ -10871,6 +10935,7 @@ cresp_on_message_complete(llhttp_t *parser)
   if (pfe) {
     creq_block_msg_done(&pfe->cresp_blk);
     sp_sse_message_done(&pfe->cresp_sse);
+    sp_answer_msg_done(&pfe->cresp_in_msg);
   }
   if (pfe && cresp_is_answer(parser->status_code)) {
     /* Capture ownership survives a policy change and names modern H1
@@ -10958,6 +11023,9 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
               client->fd, rerr, llhttp_errno_name(rerr));
     cresp_parser_init(client);
     creq_block_read_end(&client->cresp_blk, 0);
+    /* What follows may still be the middle of an answer: no status line goes
+     * out until a message is framed to its end. */
+    sp_answer_framing_lost(&client->cresp_in_msg);
   }
 }
 
@@ -10986,6 +11054,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     hc_resp_done(client);
     sp_hold_answer_ended(client);
+    sp_answer_msg_done(&client->cresp_in_msg);
   }
 }
 
@@ -12652,7 +12721,8 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
       /* No backend took the request: completed with the status written,
        * as proxy_send_backend_unreachable records it. */
       proxy_record_local_completion(client, 502);
-      send(client->fd, lb_502, sizeof(lb_502) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+      sp_raw_status_write(client, lb_502, sizeof(lb_502) - 1,
+                          MSG_DONTWAIT | MSG_NOSIGNAL);
       client->connect_wait = 0;
     }
     if (!(type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
@@ -13675,7 +13745,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 "\r\n"
                 "{\"error\":\"bad_request\",\"message\":\"unparseable or "
                 "ambiguously framed request refused before admission\"}\r\n";
-              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);
+              sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
+                                  MSG_NOSIGNAL);
               shutdown(pfe->fd, SHUT_RDWR);
               log_debug("[AIGateway] fd=%d parse error on an enforcing "
                        "service — refused before admission (no raw relay)",

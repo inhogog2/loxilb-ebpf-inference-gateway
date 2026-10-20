@@ -162,5 +162,8 @@ jobs:
       - name: UC-5 backend failure completion Audit (production sender, identity and once-only guards)
         run: make -C common test_backend_failure_audit
 
+      - name: A started answer takes no new status line (framer state at every cut, senders and reaper with their twin)
+        run: make -C common test_answer
+
       - name: UC-5 unchanged L2 split horizon (all VLAN values, routing/NAT/tunnel exceptions)
         run: make -C common test_l2_reflection

@@ -332,7 +332,11 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
   }
 
   if (pfe->fd > 0 && t->text) {
-    if (pfe->ssl) {
+    if (!t->body && sp_answer_started(pfe)) {
+      /* An answer is in progress: a status line would land in its body. */
+      log_warn("[REAPER] fd=%d: answer in progress, closed without the "
+               "status line (no owner hand-off)", pfe->fd);
+    } else if (pfe->ssl) {
       log_warn("[REAPER] fd=%d: TLS client ended without the response body "
                "(no owner hand-off)", pfe->fd);
     } else {
@@ -503,7 +507,11 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
   }
   if (pfe->fd > 0 && buf) {
     sp_reap_record(pfe, kind);
-    if (proxy_send_local_response_and_shutdown(pfe, buf, len) != 0) {
+    if (!t->body && sp_answer_started(pfe)) {
+      /* A whole response cannot follow the answer the client is reading:
+       * end that answer instead (sockproxy_answer.h). */
+      sp_end_started_answer(pfe, buf, len);
+    } else if (proxy_send_local_response_and_shutdown(pfe, buf, len) != 0) {
       log_error("[REAPER] fd=%d failed to send complete bounded response "
                 "(kind %u)", pfe->fd, kind);
     } else {

@@ -13,6 +13,7 @@
 
 #include "llhttp.h"
 #include "sockproxy_sse_observe.h"
+#include "sockproxy_answer.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -1232,6 +1233,7 @@ struct proxy_fd_ent {
    * one as held. */
   _Atomic uint8_t  eof_hold;          // held on EOF: FIN read, kept open for an owed answer
   _Atomic uint8_t  cresp_answer_open; // the response framer is inside an answer (1xx excluded)
+  _Atomic uint8_t  cresp_in_msg;      // the response framer is inside a message, 1xx included (sockproxy_answer.h)
   _Atomic uint8_t  hold_answer_began; // an answer to the held request has begun
   _Atomic uint8_t  hold_end;          // enum sp_hold_end; the first reason recorded wins
   _Atomic uint32_t hold_leg_ended;    // requests framed when the answer's leg ended, plus one (0: none)
