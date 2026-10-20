@@ -290,6 +290,35 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
       SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
 };
 
+/* Whether the answer this client is being sent is chunked, read from the
+ * client's own response framer: its parser's flags while it is inside that
+ * answer. Never from a backend leg. A P/D client's prefill leg sits in slot 0
+ * and its decode leg in a later slot, and either may already be unlinked, so
+ * the first leg's flag left the terminator unframed inside a chunked body
+ * (the client never decoded it and saw the body cut). */
+static int
+sp_reap_client_chunked(proxy_fd_ent_t *pfe)
+{
+  return atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed) &&
+         (pfe->cresp_parser.flags & F_CHUNKED) != 0;
+}
+
+/* The bytes a body kind (an SSE event, the synthesised [DONE]) is written as:
+ * on a chunked answer, its last chunk followed by the terminator, or the
+ * client decodes neither. Returns the framed length in `out`, 0 to write the
+ * text as it is. */
+static size_t
+sp_reap_body_frame(proxy_fd_ent_t *pfe, const sp_reap_text_t *t, char *out,
+                   size_t cap)
+{
+  int n;
+
+  if (!t->text || !t->body || !sp_reap_client_chunked(pfe))
+    return 0;
+  n = snprintf(out, cap, "%zx\r\n%s\r\n0\r\n\r\n", t->len, t->text);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
 /* End a client this thread decided against, answering it first.
  *
  * This thread runs under PROXY_LOCK while the fd's owner worker holds no lock
@@ -340,7 +369,11 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
       log_warn("[REAPER] fd=%d: TLS client ended without the response body "
                "(no owner hand-off)", pfe->fd);
     } else {
-      send(pfe->fd, t->text, t->len, MSG_DONTWAIT | MSG_NOSIGNAL);
+      char framed[512];
+      size_t fl = sp_reap_body_frame(pfe, t, framed, sizeof(framed));
+
+      send(pfe->fd, fl ? framed : t->text, fl ? fl : t->len,
+           MSG_DONTWAIT | MSG_NOSIGNAL);
     }
   }
   if (t->teardown) {
@@ -365,19 +398,6 @@ sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind)
  * thread would have ended it: the single-owner teardown under PROXY_LOCK for
  * a request, a shutdown for a stream the event loop cleans up. The kind is
  * cleared first, so a second wake for the same fd finds nothing to do. */
-/* Whether the response this client is reading arrives chunked: the framing
- * is the backend leg's, detected on its response headers. */
-static int
-sp_reap_client_chunked(proxy_fd_ent_t *pfe)
-{
-  proxy_fd_ent_t *leg;
-
-  if (pfe->n_rfd <= 0)
-    return 0;
-  leg = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
-  return leg && leg->is_chunked_response;
-}
-
 /* A request ended while it waited in the capacity queue (the deadline, or
  * a drain): the response says how long it waited and what the pool looks
  * like, and the refusal is recorded on the trail like every other decision
@@ -495,14 +515,13 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
     }
   }
   /* An event written into a response in progress is body bytes: on a chunked
-   * relay the client decodes chunks, so the event goes out as the last chunk
+   * answer the client decodes chunks, so the event goes out as the last chunk
    * followed by the terminator, or the client never sees an event at all. */
-  if (buf && t->body && sp_reap_client_chunked(pfe)) {
-    int n = snprintf(framed, sizeof(framed), "%zx\r\n%s\r\n0\r\n\r\n",
-                     t->len, t->text);
-    if (n > 0 && n < (int)sizeof(framed)) {
+  if (buf) {
+    size_t fl = sp_reap_body_frame(pfe, t, framed, sizeof(framed));
+    if (fl > 0) {
       buf = framed;
-      len = (size_t)n;
+      len = fl;
     }
   }
   if (pfe->fd > 0 && buf) {
