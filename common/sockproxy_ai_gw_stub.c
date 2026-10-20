@@ -21,6 +21,7 @@
  * llb_ai_ratelimit_update, llb_ai_record_request, llb_ai_record_deny,
  * llb_ai_stream_start, llb_ai_stream_end, llb_ai_token_quota_consume and
  * llb_ai_pd_record
+ * llb_ai_pd_record_extra
  * live in pkg/loxinet/ai_gateway_dp.go, llb_ai_audit_emit_only lives in
  * pkg/loxinet/ai_gateway_bench.go, and all of them are only
  * available when the binary is linked with the Go CGO runtime.
@@ -313,6 +314,16 @@ llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
     (void)decode_latency_ms;
     (void)kv_params_found;
     (void)error_phase;
+}
+
+__attribute__((weak)) void
+llb_ai_pd_record_extra(char *model_name, int64_t decode_ttft_us,
+                       int fallback_reason)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)model_name;
+    (void)decode_ttft_us;
+    (void)fallback_reason;
 }
 
 __attribute__((weak)) void

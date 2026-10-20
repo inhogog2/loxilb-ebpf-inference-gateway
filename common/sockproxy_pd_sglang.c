@@ -169,7 +169,7 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason,
      * answered 5xx, or the pair retry was exhausted. None of them is a
      * timeout, so they must not land on the prefill timeout series. */
     const char *pd_model = proxy_effective_model(client_pfe);
-    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 4 /*prefill error*/);
+    sp_pd_record(client_pfe, pd_model, 0, 0, 0, 4 /*prefill error*/);
   }
   /* The client's answer: completed with the status written. */
   proxy_record_local_completion(client_pfe, 502);
@@ -345,7 +345,7 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
            * prefill timeout made a burst of malformed client requests read as
            * a wedged prefill fleet. */
           const char *pd_model = proxy_effective_model(client_pfe);
-          llb_ai_pd_record((char *)pd_model, 0, 0, 0, 5 /*prefill rejected*/);
+          sp_pd_record(client_pfe, pd_model, 0, 0, 0, 5 /*prefill rejected*/);
         }
         pd_sg_relay_bytes(client_pfe, msg, len);
         if (ent->pd_sg_drain_done) {
@@ -575,7 +575,7 @@ fail:
         "\r\n"
         "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang dual dispatch failed\"}";
     const char *pd_model = proxy_effective_model(client_pfe);
-    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 2 /*decode error*/);
+    sp_pd_record(client_pfe, pd_model, 0, 0, 0, 2 /*decode error*/);
     /* The client's answer: completed with the status written. */
     proxy_record_local_completion(client_pfe, 503);
     if (client_pfe->fd > 0) {

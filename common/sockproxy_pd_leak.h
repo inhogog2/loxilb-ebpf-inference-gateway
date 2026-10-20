@@ -220,6 +220,41 @@ pd_prefill_status_verdict(int status, int truncated)
 }
 
 /*
+ * pd_prefill_fallback_reason - why a prefill reply that pd_prefill_status_verdict
+ * sent to the decode leg was recomputed there (loxilb_ai_pd_prefill_fallback_total
+ * {reason}); PD_FB_NONE when it was not a fallback. The reason is the condition
+ * that forced the fallback, in verdict order: when the status alone forces it,
+ * the status is the reason, whether or not the body was cut; when the status
+ * would have been relayed or used and the fallback happened only because the
+ * reply was cut at the buffer cap, the reason is truncated (a cut 2xx or 4xx).
+ *
+ *   >= 500             -> PD_FB_ORIGIN_5XX  (cut or not)
+ *   408 / 429          -> PD_FB_ORIGIN_408 / PD_FB_ORIGIN_429  (cut or not)
+ *   0 (unreadable)     -> PD_FB_NO_STATUS   (cut or not: the status alone forces it)
+ *   1xx, 3xx           -> PD_FB_OTHER       (an unusable reply)
+ *   2xx, other 4xx cut -> PD_FB_TRUNCATED
+ *   2xx not cut        -> PD_FB_NONE        (the normal path)
+ *   other 4xx not cut  -> PD_FB_NONE        (relayed, never reaches decode)
+ */
+#define PD_FB_NONE        0
+#define PD_FB_ORIGIN_5XX  1
+#define PD_FB_ORIGIN_408  2
+#define PD_FB_ORIGIN_429  3
+#define PD_FB_NO_STATUS   4
+#define PD_FB_TRUNCATED   5
+#define PD_FB_OTHER       6
+static inline int
+pd_prefill_fallback_reason(int status, int truncated)
+{
+  if (status >= 500) return PD_FB_ORIGIN_5XX;
+  if (status == 408) return PD_FB_ORIGIN_408;
+  if (status == 429) return PD_FB_ORIGIN_429;
+  if (status <= 0) return PD_FB_NO_STATUS;
+  if (status < 200 || (status >= 300 && status < 400)) return PD_FB_OTHER;
+  return truncated ? PD_FB_TRUNCATED : PD_FB_NONE;
+}
+
+/*
  * pd_decode_error_phase - the llb_ai_pd_record error_phase of a P/D request
  * whose decode leg delivered its whole response, from the status the client
  * received (the decode leg's; the prefill reply is not captured).
@@ -241,6 +276,35 @@ pd_decode_error_phase(int status)
   if (status < 400) return 0;
   if (status < 500) return 6;
   return 2;
+}
+
+/*
+ * pd_reap_error_phase - the llb_ai_pd_record error_phase of a P/D request a
+ * reaper ends while it is still in flight, from its pd_phase (the numbers are
+ * sockproxy.h's PD_PHASE_*; sockproxy_health.c asserts them):
+ *
+ *   1..3  PREFILL_SENDING / _WAITING / _DONE -> 1  prefill / timeout
+ *   4     DECODE_SENDING  (no decode byte)   -> 3  decode / timeout
+ *   5     DECODE_STREAMING (the answer began) -> 8  decode / truncated
+ *   else  not in flight                       -> -1 nothing to record
+ *
+ * The phase names the cause. A begun answer a reaper ends was ended by the
+ * gateway: the engine went silent (the sweep, the stream timeout, the idle
+ * cap) or a policy cap ended it (the duration cap), so it is decode/truncated
+ * whether the gateway wrote a terminator or cut it with an error;
+ * pd_terminator_synthesized tells the two apart. decode/error (2) is the
+ * engine's death, which only the decode leg sees. A client that stopped
+ * reading is no reaper record at all (pd_reap_unrecorded). -1 for every other
+ * phase is what makes the record once: the reaper moves the request to ERROR
+ * after recording it.
+ */
+static inline int
+pd_reap_error_phase(int pd_phase)
+{
+  if (pd_phase >= 1 && pd_phase <= 3) return 1;
+  if (pd_phase == 4) return 3;
+  if (pd_phase == 5) return 8;
+  return -1;
 }
 
 /* PD_MSG_END_TAIL_KEEP - bytes of trailing context carried between successive

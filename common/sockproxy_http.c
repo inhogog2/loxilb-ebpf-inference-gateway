@@ -205,7 +205,7 @@ proxy_owes_completion(const proxy_fd_ent_t *pfe)
  * charging the real amount. HTTP/2 settles in one place for the same reason
  * (proxy_h2_settle_stream). */
 static void
-proxy_ai_record_completion(proxy_fd_ent_t *pfe)
+proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream)
 {
   char svc_ident[64];
   int64_t lat_ms = 0;
@@ -224,7 +224,7 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
                         pfe->usage_prompt_toks, pfe->usage_complet_toks,
                         0, 0, "", (char *)proxy_request_id(pfe),
                         (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
-                        svc_ident, 0, notify_worker_id(),
+                        svc_ident, is_stream, notify_worker_id(),
                         (char *)pfe->l7_peer_ip,
                         (char *)proxy_origin_ip(pfe),
                         (int)proxy_origin_trusted_hops(pfe),
@@ -241,6 +241,23 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
   fc_permit_release(&pfe->fc);
 }
 
+static void
+proxy_ai_record_completion(proxy_fd_ent_t *pfe)
+{
+  proxy_ai_record_completion_(pfe, 0);
+}
+
+/* An answer the client was receiving, ended by a reaper that frees the
+ * connection inline (the graceful-[DONE] sweep's terminator, a stream-silence
+ * or idle cut after the 200), never reaches the [DONE] scanner's record nor the
+ * teardown's: its request record is written here, once, with the status the
+ * client received. A stream is one the client was sent as a stream. */
+void
+proxy_record_reaped_answer(proxy_fd_ent_t *pfe)
+{
+  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0);
+}
+
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
     size_t needle_len = strlen(needle);
     if (needle_len == 0) return haystack;
@@ -250,6 +267,31 @@ static const char *strnstr_portable(const char *haystack, const char *needle, si
             return &haystack[i];
     }
     return NULL;
+}
+
+/* One P/D lifecycle record, for one request and one completion event: the
+ * outcome (llb_ai_pd_record), then the request's first-event time and
+ * fallback reason (llb_ai_pd_record_extra), always both and with nothing
+ * between them. Every lifecycle record goes through here
+ * (check_pd_status_sites.sh rule 7). The two values are consumed: a second
+ * record for the same request carries 0/0, so the request's TTFT sample and
+ * fallback count are made at most once. */
+void
+sp_pd_record(proxy_fd_ent_t *pfe, const char *model, int64_t prefill_ms,
+             int64_t decode_ms, int kv, int error_phase)
+{
+  int64_t ttft_us = 0;
+  int fb = pfe->pd_fallback_reason;
+
+  if (pfe->pd_decode_start_ns > 0 &&
+      pfe->pd_first_event_ns > pfe->pd_decode_start_ns) {
+    ttft_us = (int64_t)((pfe->pd_first_event_ns - pfe->pd_decode_start_ns) /
+                        1000ULL);
+  }
+  pfe->pd_first_event_ns = 0;
+  pfe->pd_fallback_reason = 0;
+  llb_ai_pd_record((char *)model, prefill_ms, decode_ms, kv, error_phase);
+  llb_ai_pd_record_extra((char *)model, ttft_us, fb);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2053,7 +2095,7 @@ skip_deferred_masking:
               {
                 const char *pd_dec_model = proxy_effective_model(rfd_ent);
                 int d_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
-                llb_ai_pd_record((char *)pd_dec_model, 0, 0, d_kv, 2);
+                sp_pd_record(rfd_ent, pd_dec_model, 0, 0, d_kv, 2);
               }
               rfd_ent->pd_phase = PD_PHASE_ERROR;
               pd_cleanup(rfd_ent);
@@ -2406,7 +2448,7 @@ skip_deferred_masking:
                                      rfd_ent->pd_decode_start_ns) / 1000000ULL);
             }
             int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)sse_model, prefill_ms, decode_ms, pd_kv, 0);
+            sp_pd_record(rfd_ent, sse_model, prefill_ms, decode_ms, pd_kv, 0);
           }
           log_debug("P/D flow complete — client_fd=%d backend_fd=%d",
                    rfd_ent->fd, ent->fd);
@@ -2453,27 +2495,29 @@ skip_deferred_masking:
         rfd_ent->pd_decode_bytes_received += len;
       }
 
-      /* + T3: chunked / CL-less non-SSE decode
-       * completion. When the decode response has no Content-Length (chunked
-       * transfer-coding), the Content-Length tracking above never fires.
+      /* T3: chunked / CL-less non-SSE decode completion. When the decode
+       * response has no Content-Length (chunked transfer-coding), the
+       * Content-Length tracking above never fires.
        *
- * T3 (the high-concurrency stall): this !sse_active branch is ALSO
-       * the only completion detector when sse_active never flipped — the
-       * fragmented-"Content-Type" stall. Under load the response header block can
-       * split across reads, so the single-read sniff at :1157 misses
-       * "Content-Type: text/event-stream" -> sse_active stays 0 -> pd_phase stays
-       * PD_PHASE_DECODE_SENDING -> control reaches HERE, not the :1198 SSE
- * scanner. originally scanned only the CURRENT packet, so a terminator
-       * ("data: [DONE]\n\n" or the chunked "0\r\n\r\n") split across two TCP
-       * segments was missed -> the decode leg stalled forever and was eventually
-       * watchdog-reaped (~50% of high-rate points at conc=64).
+       * This !sse_active branch is also the completion detector for a stream
+       * that was never activated. It used to be reached under load by the
+       * fragmented-"Content-Type" stall: the single-read sniff missed a header
+       * block split across reads. That is no longer how a stream is
+       * recognised. The response framer gathers each header across reads and
+       * activates the stream at its headers (cresp_on_headers_complete); the
+       * raw sniff runs only for a response the framer could not frame. What
+       * still reaches here with an event stream is such a response (a
+       * malformed backend reply), or a stream on a rule without stream
+       * handling.
        *
-       * pd_scan_msg_end_window() keeps a sliding tail (riding the otherwise-idle
-       * sse_tail — idle precisely because sse_active==0 on this branch, so there
-       * is no contention with the :1198 scanner, which is gated on sse_active==1
-       * and mutually exclusive with this branch — the two never double-fire /
-       * double-free). Completion is thereby decoupled from sse_active; sse_active
-       * remains the metrics/gauge signal only. */
+       * Either way the terminator ("data: [DONE]\n\n" or the chunked
+       * "0\r\n\r\n") can be split across two reads, and a scan of the current
+       * read alone missed it: the decode leg stalled until a reaper took it.
+       * pd_scan_msg_end_window() keeps a sliding tail in sse_tail, which is
+       * idle on this branch because sse_active == 0. The SSE [DONE] scanner is
+       * gated on sse_active == 1, so the two are mutually exclusive and never
+       * both complete a request. Completion is thereby decoupled from
+       * sse_active, which remains the metrics/gauge signal only. */
       int pd_decode_chunked_done =
           (rfd_ent->pd_decode_content_length == 0) &&
           pd_scan_msg_end_window(rfd_ent->sse_tail, &rfd_ent->sse_tail_len,
@@ -2499,7 +2543,7 @@ skip_deferred_masking:
         }
         int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
         const char *ns_model = proxy_effective_model(rfd_ent);
-        llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv,
+        sp_pd_record(rfd_ent, ns_model, prefill_ms, decode_ms, pd_kv,
                          pd_decode_error_phase(rfd_ent->metric_response_status));
         rfd_ent->pd_phase = PD_PHASE_COMPLETE;
         /* The disaggregated response is complete: its capacity units go back
@@ -5829,6 +5873,8 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
   fd_ent->pd_phase_start_ts = 0;
   fd_ent->pd_prefill_start_ns = 0;
   fd_ent->pd_decode_start_ns = 0;
+  fd_ent->pd_first_event_ns = 0;
+  fd_ent->pd_fallback_reason = 0;
   fd_ent->pd_decode_content_length = 0;
   fd_ent->pd_decode_bytes_received = 0;
   fd_ent->pd_prefill_retries = 0;
@@ -6338,7 +6384,7 @@ proxy_pdestroy(void *priv)
             {
               const char *pd_model = proxy_effective_model(client_pfe);
               int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-              llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv,
+              sp_pd_record(client_pfe, pd_model, 0, 0, pd_kv,
                                4 /*prefill error*/);
             }
             /* The client's answer: completed with the status written. */
@@ -6549,7 +6595,7 @@ proxy_pdestroy(void *priv)
           {
             const char *pd_model = proxy_effective_model(client_pfe);
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
+            sp_pd_record(client_pfe, pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
           }
           /* SGLang: decode-leg death must not orphan the prefill drain leg */
           pd_sg_close_drain(client_pfe, 1);
@@ -6580,7 +6626,7 @@ proxy_pdestroy(void *priv)
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
                      pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
-            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv,
+            sp_pd_record(client_pfe, pd_model, prefill_ms, decode_ms, pd_kv,
                              pd_decode_error_phase(client_pfe->metric_response_status));
           }
           pd_cleanup(client_pfe);
@@ -6589,16 +6635,29 @@ proxy_pdestroy(void *priv)
           /* Decode backend EOF mid-stream. A completed stream leaves
            * DECODE_STREAMING via the SSE [DONE] scanner before its backend
            * closes (pd_phase NONE ⇒ the detach branch above), so reaching
-           * here means the stream was CUT with no terminator. Completion
-           * stays with the reaper paths (graceful-[DONE] synthesizes the
-           * terminator after the idle cap), but the EP death itself must be
-           * visible to the failover counters — without this tick a
-           * mid-stream decode crash is recorded as a clean success. */
+           * here means the stream was CUT with no terminator: the engine
+           * died. The request is recorded here as decode/error and moved to
+           * ERROR, so the graceful-[DONE] sweep neither records it again nor
+           * dresses the cut up as a clean end with a terminator of its own;
+           * the client sees the cut when this leg's teardown ends it. The EP
+           * death is also ticked for the failover counters. */
           log_error("decode backend EOF mid-stream — client_fd=%d "
-                    "decode_fd=%d (stream cut before [DONE]; reaper will "
-                    "complete the client)",
+                    "decode_fd=%d (stream cut before [DONE]; decode/error)",
                     client_pfe->fd, pfe->fd);
           atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+          {
+            const char *pd_model = proxy_effective_model(client_pfe);
+            int64_t prefill_ms = 0;
+            if (client_pfe->pd_prefill_start_ns > 0 &&
+                client_pfe->pd_decode_start_ns > client_pfe->pd_prefill_start_ns) {
+              prefill_ms = (int64_t)((client_pfe->pd_decode_start_ns -
+                                      client_pfe->pd_prefill_start_ns) / 1000000ULL);
+            }
+            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+            sp_pd_record(client_pfe, pd_model, prefill_ms, 0, pd_kv,
+                             2 /*decode error*/);
+          }
+          client_pfe->pd_phase = PD_PHASE_ERROR;
           /* SGLang: decode-leg death must not orphan the prefill drain leg */
           pd_sg_close_drain(client_pfe, 1);
         }
@@ -10464,7 +10523,7 @@ handle_on_message_complete(llhttp_t* parser)
             int d_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             log_debug(" llb_ai_pd_record (decode error): model=%s prefill=%lldms kv=%d",
                      pd_dec_model, (long long)d_prefill_ms, d_kv);
-            llb_ai_pd_record((char *)pd_dec_model, d_prefill_ms, 0, d_kv, 2);
+            sp_pd_record(client_pfe, pd_dec_model, d_prefill_ms, 0, d_kv, 2);
           }
           /* P5-fix: 503 (not 502) — decode response processing failure means
            * the P/D backend pool is unavailable, not a proxy protocol error. */
@@ -10888,7 +10947,20 @@ static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
     pfe->cresp_payload_observed = 1;
     if (pfe->ai_gw_mode && !pfe->usage_consumed)
       proxy_usage_tail_update(pfe, (const uint8_t *)at, len);
-    sp_sse_body(&pfe->cresp_sse, at, len);
+    /* MON-01: the decode answer's first streamed event, stamped where the
+     * framer sees it (every stream recognised by its Content-Type, whatever
+     * sse_mode says, and never a chunk-size line), once per P/D request.
+     * The time goes out on the request's lifecycle record (sp_pd_record),
+     * not across the boundary here. */
+    if (sp_sse_body(&pfe->cresp_sse, at, len) && pfe->pd_first_event_ns == 0 &&
+        pfe->pd_decode_start_ns > 0 &&
+        (pfe->pd_phase == PD_PHASE_DECODE_SENDING ||
+         pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      pfe->pd_first_event_ns = (uint64_t)ts.tv_sec * 1000000000ULL +
+                               (uint64_t)ts.tv_nsec;
+    }
   }
   return 0;
 }

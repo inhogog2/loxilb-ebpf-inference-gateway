@@ -456,6 +456,8 @@ check_client_eof_keep:
 .PHONY: check_pd_status_sites
 check_pd_status_sites:
 	sh ./check_pd_status_sites.sh
+	sh ./check_pd_status_sites_mutations.sh
+	python3 test_pd_record.py
 
 # A response the gateway writes itself is recorded as the client receives it
 # (status and class, no TTFB sample), and once as a request: a staged
@@ -734,6 +736,7 @@ test_answer: test_answer_track
 	python3 test_eof_answer.py
 	python3 test_reap_framing.py
 	python3 test_reap_framing_mutations.py
+	python3 test_reap_request_record.py
 
 .PHONY: test_admit test_uc5 test_backend_failure_audit
 test_backend_failure_audit:

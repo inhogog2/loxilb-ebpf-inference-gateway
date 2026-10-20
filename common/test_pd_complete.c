@@ -412,6 +412,63 @@ test_decode_error_phase(void)
   printf("  [PASS] pd_decode_error_phase: 2xx/3xx 0, 4xx 6, 5xx 2, unread 7\n");
 }
 
+/* pd_prefill_fallback_reason: the condition that forced the fallback, in
+ * verdict order. The status is the reason when it alone forces decode, cut or
+ * not; a reply that would have been used or relayed is truncated only because
+ * it was cut; a reply that is no status at all is no_status; 1xx/3xx other. */
+static void
+test_prefill_fallback_reason(void)
+{
+  static const struct { int status, cut, reason; } cases[] = {
+    { 500, 0, PD_FB_ORIGIN_5XX }, { 503, 1, PD_FB_ORIGIN_5XX }, { 599, 0, PD_FB_ORIGIN_5XX },
+    { 408, 0, PD_FB_ORIGIN_408 }, { 408, 1, PD_FB_ORIGIN_408 },
+    { 429, 0, PD_FB_ORIGIN_429 }, { 429, 1, PD_FB_ORIGIN_429 },
+    {   0, 0, PD_FB_NO_STATUS },  {   0, 1, PD_FB_NO_STATUS },
+    { 100, 0, PD_FB_OTHER },      { 301, 0, PD_FB_OTHER },      { 304, 1, PD_FB_OTHER },
+    { 200, 1, PD_FB_TRUNCATED },  { 404, 1, PD_FB_TRUNCATED },  { 422, 1, PD_FB_TRUNCATED },
+    { 200, 0, PD_FB_NONE },       { 204, 0, PD_FB_NONE },
+    { 404, 0, PD_FB_NONE },       /* relayed: never reaches the decode leg */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int got = pd_prefill_fallback_reason(cases[i].status, cases[i].cut);
+    if (got != cases[i].reason) {
+      fprintf(stderr, "pd_prefill_fallback_reason(%d, cut=%d) = %d, want %d\n",
+              cases[i].status, cases[i].cut, got, cases[i].reason);
+      assert(0);
+    }
+    /* a reason exactly when the verdict sends the reply to decode and the
+     * reply was not a clean 2xx */
+    int to_decode = pd_prefill_status_verdict(cases[i].status, cases[i].cut) == PD_PR_DECODE;
+    int clean = cases[i].status >= 200 && cases[i].status < 300 && !cases[i].cut;
+    assert((got != PD_FB_NONE) == (to_decode && !clean));
+  }
+  printf("  [PASS] pd_prefill_fallback_reason: status first (5xx/408/429/none/other), truncated only for a cut usable reply\n");
+}
+
+/* pd_reap_error_phase: a request a reaper ends is named by the phase it was
+ * in; a begun answer the gateway ended is decode/truncated, never the engine's
+ * death (2); anything not in flight has no record to make, which is what keeps
+ * the record to one once the reaper moves the request to ERROR. */
+static void
+test_reap_error_phase(void)
+{
+  static const struct { int pd_phase, phase; } cases[] = {
+    { 0, -1 },                         /* NONE: not a P/D request */
+    { 1, 1 }, { 2, 1 }, { 3, 1 },      /* prefill legs: prefill / timeout */
+    { 4, 3 },                          /* decode dispatched, no byte: decode / timeout */
+    { 5, 8 },                          /* the answer began: decode / truncated */
+    { 6, -1 }, { 7, -1 }, { 8, -1 },   /* COMPLETE, ERROR, PARKED */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    if (pd_reap_error_phase(cases[i].pd_phase) != cases[i].phase) {
+      fprintf(stderr, "pd_reap_error_phase(%d) = %d, want %d\n", cases[i].pd_phase,
+              pd_reap_error_phase(cases[i].pd_phase), cases[i].phase);
+      assert(0);
+    }
+  }
+  printf("  [PASS] pd_reap_error_phase: prefill 1, decode-sending 3, streaming 8, else none\n");
+}
+
 int
 main(void)
 {
@@ -430,6 +487,8 @@ main(void)
   test_resp_error_excerpt();
   test_prefill_status_verdict();
   test_decode_error_phase();
+  test_reap_error_phase();
+  test_prefill_fallback_reason();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }

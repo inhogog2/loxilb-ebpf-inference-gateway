@@ -137,7 +137,7 @@ pd_trt_early_exit_relay(struct proxy_fd_ent *client_pfe,
       prefill_ms = (int64_t)((now_ns - client_pfe->pd_prefill_start_ns) /
                              1000000ULL);
     }
-    llb_ai_pd_record((char *)model, prefill_ms, 0, 0, 0);
+    sp_pd_record(client_pfe, model, prefill_ms, 0, 0, 0);
   }
 
   log_info("[PD_TRT_EARLY_EXIT] context response finished the request — "
