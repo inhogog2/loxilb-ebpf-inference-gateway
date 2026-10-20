@@ -47,9 +47,8 @@
 #define PROXY_CACHE_LOW_WATER          (4 * 1024 * 1024)  /* 4MB resume */
 
 /* 1 if the entry, or any leg it relays with, carries a chunked response.
- * The leg pointers are read with an acquire load, as the health pass does
- * (sp_reap_client_chunked): a leg may be unlinked by a teardown on another
- * worker while this entry is still caching. */
+ * The leg pointers are read with an acquire load: a leg may be unlinked by a
+ * teardown on another worker while this entry is still caching. */
 static inline int
 proxy_cache_chunked(proxy_fd_ent_t *ent)
 {

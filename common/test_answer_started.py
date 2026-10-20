@@ -23,9 +23,11 @@ r0 = health.index('static void\npd_reap_respond(')
 r1 = health.index('\nvoid\nsp_reap_request(', r0)
 c0 = health.index('static int\nsp_reap_client_chunked(')
 c1 = health.index('\n}\n', c0) + 3
+b0 = health.index('static size_t\nsp_reap_body_frame(')
+b1 = health.index('\n}\n', b0) + 3
 f0 = health.index('void\nsp_reap_finish(proxy_fd_ent_t *pfe)')
 f1 = health.index('\n}\n', f0) + 3
-reaper = health[t0:t1] + health[c0:c1] + health[r0:r1] + health[f0:f1]
+reaper = health[t0:t1] + health[c0:c1] + health[b0:b1] + health[r0:r1] + health[f0:f1]
 
 common = r'''
 #define _GNU_SOURCE
