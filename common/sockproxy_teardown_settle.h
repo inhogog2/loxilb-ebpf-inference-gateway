@@ -96,8 +96,11 @@ teardown_owes_completion(const teardown_conn_t *c)
 }
 
 /*
- * A request the client left before any answer: no status was sent, nothing
- * recorded it. It is aborted by the client (sockproxy_end_cause.h), status 0.
+ * A request that ended before any answer: no status was sent, nothing
+ * recorded it. Its record is owed here, status 0, named by how it ended
+ * (sockproxy_end_cause.h): the client leaving (client_abort_before_answer,
+ * cause client), or, off P/D, the backend leg ending under it (backend_died,
+ * cause engine).
  *
  * Owed by a P/D request in its prefill or decode, and by any request once it
  * is whole at the gate: still at the gate, queued, parked. On a P/D rule the

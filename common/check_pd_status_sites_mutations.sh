@@ -190,19 +190,25 @@ expect "6d: a P/D request in flight before it is whole is not owed" "must be owe
 fresh
 mut sockproxy_http.c '  v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
 ' ''
-expect "6d: the view does not say the request is in flight" "the teardown must collect and record a request its client left before any answer"
+expect "6d: the view does not say the request is in flight" "the teardown must collect and record a request that ended before any answer"
 fresh
 mut sockproxy_http.c '  if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||' '  if ((teardown_owes_completion(&v) ||'
-expect "6d: the teardown does not collect it" "the teardown must collect and record a request its client left before any answer"
+expect "6d: the teardown does not collect it" "the teardown must collect and record a request that ended before any answer"
 fresh
-mut sockproxy_http.c '    if (u->end == SP_END_CLIENT_NO_ANSWER) {
+mut sockproxy_http.c '    if (teardown_owes_abort_record(&v) && sp_end_recorded_before_answer(u->end)) {
       u->owes_record = 1;
     }
 ' ''
-expect "6d: its request record is not owed" "the teardown must collect and record a request its client left before any answer"
+expect "6d: its request record is not owed" "the teardown must collect and record a request that ended before any answer"
+fresh
+mut sockproxy_http.c '    if (teardown_owes_abort_record(&v) && sp_end_recorded_before_answer(u->end)) {' '    if (u->end == SP_END_CLIENT_NO_ANSWER) {'
+expect "6d: the engine's end before any answer is not recorded" "the teardown must collect and record a request that ended before any answer"
 fresh
 mut sockproxy_http.c '         (u->end == SP_END_CLIENT_NO_ANSWER && pfe->pd_rule))) {' '         0)) {'
 expect "6c: a P/D client leaving at the gate, queued or parked gets no aborted (9)" "a P/D client that left record aborted (9) once"
+fresh
+mut sockproxy_end_cause.h '  return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_BACKEND_DIED;' '  return end == SP_END_CLIENT_NO_ANSWER;'
+expect "6f: the leg ending before any answer is not an end recorded then" "a request is recorded before any answer when the client left or the leg ended"
 
 # 6e: off P/D, the request record alone, for a whole request the client left.
 fresh

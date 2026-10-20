@@ -11,7 +11,8 @@ lifecycle record is aborted (9): the two families stay 1:1. So is a P/D
 request whose client left at the gate, queued or parked, on a kept
 connection whatever phase the request before left. A whole request on a rule
 that is not P/D gets the request record alone (no lifecycle family pairs with
-it), status 0, client_abort_before_answer.
+it): client_abort_before_answer when the client left, backend_died (cause
+engine) when the leg its answer was to come on ended, status 0 both.
 
 The production reaper writers run on the owner worker (sp_reap_finish and
 sp_reap_record, sockproxy_health.c) with the production request recorders
@@ -49,8 +50,8 @@ pd = body(http, 'static void\nproxy_collect_conn_settles(')
 assert 'u->owes_record  = teardown_owes_completion(&v);' in pd
 assert re.search(r'if \(\(teardown_owes_completion\(&v\) \|\| teardown_owes_abort_record\(&v\) \|\|', pd), \
     'the teardown no longer collects a request its client left before any answer'
-assert re.search(r'if \(u->end == SP_END_CLIENT_NO_ANSWER\) \{\s*u->owes_record = 1;\s*\}', pd), \
-    'the record of a request left before any answer is no longer owed: update this model'
+assert re.search(r'if \(teardown_owes_abort_record\(&v\) && sp_end_recorded_before_answer\(u->end\)\) \{\s*u->owes_record = 1;\s*\}', pd), \
+    'the record of a request ended before any answer is no longer owed: update this model'
 assert re.search(r'if \(u->owes_record && sp_end_client_left\(u->end\) &&\s*\(pd_reap_error_phase\(pfe->pd_phase\) >= 0 \|\|\s*'
                  r'\(u->end == SP_END_CLIENT_NO_ANSWER && pfe->pd_rule\)\)\) \{'
                  r'[\s\S]*?9 /\*aborted\*/\);\s*pfe->pd_phase = PD_PHASE_ERROR;', pd), \
@@ -198,7 +199,7 @@ static void event_loop_teardown_(proxy_fd_ent_t *c, int shape) {
   end = sp_end_cause_at_teardown(c->end_cause, shape == TEARDOWN_LISTENER,
                                  !c->h2_session && atomic_load(&c->cresp_answer_open),
                                  teardown_owes_abort_record(&v));
-  if (end == SP_END_CLIENT_NO_ANSWER) owes = 1;
+  if (teardown_owes_abort_record(&v) && sp_end_recorded_before_answer(end)) owes = 1;
   c->metric_ai_recorded = 1;
   if (owes && sp_end_client_left(end) &&
       (pd_reap_error_phase(c->pd_phase) >= 0 || (end == SP_END_CLIENT_NO_ANSWER && c->pd_rule))) {
@@ -275,9 +276,9 @@ int main(void) {
    * any answer records neither (F-17: no lifecycle value pairs with it). A
    * whole request on a rule that is not P/D, its client gone before any
    * answer: the request record alone, status 0, client_abort_before_answer;
-   * not when the listener goes, nor after the gateway ended its hold, nor
-   * when the leg its answer was to come on ended (named the engine's end by
-   * the leg's teardown; not recorded). A P/D rule's request at the
+   * not when the listener goes, nor after the gateway ended its hold; the
+   * leg its answer was to come on ending (end named backend_died by the
+   * leg's teardown): backend_died, status 0. A P/D rule's request at the
    * gate, queued or parked: both records, at any phase a kept connection
    * carries; one already recorded (a park timeout's 504): neither again. */
   {
@@ -297,7 +298,8 @@ int main(void) {
       { "not P/D, the listener goes", 0, 0, 0, 0, 0, 0, TEARDOWN_LISTENER, 0, 0, 0, "" },
       { "not P/D, hold expired", 0, 0, 0, SP_HOLD_END_EXPIRED, 0, 0, TEARDOWN_CONN, 0, 0, 0, "" },
       { "not P/D, hold released", 0, 0, 0, SP_HOLD_END_RELEASED, 0, 0, TEARDOWN_CONN, 0, 0, 0, "" },
-      { "not P/D, the leg died before answer", 0, 0, 0, 0, SP_END_BACKEND_DIED, 0, TEARDOWN_CONN, 0, 0, 0, "" },
+      { "not P/D, the leg died before answer", 0, 0, 0, 0, SP_END_BACKEND_DIED, 0, TEARDOWN_CONN, 1, 0, 0, "backend_died" },
+      { "not P/D, leg died, the listener goes", 0, 0, 0, 0, SP_END_BACKEND_DIED, 0, TEARDOWN_LISTENER, 1, 0, 0, "backend_died" },
     };
     for (unsigned i = 0; i < sizeof(left) / sizeof(left[0]); i++) {
       proxy_fd_ent_t c = client(left[i].answered);
@@ -347,7 +349,7 @@ int main(void) {
     puts("FAIL: sp_end_cause_at_teardown / sp_end_code"); bad = 1;
   }
   if (bad) { puts("FAIL: a reaped answer has no request record, more than one, or the wrong end"); return 1; }
-  puts("reaped answers: every reaper after a 200 leaves one request record, 200, named by its end (the sweep's clean end completed, a cut aborted); before an answer, its own status, once; a P/D client leaving at any stage (gate, queue, park included), one request record and one aborted (9); off P/D, a client leaving before any answer, one request record (status 0) PASS");
+  puts("reaped answers: every reaper after a 200 leaves one request record, 200, named by its end (the sweep's clean end completed, a cut aborted); before an answer, its own status, once; a P/D client leaving at any stage (gate, queue, park included), one request record and one aborted (9); off P/D, before any answer, one request record (status 0): the client leaving or the engine ending it PASS");
   return 0;
 }
 '''

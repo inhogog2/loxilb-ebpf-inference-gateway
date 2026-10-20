@@ -5,9 +5,10 @@
  * sockproxy_end_cause.h — why an answer ended before its client had all of it.
  *
  * A request whose answer began and was cut is aborted, not completed: the
- * client did not receive a complete response. So is a request whose
- * client left before any answer (its record carries status 0: no status was
- * sent; sockproxy_teardown_settle.h says which requests are owed it). Its request record (llb_ai_record_request) names the end in
+ * client did not receive a complete response. So is a request that ended
+ * before any answer, the client leaving or, off P/D, the backend leg ending
+ * (its record carries status 0: no status was sent;
+ * sockproxy_teardown_settle.h says which requests are owed it). Its request record (llb_ai_record_request) names the end in
  * error_code; "" is an answer that ended whole, or a request a status already
  * accounts for. Each code has one cause:
  *
@@ -32,7 +33,7 @@ enum sp_end_cause {
   SP_END_NONE = 0,        /* ended whole, or unknown yet */
   SP_END_CLIENT_GONE,     /* the client left with the answer open */
   SP_END_CLIENT_STALL,    /* the client stopped reading ([SSE_STALL]) */
-  SP_END_BACKEND_DIED,    /* the leg the answer came on ended under it */
+  SP_END_BACKEND_DIED,    /* the leg the answer came on (or was to come on) ended under it */
   SP_END_DURATION_CAP,    /* [SSE_CAP]: the stream's duration cap */
   SP_END_STREAM_TIMEOUT,  /* ERR-01: the decode engine went silent */
   SP_END_IDLE_TIMEOUT,    /* the idle reaper */
@@ -88,6 +89,15 @@ sp_end_cause_at_teardown(int recorded, int listener, int answer_open,
     return SP_END_CLIENT_NO_ANSWER;
   }
   return SP_END_NONE;
+}
+
+/* The ends a request is recorded by before any answer, status 0: the client
+ * leaving, or the leg the answer was to come on ending (off P/D; a P/D leg
+ * that ends before an answer is answered by the gateway with its status). */
+static inline int
+sp_end_recorded_before_answer(int end)
+{
+  return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_BACKEND_DIED;
 }
 
 /* The client left, at whatever stage: the P/D lifecycle's aborted (9). A
