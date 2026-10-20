@@ -419,6 +419,16 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
     }
   }
 
+  /* The end is this thread's. A teardown kind frees the client inline, so
+   * the record sp_reap_record writes on the owner path is not written: a
+   * dispatch of this fd that passed its lookup before pd_teardown_conn's
+   * deregistration may still be running on the owner worker, with no lock,
+   * and record the request itself (the relay's completion and [DONE]
+   * records), so a record from here could be the request's second. A
+   * shutdown kind is recorded by the event loop's teardown, as on the owner
+   * path. Every end taken here is counted. */
+  atomic_fetch_add(&global_stats.reap_fallback, 1);
+
   if (pfe->fd > 0 && t->text) {
     if (!t->body && sp_answer_started(pfe)) {
       /* An answer is in progress: a status line would land in its body. */

@@ -233,6 +233,12 @@ typedef struct proxy_metrics_snapshot {
      * went silent without one (the mechanism behind decode/truncated).
      * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
     uint64_t pd_terminator_synthesized;
+
+    /* Clients a reaper ended from the health thread because their owner
+     * worker could not be handed the end (no owner, or the wake failed). A
+     * request such an end frees inline has no request record.
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t reap_fallback;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

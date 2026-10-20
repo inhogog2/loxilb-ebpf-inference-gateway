@@ -314,6 +314,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.stream_stall_abort_sec = sp_sse_stall_abort_sec();
     sp_pool_counts(&snapshot.pools_live, &snapshot.pools_freed_total);
     snapshot.pd_terminator_synthesized = atomic_load(&global_stats.pd_terminator_synthesized);
+    snapshot.reap_fallback = atomic_load(&global_stats.reap_fallback);
 
     return snapshot;
 }

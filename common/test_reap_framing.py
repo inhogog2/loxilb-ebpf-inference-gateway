@@ -61,6 +61,7 @@ static int notify_wake_worker(void *ns, int o, int fd) { (void)ns; (void)o; (voi
 static void proxy_h2_client_end_mark(proxy_fd_ent_t *p, int a, int b, void *c) { (void)p; (void)a; (void)b; (void)c; }
 #define SP_H2_END_REAPER 0
 static void pd_teardown_conn(proxy_fd_ent_t *p) { (void)p; }
+static struct { _Atomic unsigned long long reap_fallback; } global_stats;
 #define PROXY_LOCK() ((void)0)
 #define PROXY_UNLOCK() ((void)0)
 static ssize_t send(int fd, const void *b, size_t n, int flags) { (void)fd; (void)flags; take(b, n); return (ssize_t)n; }
