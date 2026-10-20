@@ -236,6 +236,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_prefill_ep_died;        // prefill backend died mid-request (client got 503)
     _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
+    _Atomic uint64_t pd_terminator_synthesized; // graceful-[DONE] sweep wrote the terminator the engine never sent
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     // Same-EP reconnect on transient backend connect failure (affinity-bearing
     // services only — P/D disagg / KV-exact). A retry that succeeds keeps the
@@ -1705,6 +1706,11 @@ struct proxy_fd_ent {
   time_t   pd_phase_start_ts;        // Wall-clock timestamp for timeout tracking
   uint64_t pd_prefill_start_ns;      // Monotonic timestamp for prefill latency
   uint64_t pd_decode_start_ns;       // Monotonic timestamp for decode latency
+  uint64_t pd_first_event_ns;        // Monotonic time the decode answer's first SSE data
+                                     // object reached the client's framer; 0 = none yet.
+                                     // Carried on the lifecycle record (sp_pd_record)
+  uint8_t  pd_fallback_reason;       // PD_FB_*: why the prefill was recomputed on the
+                                     // decode leg; 0 = it was not. Carried likewise
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
   /* SGLang P/D dual-dispatch state. The CLIENT pfe reuses the

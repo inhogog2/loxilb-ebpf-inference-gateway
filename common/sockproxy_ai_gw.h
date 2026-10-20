@@ -532,7 +532,10 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  * Parameters:
  *   model_name         effective model name (NUL-terminated)
  *   prefill_latency_ms prefill phase duration in milliseconds; 0 when unknown
- *   decode_latency_ms  decode phase TTFT in milliseconds; 0 when unknown
+ *   decode_latency_ms  the decode leg, dispatch to the end of its response,
+ *                      in milliseconds; 0 when unknown or not sampled (a
+ *                      reaped request). The time to the first streamed
+ *                      event is llb_ai_pd_record_extra's.
  *   kv_params_found    1 when kv_transfer_params found, 0 otherwise
  *   error_phase        the lifecycle outcome, naming the leg that failed
  *                      AND how it failed. The pair is exported verbatim
@@ -570,6 +573,29 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
 extern void llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
                               int64_t decode_latency_ms, int kv_params_found,
                               int error_phase);
+
+/*
+ * llb_ai_pd_record_extra – the rest of one P/D lifecycle record.
+ *
+ * Made by sp_pd_record (sockproxy_http.c) right after llb_ai_pd_record, for the
+ * same request and the same completion event, every time and with nothing
+ * between the two calls: one record crosses as two calls, and no path makes
+ * one without the other. The values are the request's, consumed by that
+ * record, so a second record for the same request carries 0/0.
+ *
+ * Parameters:
+ *   model_name      the same effective model name as llb_ai_pd_record's
+ *   decode_ttft_us  decode dispatch to the first streamed event (the first
+ *                   SSE data object, a role-only delta included), in
+ *                   microseconds; 0 when the answer streamed no event or the
+ *                   request is not a streamed one
+ *   fallback_reason why the prefill was recomputed on the decode leg; 0 when
+ *                   it was not (PD_FB_* in sockproxy_pd_leak.h):
+ *                     1 = origin_5xx  2 = origin_408  3 = origin_429
+ *                     4 = no_status   5 = truncated   6 = other
+ */
+extern void llb_ai_pd_record_extra(char *model_name, int64_t decode_ttft_us,
+                                   int fallback_reason);
 
 /*
  * llb_ai_pd_session_hit – record a P/D session-stickiness cache hit.

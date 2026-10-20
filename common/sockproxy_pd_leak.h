@@ -220,6 +220,41 @@ pd_prefill_status_verdict(int status, int truncated)
 }
 
 /*
+ * pd_prefill_fallback_reason - why a prefill reply that pd_prefill_status_verdict
+ * sent to the decode leg was recomputed there (loxilb_ai_pd_prefill_fallback_total
+ * {reason}); PD_FB_NONE when it was not a fallback. The reason is the condition
+ * that forced the fallback, in verdict order: when the status alone forces it,
+ * the status is the reason, whether or not the body was cut; when the status
+ * would have been relayed or used and the fallback happened only because the
+ * reply was cut at the buffer cap, the reason is truncated (a cut 2xx or 4xx).
+ *
+ *   >= 500             -> PD_FB_ORIGIN_5XX  (cut or not)
+ *   408 / 429          -> PD_FB_ORIGIN_408 / PD_FB_ORIGIN_429  (cut or not)
+ *   0 (unreadable)     -> PD_FB_NO_STATUS   (cut or not: the status alone forces it)
+ *   1xx, 3xx           -> PD_FB_OTHER       (an unusable reply)
+ *   2xx, other 4xx cut -> PD_FB_TRUNCATED
+ *   2xx not cut        -> PD_FB_NONE        (the normal path)
+ *   other 4xx not cut  -> PD_FB_NONE        (relayed, never reaches decode)
+ */
+#define PD_FB_NONE        0
+#define PD_FB_ORIGIN_5XX  1
+#define PD_FB_ORIGIN_408  2
+#define PD_FB_ORIGIN_429  3
+#define PD_FB_NO_STATUS   4
+#define PD_FB_TRUNCATED   5
+#define PD_FB_OTHER       6
+static inline int
+pd_prefill_fallback_reason(int status, int truncated)
+{
+  if (status >= 500) return PD_FB_ORIGIN_5XX;
+  if (status == 408) return PD_FB_ORIGIN_408;
+  if (status == 429) return PD_FB_ORIGIN_429;
+  if (status <= 0) return PD_FB_NO_STATUS;
+  if (status < 200 || (status >= 300 && status < 400)) return PD_FB_OTHER;
+  return truncated ? PD_FB_TRUNCATED : PD_FB_NONE;
+}
+
+/*
  * pd_decode_error_phase - the llb_ai_pd_record error_phase of a P/D request
  * whose decode leg delivered its whole response, from the status the client
  * received (the decode leg's; the prefill reply is not captured).

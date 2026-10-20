@@ -228,6 +228,11 @@ typedef struct proxy_metrics_snapshot {
      * contract as the blocks above. */
     uint64_t pools_live;
     uint64_t pools_freed_total;
+
+    /* Terminators the graceful-[DONE] sweep wrote for a decode engine that
+     * went silent without one (the mechanism behind decode/truncated).
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t pd_terminator_synthesized;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

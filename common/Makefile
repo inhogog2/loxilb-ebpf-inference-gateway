@@ -457,6 +457,7 @@ check_client_eof_keep:
 check_pd_status_sites:
 	sh ./check_pd_status_sites.sh
 	sh ./check_pd_status_sites_mutations.sh
+	python3 test_pd_record.py
 
 # A response the gateway writes itself is recorded as the client receives it
 # (status and class, no TTFB sample), and once as a request: a staged

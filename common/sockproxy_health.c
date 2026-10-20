@@ -360,7 +360,7 @@ pd_reap_lifecycle(proxy_fd_ent_t *pfe, int error_phase)
     prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
                             pfe->pd_prefill_start_ns) / 1000000ULL);
   }
-  llb_ai_pd_record((char *)proxy_effective_model(pfe), prefill_ms, 0,
+  sp_pd_record(pfe, proxy_effective_model(pfe), prefill_ms, 0,
                    (pfe->pd_kv_params_len > 0) ? 1 : 0, error_phase);
   pfe->pd_phase = PD_PHASE_ERROR;
 }
@@ -1328,7 +1328,7 @@ check_draining_endpoints(void)
               int t_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
               log_info(" llb_ai_pd_record (prefill timeout): model=%s prefill=%lldms kv=%d",
                        pd_tmo_model, (long long)t_prefill_ms, t_kv);
-              llb_ai_pd_record((char *)pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
+              sp_pd_record(pfe, pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
             }
             /* single-owner teardown (see pd_teardown_conn). Mark ERROR,
              * then deregister+close+free each backend leg and the client exactly
@@ -1393,7 +1393,7 @@ check_draining_endpoints(void)
                  * an inherited default. SGLang never populates
                  * pd_kv_params_len (its KV handoff is engine-internal), so 0
                  * is the true kv answer here. */
-                llb_ai_pd_record((char *)dec_model, 0, 0, 0,
+                sp_pd_record(pfe, dec_model, 0, 0, 0,
                                  1 /*prefill timeout*/);
               } else {
                 /* The sequential machines wedged on the DECODE leg: prefill
@@ -1428,7 +1428,7 @@ check_draining_endpoints(void)
                                               pfe->pd_prefill_start_ns) /
                                              1000000ULL);
                 }
-                llb_ai_pd_record((char *)dec_model, dec_prefill_ms, 0, dec_kv,
+                sp_pd_record(pfe, dec_model, dec_prefill_ms, 0, dec_kv,
                                  3 /*decode timeout*/);
               }
             }
@@ -1670,13 +1670,14 @@ check_draining_endpoints(void)
                                     1000000ULL);
             }
             int pd_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)gc_model, prefill_ms, decode_ms, pd_kv,
+            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
                              8 /*decode truncated*/);
           }
 
           /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as
  * (held under PROXY_LOCK; pfe_next-safe). */
           pfe->pd_phase = PD_PHASE_COMPLETE;
+          atomic_fetch_add(&global_stats.pd_terminator_synthesized, 1);
           pd_reap_respond(pfe, SP_REAP_PD_GRACEFUL_DONE);
         }
 

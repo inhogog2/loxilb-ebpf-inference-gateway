@@ -268,6 +268,31 @@ static const char *strnstr_portable(const char *haystack, const char *needle, si
     return NULL;
 }
 
+/* One P/D lifecycle record, for one request and one completion event: the
+ * outcome (llb_ai_pd_record), then the request's first-event time and
+ * fallback reason (llb_ai_pd_record_extra), always both and with nothing
+ * between them. Every lifecycle record goes through here
+ * (check_pd_status_sites.sh rule 7). The two values are consumed: a second
+ * record for the same request carries 0/0, so the request's TTFT sample and
+ * fallback count are made at most once. */
+void
+sp_pd_record(proxy_fd_ent_t *pfe, const char *model, int64_t prefill_ms,
+             int64_t decode_ms, int kv, int error_phase)
+{
+  int64_t ttft_us = 0;
+  int fb = pfe->pd_fallback_reason;
+
+  if (pfe->pd_decode_start_ns > 0 &&
+      pfe->pd_first_event_ns > pfe->pd_decode_start_ns) {
+    ttft_us = (int64_t)((pfe->pd_first_event_ns - pfe->pd_decode_start_ns) /
+                        1000ULL);
+  }
+  pfe->pd_first_event_ns = 0;
+  pfe->pd_fallback_reason = 0;
+  llb_ai_pd_record((char *)model, prefill_ms, decode_ms, kv, error_phase);
+  llb_ai_pd_record_extra((char *)model, ttft_us, fb);
+}
+
 /* ---------------------------------------------------------------------------
  * pd_framing_v2 runtime feature-flag (REQ-R2 /, migration scaffold)
  *
@@ -2069,7 +2094,7 @@ skip_deferred_masking:
               {
                 const char *pd_dec_model = proxy_effective_model(rfd_ent);
                 int d_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
-                llb_ai_pd_record((char *)pd_dec_model, 0, 0, d_kv, 2);
+                sp_pd_record(rfd_ent, pd_dec_model, 0, 0, d_kv, 2);
               }
               rfd_ent->pd_phase = PD_PHASE_ERROR;
               pd_cleanup(rfd_ent);
@@ -2422,7 +2447,7 @@ skip_deferred_masking:
                                      rfd_ent->pd_decode_start_ns) / 1000000ULL);
             }
             int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)sse_model, prefill_ms, decode_ms, pd_kv, 0);
+            sp_pd_record(rfd_ent, sse_model, prefill_ms, decode_ms, pd_kv, 0);
           }
           log_debug("P/D flow complete — client_fd=%d backend_fd=%d",
                    rfd_ent->fd, ent->fd);
@@ -2515,7 +2540,7 @@ skip_deferred_masking:
         }
         int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
         const char *ns_model = proxy_effective_model(rfd_ent);
-        llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv,
+        sp_pd_record(rfd_ent, ns_model, prefill_ms, decode_ms, pd_kv,
                          pd_decode_error_phase(rfd_ent->metric_response_status));
         rfd_ent->pd_phase = PD_PHASE_COMPLETE;
         /* The disaggregated response is complete: its capacity units go back
@@ -5845,6 +5870,8 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
   fd_ent->pd_phase_start_ts = 0;
   fd_ent->pd_prefill_start_ns = 0;
   fd_ent->pd_decode_start_ns = 0;
+  fd_ent->pd_first_event_ns = 0;
+  fd_ent->pd_fallback_reason = 0;
   fd_ent->pd_decode_content_length = 0;
   fd_ent->pd_decode_bytes_received = 0;
   fd_ent->pd_prefill_retries = 0;
@@ -6354,7 +6381,7 @@ proxy_pdestroy(void *priv)
             {
               const char *pd_model = proxy_effective_model(client_pfe);
               int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-              llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv,
+              sp_pd_record(client_pfe, pd_model, 0, 0, pd_kv,
                                4 /*prefill error*/);
             }
             /* The client's answer: completed with the status written. */
@@ -6565,7 +6592,7 @@ proxy_pdestroy(void *priv)
           {
             const char *pd_model = proxy_effective_model(client_pfe);
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
+            sp_pd_record(client_pfe, pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
           }
           /* SGLang: decode-leg death must not orphan the prefill drain leg */
           pd_sg_close_drain(client_pfe, 1);
@@ -6596,7 +6623,7 @@ proxy_pdestroy(void *priv)
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
                      pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
-            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv,
+            sp_pd_record(client_pfe, pd_model, prefill_ms, decode_ms, pd_kv,
                              pd_decode_error_phase(client_pfe->metric_response_status));
           }
           pd_cleanup(client_pfe);
@@ -6624,7 +6651,7 @@ proxy_pdestroy(void *priv)
                                       client_pfe->pd_prefill_start_ns) / 1000000ULL);
             }
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)pd_model, prefill_ms, 0, pd_kv,
+            sp_pd_record(client_pfe, pd_model, prefill_ms, 0, pd_kv,
                              2 /*decode error*/);
           }
           client_pfe->pd_phase = PD_PHASE_ERROR;
@@ -10493,7 +10520,7 @@ handle_on_message_complete(llhttp_t* parser)
             int d_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             log_debug(" llb_ai_pd_record (decode error): model=%s prefill=%lldms kv=%d",
                      pd_dec_model, (long long)d_prefill_ms, d_kv);
-            llb_ai_pd_record((char *)pd_dec_model, d_prefill_ms, 0, d_kv, 2);
+            sp_pd_record(client_pfe, pd_dec_model, d_prefill_ms, 0, d_kv, 2);
           }
           /* P5-fix: 503 (not 502) — decode response processing failure means
            * the P/D backend pool is unavailable, not a proxy protocol error. */
@@ -10917,7 +10944,20 @@ static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
     pfe->cresp_payload_observed = 1;
     if (pfe->ai_gw_mode && !pfe->usage_consumed)
       proxy_usage_tail_update(pfe, (const uint8_t *)at, len);
-    sp_sse_body(&pfe->cresp_sse, at, len);
+    /* MON-01: the decode answer's first streamed event, stamped where the
+     * framer sees it (every stream recognised by its Content-Type, whatever
+     * sse_mode says, and never a chunk-size line), once per P/D request.
+     * The time goes out on the request's lifecycle record (sp_pd_record),
+     * not across the boundary here. */
+    if (sp_sse_body(&pfe->cresp_sse, at, len) && pfe->pd_first_event_ns == 0 &&
+        pfe->pd_decode_start_ns > 0 &&
+        (pfe->pd_phase == PD_PHASE_DECODE_SENDING ||
+         pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      pfe->pd_first_event_ns = (uint64_t)ts.tv_sec * 1000000000ULL +
+                               (uint64_t)ts.tv_nsec;
+    }
   }
   return 0;
 }

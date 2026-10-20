@@ -149,7 +149,7 @@ fi
 #    stream exists only for a 2xx event-stream; the non-SSE completions (the
 #    Content-Length/chunked one and the decode-backend EOF one) take
 #    pd_decode_error_phase(metric_response_status).
-lit0=$(awk '/llb_ai_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
+lit0=$(awk '/sp_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
             if (buf ~ /,[ \t]*0\);/ && buf !~ /sse_model/) print NR": "buf}' ./sockproxy_http.c)
 if [ -n "$lit0" ]; then
   echo "sockproxy_http.c: a P/D completion records a literal success (0) whatever its status; use pd_decode_error_phase():"
@@ -166,7 +166,7 @@ fi
 #     P/D record is a literal success (0): the graceful-[DONE] sweep, the one
 #     completion there, records decode/truncated (8), the engine having gone
 #     silent and the gateway having written the terminator.
-lit0h=$(awk '/llb_ai_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
+lit0h=$(awk '/sp_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
              if (buf ~ /,[ \t]*0\);/) print NR": "buf}' ./sockproxy_health.c)
 if [ -n "$lit0h" ]; then
   echo "sockproxy_health.c: a reaper records a literal success (0) for an answer the gateway ended:"
@@ -174,7 +174,7 @@ if [ -n "$lit0h" ]; then
   fail=1
 fi
 g=$(awk '/\[PD_GRACEFUL_DONE\]/ {on = 1} on && /pd_reap_respond\(/ {exit} on' ./sockproxy_health.c \
-    | tr '\n' ' ' | grep -c 'llb_ai_pd_record([^;]*8 /\*decode truncated\*/);' || true)
+    | tr '\n' ' ' | grep -c 'sp_pd_record([^;]*8 /\*decode truncated\*/);' || true)
 if [ "$g" != "1" ]; then
   echo "sockproxy_health.c: the graceful-[DONE] sweep must record decode/truncated (8) once; found $g"
   fail=1
@@ -193,7 +193,7 @@ for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_PD_IDLE_TIMEOUT SP_REAP_SSE_CAP SP
   fi
 done
 eofb=$(awk '/decode backend EOF mid-stream/ {on = 1} on && /pd_sg_close_drain\(/ {exit} on' ./sockproxy_http.c | tr '\n' ' ')
-if ! printf '%s' "$eofb" | grep -q 'llb_ai_pd_record([^;]*2 /\*decode error\*/);.*pd_phase = PD_PHASE_ERROR;'; then
+if ! printf '%s' "$eofb" | grep -q 'sp_pd_record([^;]*2 /\*decode error\*/);.*pd_phase = PD_PHASE_ERROR;'; then
   echo "sockproxy_http.c: the decode EOF mid-stream must record decode/error and move the request to ERROR"
   fail=1
 fi
@@ -208,5 +208,58 @@ if [ "$gd" != "1" ]; then
   fail=1
 fi
 
+# 7. One lifecycle record crosses as two calls, always both. llb_ai_pd_record
+#    is called only from sp_pd_record (sockproxy_http.c), and there the next
+#    statement is llb_ai_pd_record_extra, with no branch, return or goto
+#    between them; every P/D site records through sp_pd_record.
+direct=$(grep -n 'llb_ai_pd_record(' ./sockproxy*.c | grep -v '^./sockproxy_ai_gw_stub.c:' \
+         | grep -vE ':[0-9]+:[[:space:]]*(\*|/\*|//)' | grep -v '^./sockproxy_http.c:[0-9]*:  llb_ai_pd_record((char \*)model, prefill_ms, decode_ms, kv, error_phase);' || true)
+if [ -n "$direct" ]; then
+  echo "a P/D lifecycle record made without sp_pd_record (its extra half would be missing):"
+  printf '%s\n' "$direct"
+  fail=1
+fi
+helper=$(awk '/^sp_pd_record\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_http.c)
+inpd=$(printf '%s\n' "$helper" | grep -c 'llb_ai_pd_record(' || true)
+between=$(printf '%s\n' "$helper" | awk '/llb_ai_pd_record\(/ {on = 1; next} /llb_ai_pd_record_extra\(/ {exit} on')
+if [ "$inpd" != "1" ] || ! printf '%s\n' "$helper" | grep -q 'llb_ai_pd_record_extra(' || \
+   printf '%s' "$between" | grep -qE '\b(if|return|goto|else|switch)\b|;'; then
+  echo "sockproxy_http.c: sp_pd_record must call llb_ai_pd_record once and llb_ai_pd_record_extra as its next statement"
+  fail=1
+fi
+nsites=$(grep -c 'sp_pd_record(' ./sockproxy_health.c ./sockproxy_http.c ./sockproxy_pd_sglang.c \
+           ./sockproxy_pd_trtllm.c ./sockproxy_pd_vllm.c | awk -F: '{s += $2} END {print s}')
+if [ "$nsites" -lt 19 ]; then
+  echo "expected at least 19 P/D lifecycle record sites through sp_pd_record; found $nsites"
+  fail=1
+fi
+
+# 8. The two values the extra half carries have one writer each.
+#    a. The first-event stamp is in the client's response framer (cresp_on_body),
+#       taken from the observer's first-object report, once per request
+#       (pd_first_event_ns == 0) and only while a P/D decode leg is in progress.
+#    b. The fallback reason is set once, in pd_vllm.c, on the path that goes on
+#       to the decode leg: after the relay verdict and the TRT early exit.
+body=$(awk '/^static int cresp_on_body\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_http.c | tr '\n' ' ')
+if ! printf '%s' "$body" | grep -q 'if (sp_sse_body(&pfe->cresp_sse, at, len) && pfe->pd_first_event_ns == 0 && *pfe->pd_decode_start_ns > 0 && *(pfe->pd_phase == PD_PHASE_DECODE_SENDING || *pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {'; then
+  echo "sockproxy_http.c: cresp_on_body must stamp the first event once, from the observer, during a P/D decode leg"
+  fail=1
+fi
+stamps=$(grep -c 'pd_first_event_ns = (uint64_t)' ./sockproxy*.c | awk -F: '{s += $2} END {print s}')
+if [ "$stamps" != "1" ]; then
+  echo "the decode first-event time must have one writer (cresp_on_body); found $stamps"
+  fail=1
+fi
+fbw=$(grep -n 'pd_fallback_reason =' ./sockproxy*.c | grep -v '= 0;' || true)
+fbn=$(printf '%s\n' "$fbw" | grep -c . || true)
+fbl=$(printf '%s\n' "$fbw" | grep '^./sockproxy_pd_vllm.c:' | cut -d: -f2)
+relay=$(grep -n 'pd_prefill_status_verdict(pr_status, l_prefill_truncated) == PD_PR_RELAY' ./sockproxy_pd_vllm.c | cut -d: -f1)
+early=$(grep -n 'pd_trt_ctx_early_exit_check(l_prefill, l_prefill_len)' ./sockproxy_pd_vllm.c | cut -d: -f1)
+if [ "$fbn" != "1" ] || [ -z "$fbl" ] || [ -z "$relay" ] || [ -z "$early" ] || \
+   [ "$fbl" -le "$relay" ] || [ "$fbl" -le "$early" ]; then
+  echo "sockproxy_pd_vllm.c: the fallback reason must be set once, after the relay verdict and the TRT early exit"
+  fail=1
+fi
+
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded; each record crosses as both calls; the first event and the fallback reason have one writer each)"

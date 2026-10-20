@@ -116,7 +116,7 @@ pd_prefill_reject_relay(proxy_fd_ent_t *client_pfe, const uint8_t *resp,
     /* Nothing in the gateway failed and nothing timed out: the request was
      * rejected upstream (the SGLang dialect records the same reject). */
     const char *pd_model = proxy_effective_model(client_pfe);
-    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 5 /*prefill rejected*/);
+    sp_pd_record(client_pfe, pd_model, 0, 0, 0, 5 /*prefill rejected*/);
   }
   client_pfe->pd_phase = PD_PHASE_COMPLETE;
   pd_cleanup(client_pfe);
@@ -260,6 +260,12 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     ret = PD_DECODE_ANSWERED;
     goto out;
   }
+
+  /* Every path from here goes to the decode leg. If the prefill reply was not
+   * usable, decode recomputes it: say why, on the request's lifecycle record
+   * (loxilb_ai_pd_prefill_fallback_total). */
+  client_pfe->pd_fallback_reason =
+      (uint8_t)pd_prefill_fallback_reason(pr_status, l_prefill_truncated);
 
   /* 1. Extract the transfer params from the prefill response (dialect
    *    surgery: kv_transfer_params for vLLM, choices[0].disaggregated_params
@@ -787,7 +793,7 @@ fail:
     {
       const char *pd_model = proxy_effective_model(client_pfe);
       int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-      llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 4 /*prefill error*/);
+      sp_pd_record(client_pfe, pd_model, 0, 0, pd_kv, 4 /*prefill error*/);
     }
     /* The client's answer: completed with the status written. */
     proxy_record_local_completion(client_pfe, 503);
