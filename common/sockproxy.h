@@ -1169,6 +1169,9 @@ struct proxy_fd_ent {
    * a decode leg on different fds, and this codebase shards those to different
    * notify workers. */
   _Atomic uint8_t cresp_unframed;  // this response is delimited by the backend's EOF
+  /* Set when that EOF came and ended the answer: the client's connection is
+   * then the only thing left to say so, by closing. */
+  _Atomic uint8_t cresp_eof_ended;
   /* The two counters have one writer each — requests are framed on the client's
    * worker, responses on the backend's — so a relaxed atomic is enough for each
    * and no lock is needed to keep them whole.

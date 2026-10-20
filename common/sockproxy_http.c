@@ -312,6 +312,9 @@ static void proxy_sse_activate(proxy_fd_ent_t *pfe);
 static void cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void cresp_note_backend_eof(proxy_fd_ent_t *client);
+static int sp_answer_ended_by_eof(proxy_fd_ent_t *client);
+static int pd_decode_eof_keeps_client(proxy_fd_ent_t *leg,
+                                      proxy_fd_ent_t *client);
 static void cresp_note_local_answer(proxy_fd_ent_t *client);
 /* What proxy_backend_leg_unanswered did for the client of the leg. */
 #define PROXY_LEG_NOT_ANSWERED 0
@@ -6365,9 +6368,13 @@ proxy_pdestroy(void *priv)
 
         /* US-H202: Decode backend closing after P/D already completed (pd_cleanup
          * set pd_phase=NONE via SSE [DONE] or non-streaming completion).
-         * Just detach without closing the still-alive keep-alive client. */
-        if ((pfe->is_pd_decode_backend || pfe->pd_sg_drain) &&
-            client_pfe->pd_phase == PD_PHASE_NONE) {
+         * Just detach without closing the still-alive keep-alive client.
+         *
+         * Unless the decode answer had no length and no chunking: this EOF
+         * is what ended it, and the client learns that only from its own
+         * connection closing. Such a client stays linked and is closed below
+         * with the leg, its cache drained first, as a plain relay's is. */
+        if (pd_decode_eof_keeps_client(pfe, client_pfe)) {
           for (int j = 0; j < client_pfe->n_rfd; j++) {
             if (client_pfe->rfd_ent[j] == pfe) {
               client_pfe->rfd_ent[j] = NULL;
@@ -10913,6 +10920,7 @@ cresp_on_headers_complete(llhttp_t *parser)
   atomic_store_explicit(&pfe->cresp_unframed,
                         (parser->flags & (F_CONTENT_LENGTH | F_CHUNKED)) ? 0 : 1,
                         memory_order_relaxed);
+  atomic_store_explicit(&pfe->cresp_eof_ended, 0, memory_order_relaxed);
 
   /* llhttp handles the body-less statuses itself; HEAD it cannot know about, so
    * the oldest outstanding request's bit says whether to skip the body. */
@@ -11029,6 +11037,34 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   }
 }
 
+/* The answer on this HTTP/1 client was delimited by its backend's EOF, and
+ * that EOF has come (or the leg is going without it, which ends it the same
+ * way). */
+static int
+sp_answer_ended_by_eof(proxy_fd_ent_t *client)
+{
+  if (!client || client->h2_session || !client->cresp_parser_inited) {
+    return 0;
+  }
+  return atomic_load_explicit(&client->cresp_eof_ended, memory_order_relaxed) ||
+         atomic_load_explicit(&client->cresp_unframed, memory_order_relaxed);
+}
+
+/* A P/D leg is closing after its flow completed (pd_phase NONE). The client
+ * stays open for its next request unless this leg carried an answer that only
+ * its EOF could end. The drain leg's bytes never reach the client. */
+static int
+pd_decode_eof_keeps_client(proxy_fd_ent_t *leg, proxy_fd_ent_t *client)
+{
+  if (client->pd_phase != PD_PHASE_NONE) {
+    return 0;
+  }
+  if (leg->pd_sg_drain) {
+    return 1;
+  }
+  return leg->is_pd_decode_backend && !sp_answer_ended_by_eof(client);
+}
+
 /* The backend closed. A response that was delimited by that EOF is complete. */
 static void
 cresp_note_backend_eof(proxy_fd_ent_t *client)
@@ -11052,6 +11088,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
   }
   if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
+    atomic_store_explicit(&client->cresp_eof_ended, 1, memory_order_relaxed);
     hc_resp_done(client);
     sp_hold_answer_ended(client);
     sp_answer_msg_done(&client->cresp_in_msg);

@@ -731,6 +731,7 @@ test_answer_track: test_answer_track.c sockproxy_answer.h llhttp.c httpapi.c htt
 test_answer: test_answer_track
 	./test_answer_track
 	python3 test_answer_started.py
+	python3 test_eof_answer.py
 
 .PHONY: test_admit test_uc5 test_backend_failure_audit
 test_backend_failure_audit:
