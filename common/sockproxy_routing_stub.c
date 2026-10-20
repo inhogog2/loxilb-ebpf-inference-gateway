@@ -39,3 +39,12 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host,
   (void)ent; (void)host; (void)request_path; (void)model_name;
   return NULL;
 }
+
+int
+sp_route_hostless(const proxy_map_ent_t *ent, const char *model,
+                  proxy_epval_t **pool)
+{
+  (void)model;
+  *pool = sp_pool_first(ent);
+  return SP_HOSTLESS_FIRST;
+}

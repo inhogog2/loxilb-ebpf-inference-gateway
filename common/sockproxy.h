@@ -238,6 +238,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_terminator_synthesized; // graceful-[DONE] sweep wrote the terminator the engine never sent
     _Atomic uint64_t reap_fallback;             // a reaper ended a client from the health thread: its owner worker could not be handed the end
+    _Atomic uint64_t route_host_missing;        // a request with no usable Host reached dispatch on a listener whose pools name models
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     // Same-EP reconnect on transient backend connect failure (affinity-bearing
     // services only — P/D disagg / KV-exact). A retry that succeeds keeps the

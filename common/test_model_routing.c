@@ -218,10 +218,12 @@ test_default_reservation_is_the_routed_pools(void)
   assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-none") == 64);
   assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "") == 64);
   assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-on") == 800);
-  /* no usable Host: dispatch takes the listener's first pool, and so does this */
-  assert(sp_resv_default_tokens_route(&service, NULL, "/", "model-on") == 0);
+  /* no usable Host: dispatch takes the pool that names the model, and so
+   * does this; a request that names none is refused, nothing reserved */
   first_off.ai_default_tokens = 5;
-  assert(sp_resv_default_tokens_route(&service, NULL, NULL, NULL) == 5);
+  assert(sp_resv_default_tokens_route(&service, NULL, "/", "model-on") == 800);
+  assert(sp_resv_default_tokens_route(&service, NULL, NULL, NULL) == 0);
+  assert(sp_resv_default_tokens_route(&service, NULL, "/", "model-none") == 0);
   assert(sp_resv_default_tokens_route(NULL, "inference.example", "/", "model-on") == 0);
 
   HASH_CLEAR(hh, service.val.ephash);
@@ -229,9 +231,55 @@ test_default_reservation_is_the_routed_pools(void)
   assert(sp_pool_index_publish(&service) == 0);
 }
 
+/* A request with no usable Host (ROUTE-01's second defence): on a listener
+ * whose pools name models, the pool that names the request's model, or a
+ * refusal; never the first pool. A listener with no model pool keeps the
+ * first pool. */
+static void
+test_hostless_route(void)
+{
+  proxy_map_ent_t service = {0}, plain = {0}, empty = {0};
+  proxy_epval_t a, b, b2, c, w, p1, p2;
+  proxy_epval_t *got = (proxy_epval_t *)1;
+
+  add_pool(&service, &a, "inference.example||model-a", 1001);
+  add_pool(&service, &b, "inference.example||model-b", 1002);
+  add_pool(&service, &w, "inference.example|/", 1003);
+  add_pool(&service, &b2, "other.example||model-b", 1004);
+  add_pool(&service, &c, "inference.example|/v1|Qwen/Qwen2.5-7B", 1005);
+  assert(sp_route_hostless(&service, "model-b", &got) == SP_HOSTLESS_MODEL && got == &b);
+  assert(sp_route_hostless(&service, "model-a", &got) == SP_HOSTLESS_MODEL && got == &a);
+  /* a pool keyed with a path, and a model name with a slash */
+  assert(sp_route_hostless(&service, "Qwen/Qwen2.5-7B", &got) == SP_HOSTLESS_MODEL && got == &c);
+  /* a model no pool names, or none at all: refused, even with a wildcard pool */
+  assert(sp_route_hostless(&service, "model-z", &got) == SP_HOSTLESS_REFUSE && got == NULL);
+  got = (proxy_epval_t *)1;
+  assert(sp_route_hostless(&service, "", &got) == SP_HOSTLESS_REFUSE && got == NULL);
+  assert(sp_route_hostless(&service, NULL, &got) == SP_HOSTLESS_REFUSE && got == NULL);
+  /* the reservation mirrors follow the same decision */
+  b.ai_objective_strict = 1;
+  assert(sp_resv_objective_strict_route(&service, NULL, "/", "model-b") == 1);
+  assert(sp_resv_objective_strict_route(&service, NULL, "/", "model-z") == 0);
+
+  /* every pool a wildcard: the first pool, as before */
+  add_pool(&plain, &p1, "plain.example|/v1", 1101);
+  add_pool(&plain, &p2, "plain.example|/", 1102);
+  assert(sp_route_hostless(&plain, "model-a", &got) == SP_HOSTLESS_FIRST && got == &p1);
+  assert(sp_route_hostless(&plain, NULL, &got) == SP_HOSTLESS_FIRST && got == &p1);
+  /* no pool at all */
+  got = (proxy_epval_t *)1;
+  assert(sp_route_hostless(&empty, "model-a", &got) == SP_HOSTLESS_FIRST && got == NULL);
+
+  HASH_CLEAR(hh, service.val.ephash);
+  assert(sp_pool_index_publish(&service) == 0);
+  HASH_CLEAR(hh, plain.val.ephash);
+  assert(sp_pool_index_publish(&plain) == 0);
+}
+
 int
 main(void)
 {
+  test_hostless_route();
   test_exact_path_does_not_match_children();
   test_wildcard_exact_and_root_are_exact();
   test_hostname_only_model_pool();

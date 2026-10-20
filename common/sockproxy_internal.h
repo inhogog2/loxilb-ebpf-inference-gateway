@@ -269,8 +269,8 @@ void sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind);
 /* The default reservation of the rule a request routes to, for the
  * admission gate (ai_gw_req_ctx_t.default_tokens_of): the pool the listener's
  * host, path and model lookup selects, exactly as dispatch will select it.
- * host NULL = the request carried no usable Host, and dispatch takes the
- * listener's first pool. 0 when no pool matches (the request is refused at
+ * host NULL = the request carried no usable Host, and dispatch takes the pool
+ * sp_route_hostless names. 0 when no pool matches (the request is refused at
  * dispatch). An L7 policy that forwards to another pool is not followed. */
 typedef struct sp_resv_route {
   proxy_map_ent_t *ent;

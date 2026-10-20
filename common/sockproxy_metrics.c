@@ -315,6 +315,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     sp_pool_counts(&snapshot.pools_live, &snapshot.pools_freed_total);
     snapshot.pd_terminator_synthesized = atomic_load(&global_stats.pd_terminator_synthesized);
     snapshot.reap_fallback = atomic_load(&global_stats.reap_fallback);
+    snapshot.route_host_missing = atomic_load(&global_stats.route_host_missing);
 
     return snapshot;
 }

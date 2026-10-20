@@ -47,6 +47,7 @@ jobs:
             common/sockproxy_routing.c common/sockproxy_pool.c common/sockproxy_qsbr.c \
             common/sockproxy_fc.c common/log.c -Icommon -lpthread
           ASAN_OPTIONS=detect_leaks=1 /tmp/test_model_routing_sanitized
+          make -C common test_route_hostless
 
       # The runner kernel's 32-bit mmap randomisation leaves no room for
       # ThreadSanitizer's shadow layout ("unexpected memory mapping").

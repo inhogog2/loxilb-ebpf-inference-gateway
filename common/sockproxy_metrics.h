@@ -239,6 +239,12 @@ typedef struct proxy_metrics_snapshot {
      * request such an end frees inline has no request record.
      * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
     uint64_t reap_fallback;
+
+    /* Requests that reached dispatch with no usable Host on a listener whose
+     * pools name models (ROUTE-01's second defence routed or refused them).
+     * Expected 0: non-zero says a path lost the Host.
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t route_host_missing;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
