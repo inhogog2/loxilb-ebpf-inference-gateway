@@ -5,9 +5,9 @@
  * sockproxy_end_cause.h — why an answer ended before its client had all of it.
  *
  * A request whose answer began and was cut is aborted, not completed: the
- * client did not receive a complete response. So is a P/D request whose
+ * client did not receive a complete response. So is a request whose
  * client left before any answer (its record carries status 0: no status was
- * sent). Its request record (llb_ai_record_request) names the end in
+ * sent; sockproxy_teardown_settle.h says which requests are owed it). Its request record (llb_ai_record_request) names the end in
  * error_code; "" is an answer that ended whole, or a request a status already
  * accounts for. Each code has one cause:
  *
@@ -37,7 +37,7 @@ enum sp_end_cause {
   SP_END_STREAM_TIMEOUT,  /* ERR-01: the decode engine went silent */
   SP_END_IDLE_TIMEOUT,    /* the idle reaper */
   SP_END_LISTENER_CLOSED, /* the rule's listener went away with the answer open */
-  SP_END_CLIENT_NO_ANSWER, /* the client left a P/D request before any answer */
+  SP_END_CLIENT_NO_ANSWER, /* the client left a request before any answer */
   SP_END_CAUSES
 };
 
@@ -68,11 +68,12 @@ sp_end_code(int end)
  * already recorded when the answer ended (a reaper's cut, a stall, the leg
  * dying under it), else, for an answer still open (HTTP/1.1: the client's
  * response framer is inside it), the client leaving, or the gateway when the
- * whole listener is going. A P/D request in flight before any answer (no
- * status: the prefill, or the decode leg's first byte still to come,
- * `no_answer`) is the client leaving before it; a listener going then has no
- * P/D lifecycle value to pair with, so it is not recorded (as before). An
- * answer that ended whole, or a request a status accounts for, has none. */
+ * whole listener is going. A request the teardown rule owes before any
+ * answer (no status, `no_answer`: a P/D request in its prefill or before the
+ * decode leg's first byte, or any whole request on a rule that is not P/D) is
+ * the client leaving before it; a listener going then is not recorded (F-17,
+ * open: the P/D lifecycle has no value to pair with it). An answer that ended
+ * whole, or a request a status accounts for, has none. */
 static inline int
 sp_end_cause_at_teardown(int recorded, int listener, int answer_open,
                          int no_answer)

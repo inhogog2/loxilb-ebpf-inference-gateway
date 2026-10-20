@@ -1481,6 +1481,7 @@ struct proxy_fd_ent {
   uint16_t metric_response_status;
   uint8_t  ai_gw_mode;                // 1=AI Gateway connection; copied from the rule at accept
   uint8_t  apikey_auth;               // 0=unset 1=required 2=declared-disabled; copied from the rule at accept
+  uint8_t  pd_rule;                   // 1=the rule is P/D (pd_disagg_enabled); copied from the rule at accept
   uint8_t  metric_ai_recorded;       // 1=this request already counted in ai_requests_total (dedup guard)
   uint8_t  metric_resp_noted;        // 1=this request's client-visible response is recorded (proxy_note_response_ latch)
 

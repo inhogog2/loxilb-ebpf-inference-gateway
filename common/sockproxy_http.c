@@ -6044,6 +6044,13 @@ proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
   v->metric_response_status = pfe->metric_response_status;
   v->sse_active            = pfe->sse_active ? 1 : 0;
   v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
+  v->pd_rule               = pfe->pd_rule ? 1 : 0;
+  v->req_framed            = pfe->metric_req_start_ns > 0;
+  {
+    uint8_t he = atomic_load_explicit(&pfe->hold_end, memory_order_relaxed);
+
+    v->hold_gw_ended = he == SP_HOLD_END_EXPIRED || he == SP_HOLD_END_RELEASED;
+  }
 }
 
 /*
@@ -6097,8 +6104,8 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
   }
 
   /* Last response on this connection, finished with no readable usage object,
-   * or a P/D request its client left before any answer. Identity is copied
-   * here because the pfe may be recycled by the time this is emitted. */
+   * or a request its client left before any answer. Identity is copied here
+   * because the pfe may be recycled by the time this is emitted. */
   if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||
        teardown_owes_usage_missing(&v)) &&
       proxy_settle_grow((void **)&b->umiss, &b->c_umiss, b->n_umiss,
@@ -6135,7 +6142,7 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     }
     /* Read before the stream-end block below, which leaves the answer as it
      * is: an HTTP/1.1 answer the client's framer is still inside was cut; a
-     * P/D request in flight with no status had no answer yet. */
+     * request the abort rule owes (no status) had no answer yet. */
     u->end = sp_end_cause_at_teardown(
         pfe->end_cause, shape == TEARDOWN_LISTENER,
         !pfe->h2_session &&
@@ -6798,6 +6805,16 @@ proxy_pdestroy(void *priv)
           if (cl && !cl->end_cause && !pfe->pd_sg_drain &&
               (cl->pd_phase == PD_PHASE_NONE || pfe->is_pd_decode_backend) &&
               atomic_load_explicit(&cl->cresp_answer_open, memory_order_relaxed)) {
+            cl->end_cause = SP_END_BACKEND_DIED;
+          }
+          /* The same leg ending before any answer, under a whole request on
+           * a rule that is not P/D: the engine ended it too, not the client.
+           * Named here so the cascade's teardown does not read it as the
+           * client leaving before its answer (teardown_owes_abort_record);
+           * that teardown records no client_abort_before_answer for it. */
+          if (cl && !cl->end_cause && !pfe->pd_sg_drain && !cl->pd_rule &&
+              cl->odir == 0 && cl->metric_req_start_ns > 0 &&
+              !cl->metric_ai_recorded && cl->metric_response_status == 0) {
             cl->end_cause = SP_END_BACKEND_DIED;
           }
         }
@@ -11969,6 +11986,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     npfe1->sse_mode = ent_pool0->sse_mode;
     npfe1->ai_gw_mode = ent_pool0->ai_gw_mode;
     npfe1->apikey_auth = ent_pool0->apikey_auth;
+    npfe1->pd_rule = ent_pool0->pd_disagg_enabled ? 1 : 0;
     npfe1->max_stream_duration_sec = ent_pool0->max_stream_duration_sec;
     npfe1->backend_keepalive_sec = ent_pool0->backend_keepalive_sec;
     npfe1->inactive_timeout_sec = ent_pool0->inactive_timeout_sec;
