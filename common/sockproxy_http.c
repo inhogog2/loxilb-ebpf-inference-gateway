@@ -2494,27 +2494,29 @@ skip_deferred_masking:
         rfd_ent->pd_decode_bytes_received += len;
       }
 
-      /* + T3: chunked / CL-less non-SSE decode
-       * completion. When the decode response has no Content-Length (chunked
-       * transfer-coding), the Content-Length tracking above never fires.
+      /* T3: chunked / CL-less non-SSE decode completion. When the decode
+       * response has no Content-Length (chunked transfer-coding), the
+       * Content-Length tracking above never fires.
        *
- * T3 (the high-concurrency stall): this !sse_active branch is ALSO
-       * the only completion detector when sse_active never flipped — the
-       * fragmented-"Content-Type" stall. Under load the response header block can
-       * split across reads, so the single-read sniff at :1157 misses
-       * "Content-Type: text/event-stream" -> sse_active stays 0 -> pd_phase stays
-       * PD_PHASE_DECODE_SENDING -> control reaches HERE, not the :1198 SSE
- * scanner. originally scanned only the CURRENT packet, so a terminator
-       * ("data: [DONE]\n\n" or the chunked "0\r\n\r\n") split across two TCP
-       * segments was missed -> the decode leg stalled forever and was eventually
-       * watchdog-reaped (~50% of high-rate points at conc=64).
+       * This !sse_active branch is also the completion detector for a stream
+       * that was never activated. It used to be reached under load by the
+       * fragmented-"Content-Type" stall: the single-read sniff missed a header
+       * block split across reads. That is no longer how a stream is
+       * recognised. The response framer gathers each header across reads and
+       * activates the stream at its headers (cresp_on_headers_complete); the
+       * raw sniff runs only for a response the framer could not frame. What
+       * still reaches here with an event stream is such a response (a
+       * malformed backend reply), or a stream on a rule without stream
+       * handling.
        *
-       * pd_scan_msg_end_window() keeps a sliding tail (riding the otherwise-idle
-       * sse_tail — idle precisely because sse_active==0 on this branch, so there
-       * is no contention with the :1198 scanner, which is gated on sse_active==1
-       * and mutually exclusive with this branch — the two never double-fire /
-       * double-free). Completion is thereby decoupled from sse_active; sse_active
-       * remains the metrics/gauge signal only. */
+       * Either way the terminator ("data: [DONE]\n\n" or the chunked
+       * "0\r\n\r\n") can be split across two reads, and a scan of the current
+       * read alone missed it: the decode leg stalled until a reaper took it.
+       * pd_scan_msg_end_window() keeps a sliding tail in sse_tail, which is
+       * idle on this branch because sse_active == 0. The SSE [DONE] scanner is
+       * gated on sse_active == 1, so the two are mutually exclusive and never
+       * both complete a request. Completion is thereby decoupled from
+       * sse_active, which remains the metrics/gauge signal only. */
       int pd_decode_chunked_done =
           (rfd_ent->pd_decode_content_length == 0) &&
           pd_scan_msg_end_window(rfd_ent->sse_tail, &rfd_ent->sse_tail_len,
