@@ -243,6 +243,31 @@ pd_decode_error_phase(int status)
   return 2;
 }
 
+/*
+ * pd_reap_error_phase - the llb_ai_pd_record error_phase of a P/D request a
+ * reaper ends while it is still in flight, from its pd_phase (the numbers are
+ * sockproxy.h's PD_PHASE_*; sockproxy_health.c asserts them):
+ *
+ *   1..3  PREFILL_SENDING / _WAITING / _DONE -> 1  prefill / timeout
+ *   4     DECODE_SENDING  (no decode byte)   -> 3  decode / timeout
+ *   5     DECODE_STREAMING (the answer began) -> 2  decode / error
+ *   else  not in flight                       -> -1 nothing to record
+ *
+ * A stream a reaper cuts with an error (the stream timeout, the idle cap, the
+ * duration cap, a stalled client) is decode/error. Only the graceful-[DONE]
+ * sweep, which ends the answer with its terminator, records decode/truncated.
+ * -1 for every other phase is what makes the record once: the reaper moves the
+ * request to ERROR after recording it.
+ */
+static inline int
+pd_reap_error_phase(int pd_phase)
+{
+  if (pd_phase >= 1 && pd_phase <= 3) return 1;
+  if (pd_phase == 4) return 3;
+  if (pd_phase == 5) return 2;
+  return -1;
+}
+
 /* PD_MSG_END_TAIL_KEEP - bytes of trailing context carried between successive
  * reads so a message-end terminator that straddles two TCP segments is still
  * detected. Must be >= the longest terminator pd_detect_http_msg_end matches:

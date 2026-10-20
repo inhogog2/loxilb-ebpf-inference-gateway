@@ -55,14 +55,15 @@ static void ai_gw_record_local_deny(int stage,const char *rid,int prod,const cha
  snprintf(deny_code,sizeof(deny_code),"%s",code);snprintf(deny_model,sizeof(deny_model),"%s",model);
  snprintf(deny_tenant,sizeof(deny_tenant),"%s",tenant);snprintf(deny_request,sizeof(deny_request),"%s",rid);
 }
-static void capture(const char *t,int status,const char *r,const char *k){
- emitted++;observed_status=status;
+static int observed_stream;
+static void capture(const char *t,int status,const char *r,const char *k,int stream){
+ emitted++;observed_status=status;observed_stream=stream;
  snprintf(observed_tenant,sizeof(observed_tenant),"%s",t);
  snprintf(observed_request,sizeof(observed_request),"%s",r);
  snprintf(observed_key,sizeof(observed_key),"%s",k);
 }
 #define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj) \
- ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k))
+ ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k,stream))
 static int proxy_send_local_response(proxy_fd_ent_t *p,const void *buf,size_t n){
  (void)p;sent++;
  assert(n==strlen(buf));
@@ -143,7 +144,21 @@ int main(void){
  assert(denies==4 && !p.metric_ai_recorded);
  proxy_ai_record_completion(&p);
  assert(emitted==4 && observed_status==200);
+ assert(observed_stream==0);
+ /* A stream the reaper ended cleanly (the sweep's terminator): its request
+  * record is written once, as a stream, with the status the client received;
+  * not again, and not for a connection outside the AI population. */
+ p=request();p.noted=1;p.metric_response_status=200;
+ proxy_record_reaped_stream(&p);
+ assert(emitted==5 && observed_status==200 && observed_stream==1 && p.metric_ai_recorded);
+ proxy_record_reaped_stream(&p);
+ proxy_ai_record_completion(&p);
+ assert(emitted==5);
+ p=request();p.ai_gw_mode=0;p.metric_response_status=200;proxy_record_reaped_stream(&p);
+ p=request();proxy_record_reaped_stream(&p); /* no status seen: nothing owed */
+ assert(emitted==5);
  puts("backend-failure audit: identity/status, once-only, send failure, non-AI/backend/started guards PASS");
+ puts("reaped stream: recorded once, as a stream, with the status the client received PASS");
  puts("local answers: an outage completes with its status, a refusal is one deny record at its stage and never a completion, both record the response PASS");
 }
 '''

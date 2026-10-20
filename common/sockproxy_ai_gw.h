@@ -544,7 +544,11 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                        2 = decode   / error     (decode leg failed or died: the
  *                                                  engine closed or the leg broke
  *                                                  before its answer was complete,
- *                                                  an EOF mid-stream included)
+ *                                                  an EOF mid-stream included; or
+ *                                                  a reaper cut the stream with an
+ *                                                  error: the stream timeout, the
+ *                                                  idle cap, the duration cap, a
+ *                                                  stalled client)
  *                        3 = decode   / timeout   (decode leg produced no byte)
  *                        4 = prefill  / error     (prefill leg failed or died)
  *                        5 = prefill  / rejected  (origin refused; relayed verbatim)
@@ -554,7 +558,9 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                        8 = decode   / truncated (the engine went silent with
  *                                                  its connection open and no
  *                                                  terminator; the gateway ended
- *                                                  the answer with one. Never 2:
+ *                                                  the answer cleanly, with one,
+ *                                                  where a reaper's cut ends it
+ *                                                  with an error (2). Never 2:
  *                                                  once the engine has closed, the
  *                                                  EOF path records 2 and ends the
  *                                                  request before the sweep can)

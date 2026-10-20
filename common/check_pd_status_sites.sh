@@ -180,5 +180,33 @@ if [ "$g" != "1" ]; then
   fail=1
 fi
 
+# 6. A P/D request a reaper or a dying decode leg ends has a lifecycle record.
+#    The stream timeout (ERR-01), the generic idle reaper, the duration cap and
+#    the stalled-client abort each call pd_reap_lifecycle right before handing
+#    the connection to pd_reap_respond, and the decode EOF mid-stream records
+#    decode/error and moves the request to ERROR before the sweep can see it.
+for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_PD_IDLE_TIMEOUT SP_REAP_SSE_CAP SP_REAP_SSE_STALL; do
+  ok=$(grep -B3 "pd_reap_respond(pfe, $kind);" ./sockproxy_health.c | grep -c 'pd_reap_lifecycle(pfe, ' || true)
+  if [ "$ok" != "1" ]; then
+    echo "sockproxy_health.c: the $kind reap is not preceded by its lifecycle record (pd_reap_lifecycle)"
+    fail=1
+  fi
+done
+eofb=$(awk '/decode backend EOF mid-stream/ {on = 1} on && /pd_sg_close_drain\(/ {exit} on' ./sockproxy_http.c | tr '\n' ' ')
+if ! printf '%s' "$eofb" | grep -q 'llb_ai_pd_record([^;]*2 /\*decode error\*/);.*pd_phase = PD_PHASE_ERROR;'; then
+  echo "sockproxy_http.c: the decode EOF mid-stream must record decode/error and move the request to ERROR"
+  fail=1
+fi
+
+# 6b. The stream the sweep ended cleanly has its request record: the reaper's
+#     record for that kind writes the completion with the status the client
+#     received (the [DONE] scanner, which writes it otherwise, never ran).
+gd=$(awk '/^sp_reap_record\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_health.c | tr '\n' ' ' \
+     | grep -c 'case SP_REAP_PD_GRACEFUL_DONE:[^}]*proxy_record_reaped_stream(pfe);' || true)
+if [ "$gd" != "1" ]; then
+  echo "sockproxy_health.c: sp_reap_record must write the request record of a stream the sweep ended (proxy_record_reaped_stream)"
+  fail=1
+fi
+
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded)"

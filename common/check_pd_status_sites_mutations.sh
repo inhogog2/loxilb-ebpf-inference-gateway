@@ -68,5 +68,39 @@ fresh
 mut sockproxy_health.c 'llb_ai_pd_record((char *)pd_tmo_model, t_prefill_ms, 0, t_kv, 1);' 'llb_ai_pd_record((char *)pd_tmo_model, t_prefill_ms, 0, t_kv, 0);'
 expect "5b: another reaper records a success" "a reaper records a literal success (0)"
 
+# 6: every reaper and the decode EOF mid-stream record the request.
+for k in PD_STREAM_TIMEOUT PD_IDLE_TIMEOUT SSE_CAP SSE_STALL; do
+  fresh
+  python3 - "$work/src/sockproxy_health.c" "$k" <<'PY'
+import sys
+p, k = sys.argv[1], sys.argv[2]
+s = open(p).read()
+i = s.index("pd_reap_respond(pfe, SP_REAP_%s);" % k)
+j = s.rindex("pd_reap_lifecycle(pfe, ", 0, i)
+e = s.index(";", j) + 1
+s = s[:j] + "(void)0;" + s[e:]
+open(p, "w").write(s)
+PY
+  expect "6: the $k reap makes no lifecycle record" "the SP_REAP_$k reap is not preceded by its lifecycle record"
+done
+fresh
+mut sockproxy_http.c '            llb_ai_pd_record((char *)pd_model, prefill_ms, 0, pd_kv,
+                             2 /*decode error*/);
+          }
+          client_pfe->pd_phase = PD_PHASE_ERROR;' '          }'
+expect "6: the decode EOF mid-stream records nothing" "the decode EOF mid-stream must record decode/error"
+fresh
+mut sockproxy_http.c '                             2 /*decode error*/);
+          }
+          client_pfe->pd_phase = PD_PHASE_ERROR;' '                             2 /*decode error*/);
+          }'
+expect "6: the decode EOF mid-stream leaves the request to the sweep" "the decode EOF mid-stream must record decode/error"
+
+# 6b: the reaped stream's request record.
+fresh
+mut sockproxy_health.c '    proxy_record_reaped_stream(pfe);
+    break;' '    break;'
+expect "6b: the stream the sweep ended has no request record" "sp_reap_record must write the request record of a stream the sweep ended"
+
 echo "check_pd_status_sites.sh mutations: $((n - survived)) of $n killed"
 [ "$survived" = "0" ]

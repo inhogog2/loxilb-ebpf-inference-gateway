@@ -210,6 +210,7 @@ int sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
 void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                              const char *code);
 void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status);
+void proxy_record_reaped_stream(proxy_fd_ent_t *pfe);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                            int retry_body, const char *code, const char *msg);
 /* `keep`: the refusal leaves the connection open for its next request (the

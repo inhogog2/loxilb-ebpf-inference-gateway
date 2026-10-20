@@ -412,6 +412,29 @@ test_decode_error_phase(void)
   printf("  [PASS] pd_decode_error_phase: 2xx/3xx 0, 4xx 6, 5xx 2, unread 7\n");
 }
 
+/* pd_reap_error_phase: a request a reaper ends is named by the phase it was
+ * in; anything not in flight has no record to make, which is what keeps the
+ * record to one once the reaper moves the request to ERROR. */
+static void
+test_reap_error_phase(void)
+{
+  static const struct { int pd_phase, phase; } cases[] = {
+    { 0, -1 },                         /* NONE: not a P/D request */
+    { 1, 1 }, { 2, 1 }, { 3, 1 },      /* prefill legs: prefill / timeout */
+    { 4, 3 },                          /* decode dispatched, no byte: decode / timeout */
+    { 5, 2 },                          /* the answer began: decode / error */
+    { 6, -1 }, { 7, -1 }, { 8, -1 },   /* COMPLETE, ERROR, PARKED */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    if (pd_reap_error_phase(cases[i].pd_phase) != cases[i].phase) {
+      fprintf(stderr, "pd_reap_error_phase(%d) = %d, want %d\n", cases[i].pd_phase,
+              pd_reap_error_phase(cases[i].pd_phase), cases[i].phase);
+      assert(0);
+    }
+  }
+  printf("  [PASS] pd_reap_error_phase: prefill 1, decode-sending 3, streaming 2, else none\n");
+}
+
 int
 main(void)
 {
@@ -430,6 +453,7 @@ main(void)
   test_resp_error_excerpt();
   test_prefill_status_verdict();
   test_decode_error_phase();
+  test_reap_error_phase();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }

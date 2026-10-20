@@ -337,6 +337,34 @@ sp_reap_body_frame(proxy_fd_ent_t *pfe, const sp_reap_text_t *t, char *out,
  * The caller has already moved the connection out of every pass of this
  * thread (pd_phase ERROR or COMPLETE, or sse_active cleared), so the worker
  * owing the response is never reaped a second time. */
+_Static_assert(PD_PHASE_PREFILL_SENDING == 1 && PD_PHASE_PREFILL_DONE == 3 &&
+               PD_PHASE_DECODE_SENDING == 4 && PD_PHASE_DECODE_STREAMING == 5,
+               "pd_reap_error_phase (sockproxy_pd_leak.h) reads these numbers");
+
+/* The lifecycle record of a P/D request a reaper ends, made once. The request
+ * then moves to ERROR, outside every in-flight phase, so no later pass (the
+ * sweep, ERR-01, the generic reaper) and no decode EOF records it again. A
+ * connection with no P/D request in flight has nothing to record. The decode
+ * duration is not sampled: it would run to the reap, idle wait included. The
+ * prefill duration is known once decode was dispatched. */
+static void
+pd_reap_lifecycle(proxy_fd_ent_t *pfe, int error_phase)
+{
+  int64_t prefill_ms = 0;
+
+  if (pd_reap_error_phase(pfe->pd_phase) < 0) {
+    return;
+  }
+  if (pfe->pd_prefill_start_ns > 0 &&
+      pfe->pd_decode_start_ns > pfe->pd_prefill_start_ns) {
+    prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
+                            pfe->pd_prefill_start_ns) / 1000000ULL);
+  }
+  llb_ai_pd_record((char *)proxy_effective_model(pfe), prefill_ms, 0,
+                   (pfe->pd_kv_params_len > 0) ? 1 : 0, error_phase);
+  pfe->pd_phase = PD_PHASE_ERROR;
+}
+
 static void
 pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
 {
@@ -485,6 +513,11 @@ sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
     break;
   case SP_REAP_PD_STREAM_TIMEOUT:
     proxy_record_local_completion(pfe, 502);
+    break;
+  case SP_REAP_PD_GRACEFUL_DONE:
+    /* The stream ended cleanly, with the gateway's terminator: completed,
+     * with the status the client received. */
+    proxy_record_reaped_stream(pfe);
     break;
   default:
     break;
@@ -1102,6 +1135,8 @@ check_draining_endpoints(void)
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;
             pfe->bp_since = 0;
+            /* A P/D stream cut for its stalled client: decode/error. */
+            pd_reap_lifecycle(pfe, 2 /*decode error*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);
             pfe = pfe_next;
             continue;
@@ -1132,7 +1167,9 @@ check_draining_endpoints(void)
             pfe->sse_active = 0;  /* Reset so eviction suppression no longer blocks cleanup */
             /* An error SSE event so the client can react, then both
              * directions shut; the event loop cleans up. Written by the
-             * socket's owner worker (pd_reap_respond). */
+             * socket's owner worker (pd_reap_respond). A P/D stream cut at
+             * its duration cap: decode/error. */
+            pd_reap_lifecycle(pfe, 2 /*decode error*/);
             pd_reap_respond(pfe, SP_REAP_SSE_CAP);
           }
         }
@@ -1687,7 +1724,9 @@ check_draining_endpoints(void)
             log_error("ERR-01: P/D decode stream timeout — fd=%d idle=%lds",
                       pfe->fd, (long)elapsed);
             /* real two-leg teardown (see above), the 502 first; both
-             * written by the socket's owner worker (pd_reap_respond). */
+             * written by the socket's owner worker (pd_reap_respond). The
+             * stream went silent and is cut with an error: decode/error. */
+            pd_reap_lifecycle(pfe, 2 /*decode error*/);
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_reap_respond(pfe, SP_REAP_PD_STREAM_TIMEOUT);
           }
@@ -1754,6 +1793,8 @@ check_draining_endpoints(void)
             log_error("generic P/D idle reaper — fd=%d pd_phase=%d "
                       "elapsed=%lds >= cap=%us",
                       pfe->fd, (int)pfe->pd_phase, (long)elapsed, idle_cap);
+            /* Named by the phase it wedged in (pd_reap_error_phase). */
+            pd_reap_lifecycle(pfe, pd_reap_error_phase(pfe->pd_phase));
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_reap_respond(pfe, SP_REAP_PD_IDLE_TIMEOUT);
           }

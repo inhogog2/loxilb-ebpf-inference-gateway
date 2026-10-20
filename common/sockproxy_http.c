@@ -205,7 +205,7 @@ proxy_owes_completion(const proxy_fd_ent_t *pfe)
  * charging the real amount. HTTP/2 settles in one place for the same reason
  * (proxy_h2_settle_stream). */
 static void
-proxy_ai_record_completion(proxy_fd_ent_t *pfe)
+proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream)
 {
   char svc_ident[64];
   int64_t lat_ms = 0;
@@ -224,7 +224,7 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
                         pfe->usage_prompt_toks, pfe->usage_complet_toks,
                         0, 0, "", (char *)proxy_request_id(pfe),
                         (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
-                        svc_ident, 0, notify_worker_id(),
+                        svc_ident, is_stream, notify_worker_id(),
                         (char *)pfe->l7_peer_ip,
                         (char *)proxy_origin_ip(pfe),
                         (int)proxy_origin_trusted_hops(pfe),
@@ -239,6 +239,22 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
    * and its capacity unit goes back before the connection idles on
    * keep-alive. */
   fc_permit_release(&pfe->fc);
+}
+
+static void
+proxy_ai_record_completion(proxy_fd_ent_t *pfe)
+{
+  proxy_ai_record_completion_(pfe, 0);
+}
+
+/* A stream the client was receiving, ended by a reaper with a clean end of its
+ * own (the graceful-[DONE] sweep's terminator), never reaches the [DONE]
+ * scanner's record: its request record is written here, once, with the status
+ * the client received. */
+void
+proxy_record_reaped_stream(proxy_fd_ent_t *pfe)
+{
+  proxy_ai_record_completion_(pfe, 1);
 }
 
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
@@ -6589,16 +6605,29 @@ proxy_pdestroy(void *priv)
           /* Decode backend EOF mid-stream. A completed stream leaves
            * DECODE_STREAMING via the SSE [DONE] scanner before its backend
            * closes (pd_phase NONE ⇒ the detach branch above), so reaching
-           * here means the stream was CUT with no terminator. Completion
-           * stays with the reaper paths (graceful-[DONE] synthesizes the
-           * terminator after the idle cap), but the EP death itself must be
-           * visible to the failover counters — without this tick a
-           * mid-stream decode crash is recorded as a clean success. */
+           * here means the stream was CUT with no terminator: the engine
+           * died. The request is recorded here as decode/error and moved to
+           * ERROR, so the graceful-[DONE] sweep neither records it again nor
+           * dresses the cut up as a clean end with a terminator of its own;
+           * the client sees the cut when this leg's teardown ends it. The EP
+           * death is also ticked for the failover counters. */
           log_error("decode backend EOF mid-stream — client_fd=%d "
-                    "decode_fd=%d (stream cut before [DONE]; reaper will "
-                    "complete the client)",
+                    "decode_fd=%d (stream cut before [DONE]; decode/error)",
                     client_pfe->fd, pfe->fd);
           atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+          {
+            const char *pd_model = proxy_effective_model(client_pfe);
+            int64_t prefill_ms = 0;
+            if (client_pfe->pd_prefill_start_ns > 0 &&
+                client_pfe->pd_decode_start_ns > client_pfe->pd_prefill_start_ns) {
+              prefill_ms = (int64_t)((client_pfe->pd_decode_start_ns -
+                                      client_pfe->pd_prefill_start_ns) / 1000000ULL);
+            }
+            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+            llb_ai_pd_record((char *)pd_model, prefill_ms, 0, pd_kv,
+                             2 /*decode error*/);
+          }
+          client_pfe->pd_phase = PD_PHASE_ERROR;
           /* SGLang: decode-leg death must not orphan the prefill drain leg */
           pd_sg_close_drain(client_pfe, 1);
         }
