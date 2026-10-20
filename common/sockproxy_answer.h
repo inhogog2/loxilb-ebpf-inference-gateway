@@ -87,12 +87,4 @@ static inline size_t sp_answer_sse_end(const char *code, int chunked,
               : snprintf(out, cap, "%s", ev);
   return (m > 0 && (size_t)m < cap) ? (size_t)m : 0;
 }
-
-/* A response is handled as a stream when its Content-Type says
- * text/event-stream on an AI-gateway connection; sse_mode asks for it on any
- * rule. */
-static inline int sp_stream_recognised(int sse_mode, int ai_gw_mode)
-{
-  return sse_mode == 1 || ai_gw_mode != 0;
-}
 #endif

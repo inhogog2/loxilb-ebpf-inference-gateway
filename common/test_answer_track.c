@@ -127,14 +127,7 @@ int main(void)
     assert(sp_answer_sse_end("pd_idle_timeout", 1, out, 16) == 0);
   }
 
-  /* Stream handling follows the Content-Type on an AI-gateway connection;
-   * sse_mode asks for it anywhere; a plain rule without it is unchanged. */
-  assert(sp_stream_recognised(0, 1));
-  assert(sp_stream_recognised(1, 0));
-  assert(sp_stream_recognised(1, 1));
-  assert(!sp_stream_recognised(0, 0));
-
   puts("answer tracking: started from the first status-line byte at every cut, interim and lost framing; "
-       "the in-band end decodes as the answer's last chunk; streams recognised on every AI connection PASS");
+       "the in-band end decodes as the answer's last chunk PASS");
   return 0;
 }

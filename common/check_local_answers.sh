@@ -296,8 +296,7 @@ for spec in \
   'sockproxy_health.c:pd_reap_respond:!t->body && sp_answer_started(pfe)' \
   'sockproxy_http.c:cresp_on_message_begin:sp_answer_msg_begin(&pfe->cresp_in_msg)' \
   'sockproxy_http.c:cresp_on_message_complete:sp_answer_msg_done(&pfe->cresp_in_msg)' \
-  'sockproxy_http.c:cresp_feed:sp_answer_framing_lost(&client->cresp_in_msg)' \
-  'sockproxy_http.c:proxy_sse_activate:sp_stream_recognised(pfe->sse_mode, pfe->ai_gw_mode)'; do
+  'sockproxy_http.c:cresp_feed:sp_answer_framing_lost(&client->cresp_in_msg)'; do
   f=${spec%%:*}; rest=${spec#*:}; fn=${rest%%:*}; pat=${rest#*:}
   fnbody "$f" "$fn" | grep -qF "$pat" ||
     { echo "$f: $fn must hold: $pat (a started answer takes no new status line)"; fail=1; }

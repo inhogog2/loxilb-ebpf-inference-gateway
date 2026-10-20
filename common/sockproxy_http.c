@@ -10823,9 +10823,7 @@ cresp_is_answer(int status)
 static void
 proxy_sse_activate(proxy_fd_ent_t *pfe)
 {
-  if (!pfe || pfe->sse_active ||
-      !sp_stream_recognised(pfe->sse_mode, pfe->ai_gw_mode))
-    return;
+  if (!pfe || pfe->sse_mode != 1 || pfe->sse_active) return;
   pfe->sse_active = 1;
   pfe->stream_start_ts = time(NULL);
   {

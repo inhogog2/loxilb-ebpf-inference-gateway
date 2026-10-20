@@ -258,9 +258,5 @@ mut sockproxy_http.c '    sp_answer_framing_lost(&client->cresp_in_msg);
 ' ''
 expect "rule 6: a framer that lost the framing reads as outside a message" "cresp_feed must hold"
 
-fresh
-mut sockproxy_http.c '!sp_stream_recognised(pfe->sse_mode, pfe->ai_gw_mode))' 'pfe->sse_mode != 1)'
-expect "rule 6: streams recognised only where sse_mode asks" "proxy_sse_activate must hold"
-
 [ "$survived" = "0" ] || { echo "check_local_answers.sh: a mutation survived"; exit 1; }
 echo "check_local_answers.sh mutations: $n/$n killed"
