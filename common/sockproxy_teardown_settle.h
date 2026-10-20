@@ -99,22 +99,20 @@ teardown_owes_completion(const teardown_conn_t *c)
  * A request the client left before any answer: no status was sent, nothing
  * recorded it. It is aborted by the client (sockproxy_end_cause.h), status 0.
  *
- * A P/D request owes it while in flight (its prefill or decode), and owes the
- * P/D lifecycle's aborted (9) beside it. A request on a rule that is not P/D
- * has no lifecycle family to pair with, so the request record alone keeps the
- * families 1:1; it owes it once the whole request reached the gate. A P/D
- * rule's request outside its prefill and decode (still at the gate, queued,
- * parked) is not owed either: the lifecycle has no value for it, and the
- * request record alone would break 1:1.
+ * Owed by a P/D request in its prefill or decode, and by any request once it
+ * is whole at the gate: still at the gate, queued, parked. On a P/D rule the
+ * client leaving owes the P/D lifecycle's aborted (9) beside it, at any of
+ * those stages: the model is known from the gate, so the lifecycle record
+ * has what it needs, and a client giving up while parked is the signal that
+ * the queue is too long.
  *
  * Nothing in the status-0 test can be another request's: every answer, the
  * backend's or the gateway's own, sets the status through the one latch, and
- * a refusal is recorded when it is sent. A request still being read never
- * reached the gate, and the next one on a keep-alive connection re-arms only
- * when it is whole. A hold the gateway ended (expired, released) is the
- * gateway's end, not the client's: not this record. Without this the client
- * giving up before the first byte reached no family. HTTP/2 is not walked for
- * it (#415).
+ * a refusal, a reaper's answer, a park timeout and a prefill failure all send
+ * one. A request still being read never reached the gate, and the next one on
+ * a keep-alive connection re-arms only when it is whole. A hold the gateway
+ * ended (expired, released) is the gateway's end, not the client's: not this
+ * record. HTTP/2 is not walked for it (#415).
  */
 static inline int
 teardown_owes_abort_record(const teardown_conn_t *c)
@@ -123,8 +121,8 @@ teardown_owes_abort_record(const teardown_conn_t *c)
       c->metric_response_status != 0 || c->has_h2_session) {
     return 0;
   }
-  if (c->pd_rule) {
-    return c->pd_in_flight;
+  if (c->pd_rule && c->pd_in_flight) {
+    return 1;
   }
   return c->req_framed && !c->hold_gw_ended;
 }

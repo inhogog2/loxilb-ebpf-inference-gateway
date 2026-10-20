@@ -6159,11 +6159,16 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
 
     /* A P/D client that left, with its answer open or before any answer: the
      * request's lifecycle record is aborted (9), the cause the request record
-     * names (client_abort, client_abort_before_answer), once. Not for one a
-     * leg's death or a reaper already recorded (they moved it out of the
-     * in-flight phases, or named another cause). */
+     * names (client_abort, client_abort_before_answer), once. With its answer
+     * open, not for one a leg's death or a reaper already recorded (they
+     * moved it out of the in-flight phases, or named another cause). Before
+     * any answer, on a P/D rule at any stage (in flight, at the gate, queued,
+     * parked): status 0 and no request record mean no lifecycle record was
+     * written for this request, whatever pd_phase a kept connection carries
+     * from the one before. */
     if (u->owes_record && sp_end_client_left(u->end) &&
-        pd_reap_error_phase(pfe->pd_phase) >= 0) {
+        (pd_reap_error_phase(pfe->pd_phase) >= 0 ||
+         (u->end == SP_END_CLIENT_NO_ANSWER && pfe->pd_rule))) {
       int64_t prefill_ms = 0;
 
       if (pfe->pd_prefill_start_ns > 0 &&

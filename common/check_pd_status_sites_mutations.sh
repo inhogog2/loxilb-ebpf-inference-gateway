@@ -182,11 +182,11 @@ fresh
 mut sockproxy_teardown_settle.h 'c->ai_gw_mode || c->metric_ai_recorded ||' 'c->ai_gw_mode ||'
 expect "6d: a recorded request is owed its abort record again" "must be owed its abort record by the teardown rule"
 fresh
-mut sockproxy_teardown_settle.h '  if (c->pd_rule) {
-    return c->pd_in_flight;
+mut sockproxy_teardown_settle.h '  if (c->pd_rule && c->pd_in_flight) {
+    return 1;
   }
 ' ''
-expect "6d: a P/D request outside its prefill and decode is recorded alone" "must be owed its abort record by the teardown rule"
+expect "6d: a P/D request in flight before it is whole is not owed" "must be owed its abort record by the teardown rule"
 fresh
 mut sockproxy_http.c '  v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
 ' ''
@@ -200,6 +200,9 @@ mut sockproxy_http.c '    if (u->end == SP_END_CLIENT_NO_ANSWER) {
     }
 ' ''
 expect "6d: its request record is not owed" "the teardown must collect and record a request its client left before any answer"
+fresh
+mut sockproxy_http.c '         (u->end == SP_END_CLIENT_NO_ANSWER && pfe->pd_rule))) {' '         0)) {'
+expect "6c: a P/D client leaving at the gate, queued or parked gets no aborted (9)" "a P/D client that left record aborted (9) once"
 
 # 6e: off P/D, the request record alone, for a whole request the client left.
 fresh

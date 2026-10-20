@@ -205,10 +205,15 @@ main(void)
   teardown_conn_t plain_unread = plain_left;
   plain_unread.req_framed = 0;
 
-  /* A P/D rule's request outside its prefill and decode (at the gate,
-   * queued, parked): the lifecycle has no value for it, so neither record. */
+  /* A P/D rule's whole request outside its prefill and decode (at the gate,
+   * queued, parked), its client gone: owed both records, aborted (9) at the
+   * lifecycle. */
   teardown_conn_t pd_parked = pd_left;
   pd_parked.pd_in_flight = 0;
+
+  /* The same, with no whole request yet: nothing. */
+  teardown_conn_t pd_unread = pd_parked;
+  pd_unread.req_framed = 0;
 
   /* A half-close hold the gateway ended: its end, not the client's. */
   teardown_conn_t plain_hold_expired = plain_left;
@@ -231,7 +236,8 @@ main(void)
   check("P/D left, already recorded", TEARDOWN_CONN, &pd_left_recorded, 0, 0);
   check("not P/D, left before its answer", TEARDOWN_CONN, &plain_left, 1, 1);
   check("not P/D, no whole request", TEARDOWN_CONN, &plain_unread, 0, 0);
-  check("P/D rule, not in flight",  TEARDOWN_CONN, &pd_parked,   0, 0);
+  check("P/D rule, parked or queued", TEARDOWN_CONN, &pd_parked, 1, 1);
+  check("P/D rule, no whole request", TEARDOWN_CONN, &pd_unread,  0, 0);
   check("not P/D, hold the gateway ended", TEARDOWN_CONN, &plain_hold_expired, 0, 0);
 
   printf("\n TEARDOWN_LISTENER - the same connections, rule going away:\n");
@@ -269,13 +275,15 @@ main(void)
     checks++;
     if (!teardown_owes_abort_record(&pd_left) || teardown_owes_abort_record(&answered) ||
         teardown_owes_abort_record(&leg) || teardown_owes_abort_record(&h2) ||
-        teardown_owes_abort_record(&pd_parked) || teardown_owes_abort_record(&pd_left_recorded)) {
-      printf("  [FAIL] teardown_owes_abort_record: on a P/D rule, owed only for a client in "
-             "flight, no status, nothing recorded, HTTP/1.1\n");
+        !teardown_owes_abort_record(&pd_parked) || teardown_owes_abort_record(&pd_unread) ||
+        teardown_owes_abort_record(&pd_left_recorded)) {
+      printf("  [FAIL] teardown_owes_abort_record: on a P/D rule, owed in flight or once the "
+             "request is whole (gate, queue, park), no status, nothing recorded, HTTP/1.1\n");
       failures++;
     } else {
-      printf("  [ok]   P/D rule: owed in flight with no status; not with a status, on a leg, "
-             "on HTTP/2, outside the prefill and decode, or once recorded\n");
+      printf("  [ok]   P/D rule: owed in flight and at the gate, queued or parked, with no "
+             "status; not with a status, on a leg, on HTTP/2, before the request is whole, "
+             "or once recorded\n");
     }
     checks++;
     if (!teardown_owes_abort_record(&plain_left) || teardown_owes_abort_record(&p_answered) ||
