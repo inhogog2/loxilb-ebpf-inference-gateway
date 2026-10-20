@@ -268,28 +268,51 @@ if ! awk '/The connection.s last response \(collected above under PROXY_LOCK\)/ 
   echo "sockproxy_http.c: the teardown's request record must name the end (sp_end_code(u->end))"
   fail=1
 fi
-if ! grep -q 'cl->end_cause = SP_END_BACKEND_DIED;' ./sockproxy_http.c; then
+if ! tr '\n' ' ' < ./sockproxy_http.c | grep -q 'atomic_load_explicit(&cl->cresp_answer_open, memory_order_relaxed)) { *cl->end_cause = SP_END_BACKEND_DIED;'; then
   echo "sockproxy_http.c: a leg ending under its client's open answer must name the engine (SP_END_BACKEND_DIED)"
   fail=1
 fi
 
-# 6d. A P/D request its client left before any answer reaches both families:
-#     the shared teardown rule owes it (in flight, status 0, nothing recorded),
-#     the teardown collects it, and its request record is owed with
-#     client_abort_before_answer (status 0); the 6c branch then records
-#     aborted (9). test_reap_request_record.py drives it.
+# 6d. A request its client left before any answer is recorded once: the
+#     shared teardown rule owes it (status 0, nothing recorded; on a P/D rule
+#     while in flight, elsewhere once the whole request reached the gate), the
+#     teardown collects it, and its request record is owed with
+#     client_abort_before_answer (status 0); on a P/D rule the 6c branch then
+#     records aborted (9). test_reap_request_record.py drives it.
 tsh=$(awk '/^teardown_conn_owes_settle\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_teardown_settle.h | tr '\n' ' ')
 oar=$(awk '/^teardown_owes_abort_record\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_teardown_settle.h | tr '\n' ' ')
 if ! printf '%s' "$tsh" | grep -q 'teardown_owes_abort_record(c)' || \
-   ! printf '%s' "$oar" | grep -q 'c->metric_response_status == 0 && c->pd_in_flight' || \
-   ! printf '%s' "$oar" | grep -q '!c->metric_ai_recorded'; then
-  echo "sockproxy_teardown_settle.h: a P/D request in flight with no status must be owed its abort record by the teardown rule"
+   ! printf '%s' "$oar" | grep -q 'c->metric_ai_recorded ||' || \
+   ! printf '%s' "$oar" | grep -q 'c->metric_response_status != 0 ||' || \
+   ! printf '%s' "$oar" | grep -q 'if (c->pd_rule) { *return c->pd_in_flight; *}'; then
+  echo "sockproxy_teardown_settle.h: a request with no status, nothing recorded, must be owed its abort record by the teardown rule (on a P/D rule only in flight)"
   fail=1
 fi
 if ! grep -q 'v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;' ./sockproxy_http.c || \
    ! printf '%s' "$col" | grep -q 'if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||' || \
    ! printf '%s' "$col" | grep -q 'if (u->end == SP_END_CLIENT_NO_ANSWER) { *u->owes_record = 1; *}'; then
-  echo "sockproxy_http.c: the teardown must collect and record a P/D request its client left before any answer (client_abort_before_answer)"
+  echo "sockproxy_http.c: the teardown must collect and record a request its client left before any answer (client_abort_before_answer)"
+  fail=1
+fi
+
+# 6e. Off P/D, the request record alone (no lifecycle family pairs with it):
+#     owed once the whole request reached the gate, not after the gateway
+#     ended a half-close hold; the rule is known per connection from accept;
+#     a leg ending before any answer names the engine, so the cascade's
+#     teardown does not read it as the client leaving.
+if ! printf '%s' "$oar" | grep -q 'return c->req_framed && !c->hold_gw_ended;'; then
+  echo "sockproxy_teardown_settle.h: off P/D, the abort record is owed for a whole request only, and not after the gateway ended its hold"
+  fail=1
+fi
+if ! grep -q 'npfe1->pd_rule = ent_pool0->pd_disagg_enabled ? 1 : 0;' ./sockproxy_http.c || \
+   ! grep -q 'v->pd_rule               = pfe->pd_rule ? 1 : 0;' ./sockproxy_http.c || \
+   ! grep -q 'v->req_framed            = pfe->metric_req_start_ns > 0;' ./sockproxy_http.c || \
+   ! grep -q 'v->hold_gw_ended = he == SP_HOLD_END_EXPIRED || he == SP_HOLD_END_RELEASED;' ./sockproxy_http.c; then
+  echo "sockproxy_http.c: the teardown view must say whether the rule is P/D, the request whole, and the hold ended by the gateway"
+  fail=1
+fi
+if ! tr '\n' ' ' < ./sockproxy_http.c | grep -q '!cl->pd_rule && *cl->odir == 0 && cl->metric_req_start_ns > 0 && *!cl->metric_ai_recorded && cl->metric_response_status == 0) { *cl->end_cause = SP_END_BACKEND_DIED;'; then
+  echo "sockproxy_http.c: off P/D, a leg ending before any answer must name the engine, not leave it to read as the client leaving"
   fail=1
 fi
 
@@ -347,4 +370,4 @@ if [ "$fbn" != "1" ] || [ -z "$fbl" ] || [ -z "$relay" ] || [ -z "$early" ] || \
 fi
 
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; a cut answer is recorded by its end, a P/D client's abort is aborted at any stage; each record crosses as both calls; the first event and the fallback reason have one writer each)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; a cut answer is recorded by its end, a P/D client's abort is aborted at any stage, off P/D a client leaving before any answer is one request record; each record crosses as both calls; the first event and the fallback reason have one writer each)"

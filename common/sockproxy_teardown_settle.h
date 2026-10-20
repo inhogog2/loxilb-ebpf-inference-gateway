@@ -53,6 +53,11 @@ typedef struct {
   int sse_active;              /* a stream was started and never ended */
   int pd_in_flight;            /* a P/D request still in its prefill or decode
                                 * (pd_reap_error_phase(pd_phase) >= 0) */
+  int pd_rule;                 /* the connection's rule is P/D */
+  int req_framed;              /* a whole request reached the gate on this
+                                * connection (metric_req_start_ns > 0) */
+  int hold_gw_ended;           /* a half-close hold the gateway ended (it
+                                * expired, or an operator released it) */
 } teardown_conn_t;
 
 /* 2xx, matching proxy_status_is_2xx. Restated rather than included so this
@@ -91,19 +96,37 @@ teardown_owes_completion(const teardown_conn_t *c)
 }
 
 /*
- * A P/D request the client left before any answer: in flight, no status was
- * sent, nothing recorded it. It is aborted by the client
- * (sockproxy_end_cause.h), and both its records are owed here: the request
- * record with status 0 and the P/D lifecycle's aborted (9). Without this the
- * client giving up before the first token reached neither family. HTTP/2 is
- * not walked for it (#415).
+ * A request the client left before any answer: no status was sent, nothing
+ * recorded it. It is aborted by the client (sockproxy_end_cause.h), status 0.
+ *
+ * A P/D request owes it while in flight (its prefill or decode), and owes the
+ * P/D lifecycle's aborted (9) beside it. A request on a rule that is not P/D
+ * has no lifecycle family to pair with, so the request record alone keeps the
+ * families 1:1; it owes it once the whole request reached the gate. A P/D
+ * rule's request outside its prefill and decode (still at the gate, queued,
+ * parked) is not owed either: the lifecycle has no value for it, and the
+ * request record alone would break 1:1.
+ *
+ * Nothing in the status-0 test can be another request's: every answer, the
+ * backend's or the gateway's own, sets the status through the one latch, and
+ * a refusal is recorded when it is sent. A request still being read never
+ * reached the gate, and the next one on a keep-alive connection re-arms only
+ * when it is whole. A hold the gateway ended (expired, released) is the
+ * gateway's end, not the client's: not this record. Without this the client
+ * giving up before the first byte reached no family. HTTP/2 is not walked for
+ * it (#415).
  */
 static inline int
 teardown_owes_abort_record(const teardown_conn_t *c)
 {
-  return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
-         c->metric_response_status == 0 && c->pd_in_flight &&
-         !c->has_h2_session;
+  if (!c || c->odir != 0 || !c->ai_gw_mode || c->metric_ai_recorded ||
+      c->metric_response_status != 0 || c->has_h2_session) {
+    return 0;
+  }
+  if (c->pd_rule) {
+    return c->pd_in_flight;
+  }
+  return c->req_framed && !c->hold_gw_ended;
 }
 
 /*

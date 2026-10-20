@@ -7,7 +7,9 @@ client received, 200, and how it ended (error_code, sockproxy_end_cause.h):
 whose answer ended whole is "". A P/D client that leaves before any answer
 (the prefill, or the decode leg's first byte still to come) is
 client_abort_before_answer with status 0, none having been sent, and its P/D
-lifecycle record is aborted (9): the two families stay 1:1.
+lifecycle record is aborted (9): the two families stay 1:1. So is a whole
+request on a rule that is not P/D, with the request record alone (no
+lifecycle family pairs with it).
 
 The production reaper writers run on the owner worker (sp_reap_finish and
 sp_reap_record, sockproxy_health.c) with the production request recorders
@@ -57,6 +59,12 @@ tde = re.search(r'u->end = (sp_end_cause_at_teardown\(\s*pfe->end_cause, shape =
                 r'!pfe->h2_session &&\s*atomic_load_explicit\(&pfe->cresp_answer_open, memory_order_relaxed\),\s*'
                 r'teardown_owes_abort_record\(&v\)\));', pd)
 assert tde, 'the teardown reads the end differently: update this model'
+# The view reads the gateway-ended holds by these values (stubbed below).
+hcore = (root / 'sockproxy_hold_core.h').read_text()
+hend = re.search(r'enum sp_hold_end \{([^}]*)\}', hcore).group(1)
+hnames = [m.group(1) for m in re.finditer(r'(SP_HOLD_END_[A-Z_]+)', hend)]
+assert hnames.index('SP_HOLD_END_EXPIRED') == 3 and hnames.index('SP_HOLD_END_RELEASED') == 4 \
+    and 'SP_HOLD_END_NONE = 0' in hend, 'enum sp_hold_end moved: update the stub values'
 # The passes name the shutdown kinds' cuts before handing them off.
 for kind, cause in (('SP_REAP_SSE_CAP', 'SP_END_DURATION_CAP'), ('SP_REAP_SSE_STALL', 'SP_END_CLIENT_STALL')):
     i = health.index('pd_reap_respond(pfe, %s);' % kind)
@@ -95,11 +103,13 @@ prefix = r'''
 #define PROXY_UNLOCK() ((void)0)
 #define AI_GW_STAGE_CAPACITY 3
 #define AI_GW_CLASS_INFO(a,b,c,d) 0
+enum { SP_HOLD_END_NONE = 0, SP_HOLD_END_EXPIRED = 3, SP_HOLD_END_RELEASED = 4 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 struct proxy_fd_ent {
   int fd, odir, ai_gw_mode, metric_ai_recorded, metric_response_status, noted, fc;
   int usage_reserved_toks, usage_consumed, usage_prompt_toks, usage_complet_toks;
   int auth_src, adm_priority, adm_class_set, adm_class, adm_objective_denied, adm_hint_not_applied, pd_phase;
+  uint8_t pd_rule; _Atomic uint8_t hold_end;
   void *h2_session; uint8_t sse_active, reap_resp, end_cause; time_t stream_start_ts;
   _Atomic uint8_t cresp_in_msg, cresp_answer_open; llhttp_t cresp_parser;
   uint64_t metric_req_start_ns;
@@ -258,20 +268,30 @@ int main(void) {
    * leg's first byte still to come) its request record is status 0,
    * client_abort_before_answer, and its lifecycle record aborted (9); with
    * its answer open, client_abort and 9. One of each. A listener going before
-   * any answer records neither (no lifecycle value pairs with it); a request
-   * that is not P/D and has no status is not this record's. */
+   * any answer records neither (F-17: no lifecycle value pairs with it). A
+   * whole request on a rule that is not P/D, its client gone before any
+   * answer: the request record alone, status 0, client_abort_before_answer;
+   * not when the listener goes, nor after the gateway ended its hold. A P/D
+   * rule's request outside its prefill and decode (parked): neither. */
   {
-    static const struct { const char *what; int pd_phase, answered, shape, records, status, pd9; const char *code; } left[] = {
-      { "P/D prefill, the client leaves", 2, 0, TEARDOWN_CONN, 1, 0, 1, "client_abort_before_answer" },
-      { "P/D decode sent, no byte yet", 4, 0, TEARDOWN_CONN, 1, 0, 1, "client_abort_before_answer" },
-      { "P/D answer open, the client leaves", 5, 1, TEARDOWN_CONN, 1, 200, 1, "client_abort" },
-      { "P/D prefill, the listener goes", 2, 0, TEARDOWN_LISTENER, 0, 0, 0, "" },
-      { "P/D already recorded (ERROR)", 7, 0, TEARDOWN_CONN, 0, 0, 0, "" },
-      { "not P/D, no status yet", 0, 0, TEARDOWN_CONN, 0, 0, 0, "" },
+    static const struct { const char *what; int pd_rule, pd_phase, answered, hold_end, shape, records, status, pd9; const char *code; } left[] = {
+      { "P/D prefill, the client leaves", 1, 2, 0, 0, TEARDOWN_CONN, 1, 0, 1, "client_abort_before_answer" },
+      { "P/D decode sent, no byte yet", 1, 4, 0, 0, TEARDOWN_CONN, 1, 0, 1, "client_abort_before_answer" },
+      { "P/D answer open, the client leaves", 1, 5, 1, 0, TEARDOWN_CONN, 1, 200, 1, "client_abort" },
+      { "P/D prefill, the listener goes", 1, 2, 0, 0, TEARDOWN_LISTENER, 0, 0, 0, "" },
+      { "P/D already recorded (ERROR)", 1, 7, 0, 0, TEARDOWN_CONN, 0, 0, 0, "" },
+      { "P/D parked, the client leaves", 1, 8, 0, 0, TEARDOWN_CONN, 0, 0, 0, "" },
+      { "not P/D, the client leaves", 0, 0, 0, 0, TEARDOWN_CONN, 1, 0, 0, "client_abort_before_answer" },
+      { "not P/D, answer open, client leaves", 0, 0, 1, 0, TEARDOWN_CONN, 1, 200, 0, "client_abort" },
+      { "not P/D, the listener goes", 0, 0, 0, 0, TEARDOWN_LISTENER, 0, 0, 0, "" },
+      { "not P/D, hold expired", 0, 0, 0, SP_HOLD_END_EXPIRED, TEARDOWN_CONN, 0, 0, 0, "" },
+      { "not P/D, hold released", 0, 0, 0, SP_HOLD_END_RELEASED, TEARDOWN_CONN, 0, 0, 0, "" },
     };
     for (unsigned i = 0; i < sizeof(left) / sizeof(left[0]); i++) {
       proxy_fd_ent_t c = client(left[i].answered);
+      c.pd_rule = (uint8_t)left[i].pd_rule;
       c.pd_phase = left[i].pd_phase;
+      atomic_store(&c.hold_end, (uint8_t)left[i].hold_end);
       records = 0; record_status = 0; record_code[0] = 0; pd_aborted = 0;
       event_loop_teardown_(&c, left[i].shape);
       event_loop_teardown_(&c, left[i].shape);   /* a second walk owes nothing */
@@ -282,10 +302,20 @@ int main(void) {
         bad = 1;
     }
   }
+  /* A connection with no whole request (idle, or one still being read) owes
+   * nothing, on any rule. */
+  {
+    proxy_fd_ent_t c = client(0);
+    c.metric_req_start_ns = 0;
+    records = 0; pd_aborted = 0;
+    event_loop_teardown(&c);
+    printf("  not P/D, no whole request, client leaves -> %d request record(s)\n", records);
+    if (records != 0 || pd_aborted != 0) bad = 1;
+  }
   /* The teardown's reading, case by case: a recorded end wins, an open answer
-   * is the client leaving (the gateway when the whole listener goes), a P/D
-   * request before any answer the client leaving before it (nothing when the
-   * listener goes), a whole one has no end. */
+   * is the client leaving (the gateway when the whole listener goes), a
+   * request the abort rule owes before any answer the client leaving before
+   * it (nothing when the listener goes), a whole one has no end. */
   if (sp_end_cause_at_teardown(SP_END_CLIENT_STALL, 0, 0, 0) != SP_END_CLIENT_STALL ||
       sp_end_cause_at_teardown(SP_END_BACKEND_DIED, 1, 1, 0) != SP_END_BACKEND_DIED ||
       sp_end_cause_at_teardown(SP_END_NONE, 0, 1, 0) != SP_END_CLIENT_GONE ||
@@ -303,7 +333,7 @@ int main(void) {
     puts("FAIL: sp_end_cause_at_teardown / sp_end_code"); bad = 1;
   }
   if (bad) { puts("FAIL: a reaped answer has no request record, more than one, or the wrong end"); return 1; }
-  puts("reaped answers: every reaper after a 200 leaves one request record, 200, named by its end (the sweep's clean end completed, a cut aborted); before an answer, its own status, once; a P/D client leaving at any stage, one request record and one aborted (9) PASS");
+  puts("reaped answers: every reaper after a 200 leaves one request record, 200, named by its end (the sweep's clean end completed, a cut aborted); before an answer, its own status, once; a P/D client leaving at any stage, one request record and one aborted (9); off P/D, a client leaving before any answer, one request record (status 0) PASS");
   return 0;
 }
 '''

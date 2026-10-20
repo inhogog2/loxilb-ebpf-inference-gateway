@@ -160,7 +160,9 @@ mut sockproxy_http.c '                            (char *)sp_end_code(u->end),
                             u->request_id,'
 expect "6c: the teardown record drops the end" "the teardown's request record must name the end"
 fresh
-mut sockproxy_http.c '            cl->end_cause = SP_END_BACKEND_DIED;' '            (void)0;'
+mut sockproxy_http.c 'memory_order_relaxed)) {
+            cl->end_cause = SP_END_BACKEND_DIED;' 'memory_order_relaxed)) {
+            (void)0;'
 expect "6c: a dying leg does not name the engine" "must name the engine (SP_END_BACKEND_DIED)"
 fresh
 mut sockproxy_http.c '        teardown_owes_abort_record(&v));' '        0);'
@@ -169,31 +171,58 @@ fresh
 mut sockproxy_http.c '    if (u->owes_record && sp_end_client_left(u->end) &&' '    if (u->owes_record && u->end == SP_END_CLIENT_GONE &&'
 expect "6c: the client leaving before an answer gets no aborted (9)" "a P/D client that left record aborted (9) once"
 
-# 6d: a P/D request its client left before any answer reaches both families.
+# 6d: a request its client left before any answer is recorded once.
 fresh
 mut sockproxy_teardown_settle.h '         teardown_owes_abort_record(c) || teardown_owes_usage_missing(c) ||' '         teardown_owes_usage_missing(c) ||'
 expect "6d: the teardown rule owes nothing for a request left before its answer" "must be owed its abort record by the teardown rule"
 fresh
-mut sockproxy_teardown_settle.h '         c->metric_response_status == 0 && c->pd_in_flight &&' '         c->pd_in_flight &&'
+mut sockproxy_teardown_settle.h '      c->metric_response_status != 0 || c->has_h2_session) {' '      c->has_h2_session) {'
 expect "6d: a request a status accounts for is recorded again" "must be owed its abort record by the teardown rule"
 fresh
-mut sockproxy_teardown_settle.h '  return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
-         c->metric_response_status == 0' '  return c && c->odir == 0 && c->ai_gw_mode &&
-         c->metric_response_status == 0'
+mut sockproxy_teardown_settle.h 'c->ai_gw_mode || c->metric_ai_recorded ||' 'c->ai_gw_mode ||'
 expect "6d: a recorded request is owed its abort record again" "must be owed its abort record by the teardown rule"
+fresh
+mut sockproxy_teardown_settle.h '  if (c->pd_rule) {
+    return c->pd_in_flight;
+  }
+' ''
+expect "6d: a P/D request outside its prefill and decode is recorded alone" "must be owed its abort record by the teardown rule"
 fresh
 mut sockproxy_http.c '  v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
 ' ''
-expect "6d: the view does not say the request is in flight" "the teardown must collect and record a P/D request its client left before any answer"
+expect "6d: the view does not say the request is in flight" "the teardown must collect and record a request its client left before any answer"
 fresh
 mut sockproxy_http.c '  if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||' '  if ((teardown_owes_completion(&v) ||'
-expect "6d: the teardown does not collect it" "the teardown must collect and record a P/D request its client left before any answer"
+expect "6d: the teardown does not collect it" "the teardown must collect and record a request its client left before any answer"
 fresh
 mut sockproxy_http.c '    if (u->end == SP_END_CLIENT_NO_ANSWER) {
       u->owes_record = 1;
     }
 ' ''
-expect "6d: its request record is not owed" "the teardown must collect and record a P/D request its client left before any answer"
+expect "6d: its request record is not owed" "the teardown must collect and record a request its client left before any answer"
+
+# 6e: off P/D, the request record alone, for a whole request the client left.
+fresh
+mut sockproxy_teardown_settle.h '  return c->req_framed && !c->hold_gw_ended;' '  return 1;'
+expect "6e: a request not yet whole is owed an abort record" "off P/D, the abort record is owed for a whole request only"
+fresh
+mut sockproxy_teardown_settle.h '  return c->req_framed && !c->hold_gw_ended;' '  return c->req_framed;'
+expect "6e: a hold the gateway ended reads as the client leaving" "off P/D, the abort record is owed for a whole request only"
+fresh
+mut sockproxy_http.c '    npfe1->pd_rule = ent_pool0->pd_disagg_enabled ? 1 : 0;
+' ''
+expect "6e: the connection does not know its rule is P/D" "the teardown view must say whether the rule is P/D"
+fresh
+mut sockproxy_http.c '  v->req_framed            = pfe->metric_req_start_ns > 0;' '  v->req_framed            = 1;'
+expect "6e: the view calls every request whole" "the teardown view must say whether the rule is P/D"
+fresh
+mut sockproxy_http.c '    v->hold_gw_ended = he == SP_HOLD_END_EXPIRED || he == SP_HOLD_END_RELEASED;' '    v->hold_gw_ended = he == SP_HOLD_END_EXPIRED;'
+expect "6e: an operator's release reads as the client leaving" "the teardown view must say whether the rule is P/D"
+fresh
+mut sockproxy_http.c '              !cl->metric_ai_recorded && cl->metric_response_status == 0) {
+            cl->end_cause = SP_END_BACKEND_DIED;' '              !cl->metric_ai_recorded && cl->metric_response_status == 0) {
+            (void)0;'
+expect "6e: a leg dying before any answer reads as the client leaving" "off P/D, a leg ending before any answer must name the engine"
 
 # 7: one record, both calls, through the helper only.
 fresh
