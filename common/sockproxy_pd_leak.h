@@ -198,10 +198,11 @@ pd_resp_error_excerpt(const uint8_t *buf, size_t len, char *out, size_t cap)
  *
  * PD_PR_RELAY: an origin 4xx is a deterministic client error that every
  * engine would repeat (unknown model, malformed body, prompt over the context
- * window). The decode leg would answer the same 4xx, so the prefill reply is
- * handed to the client verbatim and decode is not called. A reply truncated
- * at the buffer cap is not the origin's response any more and cannot be
- * relayed; it takes the decode leg, which answers the same reject itself.
+ * window). The decode leg would answer the same 4xx, so the client gets the
+ * prefill reply and decode is not called. A reply cut at the buffer cap is
+ * relayed by its status: the cut body is not the origin's any more, so the
+ * relay writes a short gateway body in its place (pd_prefill_cut_reject)
+ * rather than spend a decode call on the same reject.
  *
  * PD_PR_DECODE: everything else. A 5xx keeps the documented degradation (the
  * decode leg recomputes the prefill and the request is served; the breaker's
@@ -213,10 +214,47 @@ pd_resp_error_excerpt(const uint8_t *buf, size_t len, char *out, size_t cap)
 #define PD_PR_RELAY  1
 
 static inline int
-pd_prefill_status_verdict(int status, int truncated)
+pd_prefill_status_verdict(int status)
 {
-  return (status >= 400 && status < 500 && status != 408 && status != 429 &&
-          !truncated) ? PD_PR_RELAY : PD_PR_DECODE;
+  return (status >= 400 && status < 500 && status != 408 && status != 429)
+             ? PD_PR_RELAY : PD_PR_DECODE;
+}
+
+/*
+ * pd_prefill_cut_reject - the response a client gets for an origin 4xx whose
+ * prefill reply was cut at the buffer cap: the engine's status, and a short
+ * gateway body in place of the cut one, framed by its length. Returns the
+ * length written into out, 0 when it does not fit.
+ */
+static inline size_t
+pd_prefill_cut_reject(int status, char *out, size_t cap)
+{
+  char body[160];
+  const char *reason;
+  int bl, n;
+
+  switch (status) {
+  case 400: reason = "Bad Request"; break;
+  case 401: reason = "Unauthorized"; break;
+  case 403: reason = "Forbidden"; break;
+  case 404: reason = "Not Found"; break;
+  case 413: reason = "Content Too Large"; break;
+  case 422: reason = "Unprocessable Content"; break;
+  default:  reason = "Client Error"; break;
+  }
+  bl = snprintf(body, sizeof(body),
+                "{\"error\":\"prefill_rejected\",\"status\":%d,"
+                "\"detail\":\"the engine's reply was cut at the gateway's buffer cap\"}",
+                status);
+  if (bl <= 0 || (size_t)bl >= sizeof(body))
+    return 0;
+  n = snprintf(out, cap,
+               "HTTP/1.1 %d %s\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %d\r\n"
+               "\r\n"
+               "%s", status, reason, bl, body);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
 /*
@@ -224,17 +262,17 @@ pd_prefill_status_verdict(int status, int truncated)
  * sent to the decode leg was recomputed there (loxilb_ai_pd_prefill_fallback_total
  * {reason}); PD_FB_NONE when it was not a fallback. The reason is the condition
  * that forced the fallback, in verdict order: when the status alone forces it,
- * the status is the reason, whether or not the body was cut; when the status
- * would have been relayed or used and the fallback happened only because the
- * reply was cut at the buffer cap, the reason is truncated (a cut 2xx or 4xx).
+ * the status is the reason, whether or not the body was cut; when the reply
+ * would have been used and the fallback happened only because it was cut at
+ * the buffer cap, the reason is truncated (a cut 2xx).
  *
  *   >= 500             -> PD_FB_ORIGIN_5XX  (cut or not)
  *   408 / 429          -> PD_FB_ORIGIN_408 / PD_FB_ORIGIN_429  (cut or not)
  *   0 (unreadable)     -> PD_FB_NO_STATUS   (cut or not: the status alone forces it)
  *   1xx, 3xx           -> PD_FB_OTHER       (an unusable reply)
- *   2xx, other 4xx cut -> PD_FB_TRUNCATED
+ *   2xx cut            -> PD_FB_TRUNCATED
  *   2xx not cut        -> PD_FB_NONE        (the normal path)
- *   other 4xx not cut  -> PD_FB_NONE        (relayed, never reaches decode)
+ *   other 4xx          -> PD_FB_NONE        (relayed, cut or not: never reaches decode)
  */
 #define PD_FB_NONE        0
 #define PD_FB_ORIGIN_5XX  1
@@ -251,6 +289,7 @@ pd_prefill_fallback_reason(int status, int truncated)
   if (status == 429) return PD_FB_ORIGIN_429;
   if (status <= 0) return PD_FB_NO_STATUS;
   if (status < 200 || (status >= 300 && status < 400)) return PD_FB_OTHER;
+  if (status >= 400) return PD_FB_NONE;
   return truncated ? PD_FB_TRUNCATED : PD_FB_NONE;
 }
 
@@ -294,7 +333,8 @@ pd_decode_error_phase(int status)
  * whether the gateway wrote a terminator or cut it with an error;
  * pd_terminator_synthesized tells the two apart. decode/error (2) is the
  * engine's death, which only the decode leg sees. A client that stopped
- * reading is no reaper record at all (pd_reap_unrecorded). -1 for every other
+ * reading is the client's abort: the stall reaper records aborted (9), not
+ * this table's value. -1 for every other
  * phase is what makes the record once: the reaper moves the request to ERROR
  * after recording it.
  */

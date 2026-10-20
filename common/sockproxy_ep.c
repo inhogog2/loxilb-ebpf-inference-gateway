@@ -490,6 +490,28 @@ strip_port_from_hostname(const char *host_with_port, char *host_only, size_t hos
   }
 }
 
+/* The model a request routes by, with or without a Host:
+ *   0. the admission gate's body-first resolution. On enforcing services this
+ *      is the model authorization was checked against; routing by anything
+ *      else re-opens the authorize-A-serve-B split the gate's conflict rule
+ *      closes.
+ *   1. the X-Model header (fast path, set during header parsing)
+ *   2. the JSON body "model" field (extract_llm_prefix)
+ *   3. "" (wildcard, backward compatible)
+ * The same value llb_ai_validate_key checks AllowedModels against. */
+static const char *
+sp_route_model(const proxy_fd_ent_t *pfe)
+{
+  if (pfe && pfe->effective_model[0] != '\0') {
+    return pfe->effective_model;
+  } else if (pfe && pfe->x_model_header[0] != '\0') {
+    return pfe->x_model_header;
+  } else if (pfe && pfe->prefix_key.model[0] != '\0') {
+    return pfe->prefix_key.model;
+  }
+  return "";
+}
+
 int
 proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                  const char *host_str,
@@ -544,31 +566,44 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                   host_str ? host_str : "(null)", request_path ? request_path : "(null)");
 #endif
 #endif
+        // Criterion A/C: the model, resolved once for both branches.
+        const char *effective_model = sp_route_model(pfe);
+
         if (host_str == NULL) {
-          tepval = sp_pool_first(node);
+          /* No usable Host (ROUTE-01): never "the first pool" on a listener
+           * whose pools name models. After ROUTE-01's fix no HTTP request
+           * reaches here on such a listener; route_host_missing says one
+           * did. */
+          int hl = sp_route_hostless(node, effective_model, &tepval);
+
+          if (hl != SP_HOSTLESS_FIRST) {
+            atomic_fetch_add(&global_stats.route_host_missing, 1);
+          }
+          if (hl == SP_HOSTLESS_REFUSE && pfe) {
+            char response_buf[512];
+            int named = effective_model[0] != '\0';
+            const char *code = named ? "model_unavailable" : "no_route";
+
+            snprintf(response_buf, sizeof(response_buf),
+                     "HTTP/1.1 503 Service Unavailable\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "{\"error\":\"%s\",\"model\":\"%s\","
+                     "\"detail\":\"no Host, and %s\"}\r\n",
+                     code, effective_model,
+                     named ? "no backend pool for this model" : "no model to route by");
+            sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, code,
+                                  response_buf, strlen(response_buf));
+            log_info("[MODEL_ROUTING] 503 sent: no Host, model='%s' names no pool on fd=%d",
+                     effective_model, pfe->fd);
+            pfe->lb_err_body_sent = 1;
+            return -1;
+          }
         } else {
           // Strip port from hostname before lookup (e.g., "example.com:9090" → "example.com")
           char host_only[256];
           strip_port_from_hostname(host_str, host_only, sizeof(host_only));
-
-          // Criterion A: Determine effective model name with priority:
-          //   1. X-Model HTTP header (fast path — set during header parsing)
-          //   2. JSON body "model" field (set by extract_llm_prefix during body parsing)
-          //   3. "" (empty string — wildcard, backward compatible)
-          // Criterion C: same effective_model is the value that llb_ai_validate_key
-          // ( CGO bridge) would receive for AllowedModels checking.
-          const char *effective_model = "";
-          if (pfe && pfe->effective_model[0] != '\0') {
-            // Priority 0: the admission gate's body-first resolution. On
-            // enforcing services this is the model authorization was
-            // checked against; routing by anything else re-opens the
-            // authorize-A-serve-B split the gate's conflict rule closes.
-            effective_model = pfe->effective_model;
-          } else if (pfe && pfe->x_model_header[0] != '\0') {
-            effective_model = pfe->x_model_header;       // Priority 1: X-Model header
-          } else if (pfe && pfe->prefix_key.model[0] != '\0') {
-            effective_model = pfe->prefix_key.model;     // Priority 2: JSON body "model"
-          }
 
           // L7 content-routing discriminator + dispatch — the H1
           // seam. Runs AFTER the AI-GW auth/QUOTA gate (handle_on_message_complete,

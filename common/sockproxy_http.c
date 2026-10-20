@@ -90,6 +90,7 @@
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_end_cause.h"      /* why an answer ended before the client had it */
 #include "sockproxy_stream_fallback.h"
 #include "sockproxy_admit_response.h"
 #include "sockproxy_mcp_capture.h"
@@ -205,7 +206,7 @@ proxy_owes_completion(const proxy_fd_ent_t *pfe)
  * charging the real amount. HTTP/2 settles in one place for the same reason
  * (proxy_h2_settle_stream). */
 static void
-proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream)
+proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end)
 {
   char svc_ident[64];
   int64_t lat_ms = 0;
@@ -222,7 +223,7 @@ proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream)
                         (char *)proxy_effective_model(pfe),
                         (int)pfe->metric_response_status, lat_ms,
                         pfe->usage_prompt_toks, pfe->usage_complet_toks,
-                        0, 0, "", (char *)proxy_request_id(pfe),
+                        0, 0, (char *)sp_end_code(end), (char *)proxy_request_id(pfe),
                         (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
                         svc_ident, is_stream, notify_worker_id(),
                         (char *)pfe->l7_peer_ip,
@@ -244,18 +245,19 @@ proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream)
 static void
 proxy_ai_record_completion(proxy_fd_ent_t *pfe)
 {
-  proxy_ai_record_completion_(pfe, 0);
+  proxy_ai_record_completion_(pfe, 0, SP_END_NONE);
 }
 
 /* An answer the client was receiving, ended by a reaper that frees the
  * connection inline (the graceful-[DONE] sweep's terminator, a stream-silence
  * or idle cut after the 200), never reaches the [DONE] scanner's record nor the
  * teardown's: its request record is written here, once, with the status the
- * client received. A stream is one the client was sent as a stream. */
+ * client received and how the reaper ended it (`end`, SP_END_NONE for the
+ * sweep's clean end). A stream is one the client was sent as a stream. */
 void
-proxy_record_reaped_answer(proxy_fd_ent_t *pfe)
+proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end)
 {
-  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0);
+  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end);
 }
 
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
@@ -5987,6 +5989,9 @@ typedef struct {
   int  priority;
   int  class_info;     /* AI_GW_CLASSF_* */
   char objective[64];
+  /* How the answer ended (enum sp_end_cause): SP_END_NONE when the client
+   * got all of it; otherwise the request is aborted and error_code names it. */
+  int  end;
 } proxy_umiss_t;
 
 typedef struct {
@@ -6038,6 +6043,7 @@ proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
   v->metric_ai_recorded    = pfe->metric_ai_recorded ? 1 : 0;
   v->metric_response_status = pfe->metric_response_status;
   v->sse_active            = pfe->sse_active ? 1 : 0;
+  v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
 }
 
 /*
@@ -6090,10 +6096,11 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     pfe->usage_res_epoch = 0;
   }
 
-  /* Last response on this connection, finished with no readable usage object.
-   * Identity is copied here because the pfe may be recycled by the time this
-   * is emitted. */
-  if ((teardown_owes_completion(&v) || teardown_owes_usage_missing(&v)) &&
+  /* Last response on this connection, finished with no readable usage object,
+   * or a P/D request its client left before any answer. Identity is copied
+   * here because the pfe may be recycled by the time this is emitted. */
+  if ((teardown_owes_completion(&v) || teardown_owes_abort_record(&v) ||
+       teardown_owes_usage_missing(&v)) &&
       proxy_settle_grow((void **)&b->umiss, &b->c_umiss, b->n_umiss,
                         sizeof(*b->umiss))) {
     const char *um_model = proxy_effective_model(pfe);
@@ -6126,9 +6133,41 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
       u->latency_ms = (int64_t)((get_timestamp_ns() -
                                  pfe->metric_req_start_ns) / 1000000ULL);
     }
+    /* Read before the stream-end block below, which leaves the answer as it
+     * is: an HTTP/1.1 answer the client's framer is still inside was cut; a
+     * P/D request in flight with no status had no answer yet. */
+    u->end = sp_end_cause_at_teardown(
+        pfe->end_cause, shape == TEARDOWN_LISTENER,
+        !pfe->h2_session &&
+            atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed),
+        teardown_owes_abort_record(&v));
+    /* Before any answer the record is owed only when the client left
+     * (status 0, client_abort_before_answer). */
+    if (u->end == SP_END_CLIENT_NO_ANSWER) {
+      u->owes_record = 1;
+    }
     /* Claimed under the lock: whatever this entry owes, it owes once. */
     pfe->metric_ai_recorded = 1;
     pfe->usage_consumed = 1;
+
+    /* A P/D client that left, with its answer open or before any answer: the
+     * request's lifecycle record is aborted (9), the cause the request record
+     * names (client_abort, client_abort_before_answer), once. Not for one a
+     * leg's death or a reaper already recorded (they moved it out of the
+     * in-flight phases, or named another cause). */
+    if (u->owes_record && sp_end_client_left(u->end) &&
+        pd_reap_error_phase(pfe->pd_phase) >= 0) {
+      int64_t prefill_ms = 0;
+
+      if (pfe->pd_prefill_start_ns > 0 &&
+          pfe->pd_decode_start_ns > pfe->pd_prefill_start_ns) {
+        prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
+                                pfe->pd_prefill_start_ns) / 1000000ULL);
+      }
+      sp_pd_record(pfe, um_model ? um_model : "", prefill_ms, 0,
+                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*aborted*/);
+      pfe->pd_phase = PD_PHASE_ERROR;
+    }
   }
 
   /* A stream still open at teardown. The orderly close ends it when the
@@ -6752,6 +6791,15 @@ proxy_pdestroy(void *priv)
           if (cl && cl->sse_active && cl->stream_end_ts == 0 && !cl->abandon_reason) {
             cl->abandon_reason = ABANDON_BACKEND_DIED + 1;
           }
+          /* The leg the client's answer comes on, ending with the answer
+           * open: the engine ended it. Not an SGLang drain leg, whose bytes
+           * never reach the client, nor a P/D prefill leg: a P/D answer
+           * comes on the decode leg. */
+          if (cl && !cl->end_cause && !pfe->pd_sg_drain &&
+              (cl->pd_phase == PD_PHASE_NONE || pfe->is_pd_decode_backend) &&
+              atomic_load_explicit(&cl->cresp_answer_open, memory_order_relaxed)) {
+            cl->end_cause = SP_END_BACKEND_DIED;
+          }
         }
       }
       proxy_release_rfd_ctx(pfe);
@@ -6809,14 +6857,15 @@ proxy_pdestroy(void *priv)
     proxy_umiss_t *u = &settles.umiss[ui];
     if (u->owes_record) {
       llb_ai_record_request(u->tenant, u->model, u->status, u->latency_ms,
-                            u->prompt_toks, u->complet_toks, 0, 0, "",
+                            u->prompt_toks, u->complet_toks, 0, 0,
+                            (char *)sp_end_code(u->end),
                             u->request_id, u->user, u->key, u->svc_ident,
                             0, notify_worker_id(),
                             u->client_ip, u->origin_ip, u->trusted_hops,
                             u->auth_src, u->net_identity,
                             u->priority, u->class_info, u->objective);
-      log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d",
-               u->tenant, u->model, u->status);
+      log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d end=%s",
+               u->tenant, u->model, u->status, sp_end_code(u->end));
     }
     if (!u->owes_missing) {
       continue;
@@ -11912,6 +11961,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->stream_start_ts = 0;
   npfe1->bp_since = 0;
   npfe1->abandon_reason = 0;
+  npfe1->end_cause = 0;
   npfe1->stream_end_ts = 0;
   memset(npfe1->sse_tail, 0, sizeof(npfe1->sse_tail));
   npfe1->sse_tail_len = 0;
@@ -12553,6 +12603,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->stream_start_ts = 0;
     pfe->bp_since = 0;
     pfe->abandon_reason = 0;
+    pfe->end_cause = 0;
     pfe->stream_end_ts = 0;
     pfe->sse_tail_len = 0;
     pfe->pd_last_decode_ts = 0;
@@ -13899,6 +13950,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->stream_start_ts = 0;
           pfe->bp_since = 0;
           pfe->abandon_reason = 0;
+          pfe->end_cause = 0;
           pfe->stream_end_ts = 0;
           pfe->sse_tail_len = 0;
           pfe->pd_last_decode_ts = 0;

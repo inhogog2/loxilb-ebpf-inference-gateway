@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Every reaper that ends an answer the client was already receiving leaves
 exactly one request record (loxilb_ai_requests_total) with the status the
-client received: completed/200.
+client received, 200, and how it ended (error_code, sockproxy_end_cause.h):
+"" for the sweep's clean end (completed), the reaper's code for a cut
+(aborted). A client that leaves with its answer open is client_abort; one
+whose answer ended whole is "". A P/D client that leaves before any answer
+(the prefill, or the decode leg's first byte still to come) is
+client_abort_before_answer with status 0, none having been sent, and its P/D
+lifecycle record is aborted (9): the two families stay 1:1.
 
 The production reaper writers run on the owner worker (sp_reap_finish and
 sp_reap_record, sockproxy_health.c) with the production request recorders
@@ -37,18 +43,37 @@ for rec in ('proxy_collect_conn_settles', 'llb_ai_record_request', 'proxy_ai_rec
     assert rec not in td, 'pd_teardown_conn now records (%s): update this model' % rec
 pd = body(http, 'static void\nproxy_collect_conn_settles(')
 assert 'u->owes_record  = teardown_owes_completion(&v);' in pd
-assert re.search(r'if \(u->owes_record\) \{\s*llb_ai_record_request\(', http), \
-    'proxy_pdestroy no longer writes the record a teardown owes'
+assert re.search(r'if \(\(teardown_owes_completion\(&v\) \|\| teardown_owes_abort_record\(&v\) \|\|', pd), \
+    'the teardown no longer collects a request its client left before any answer'
+assert re.search(r'if \(u->end == SP_END_CLIENT_NO_ANSWER\) \{\s*u->owes_record = 1;\s*\}', pd), \
+    'the record of a request left before any answer is no longer owed: update this model'
+assert re.search(r'if \(u->owes_record && sp_end_client_left\(u->end\) &&\s*pd_reap_error_phase\(pfe->pd_phase\) >= 0\) \{'
+                 r'[\s\S]*?9 /\*aborted\*/\);\s*pfe->pd_phase = PD_PHASE_ERROR;', pd), \
+    'the P/D client leaving records aborted (9) differently: update this model'
+assert re.search(r'if \(u->owes_record\) \{\s*llb_ai_record_request\([^;]*\(char \*\)sp_end_code\(u->end\),', http), \
+    'proxy_pdestroy no longer writes the record a teardown owes, with its end'
+# The event loop's teardown reads the end as below (the model's teardown).
+tde = re.search(r'u->end = (sp_end_cause_at_teardown\(\s*pfe->end_cause, shape == TEARDOWN_LISTENER,\s*'
+                r'!pfe->h2_session &&\s*atomic_load_explicit\(&pfe->cresp_answer_open, memory_order_relaxed\),\s*'
+                r'teardown_owes_abort_record\(&v\)\));', pd)
+assert tde, 'the teardown reads the end differently: update this model'
+# The passes name the shutdown kinds' cuts before handing them off.
+for kind, cause in (('SP_REAP_SSE_CAP', 'SP_END_DURATION_CAP'), ('SP_REAP_SSE_STALL', 'SP_END_CLIENT_STALL')):
+    i = health.index('pd_reap_respond(pfe, %s);' % kind)
+    assert 'pfe->end_cause = %s;' % cause in health[i - 1500:i], kind
 
 t0 = health.index('typedef struct sp_reap_text {')
 t1 = health.index('\n};\n', health.index('[SP_REAP_SSE_STALL]', t0)) + 4
 reaper = (health[t0:t1] + body(health, 'static int\nsp_reap_client_chunked(')
           + body(health, 'static size_t\nsp_reap_body_frame(')
+          + body(health, 'static int\nsp_reap_end(')
           + body(health, 'static void\nsp_reap_record(')
           + body(health, 'void\nsp_reap_finish(proxy_fd_ent_t *pfe)'))
 a = http.index('static int\nproxy_owes_completion(')
 b = http.index('static const char *strnstr_portable', a)
-recorders = (http[a:b] + body(http, 'void\nproxy_record_local_completion(')
+pdleak = (root / 'sockproxy_pd_leak.h').read_text()
+recorders = (body(pdleak, 'static inline int\npd_reap_error_phase(')
+             + http[a:b] + body(http, 'void\nproxy_record_local_completion(')
              + body(http, 'static void\nproxy_teardown_view('))
 
 prefix = r'''
@@ -62,6 +87,7 @@ prefix = r'''
 #include <sys/types.h>
 #include "llhttp.h"
 #include "sockproxy_teardown_settle.h"
+#include "sockproxy_end_cause.h"
 #define log_warn(...) ((void)0)
 #define log_error(...) ((void)0)
 #define log_debug(...) ((void)0)
@@ -73,8 +99,8 @@ typedef struct proxy_fd_ent proxy_fd_ent_t;
 struct proxy_fd_ent {
   int fd, odir, ai_gw_mode, metric_ai_recorded, metric_response_status, noted, fc;
   int usage_reserved_toks, usage_consumed, usage_prompt_toks, usage_complet_toks;
-  int auth_src, adm_priority, adm_class_set, adm_class, adm_objective_denied, adm_hint_not_applied;
-  void *h2_session; uint8_t sse_active, reap_resp; time_t stream_start_ts;
+  int auth_src, adm_priority, adm_class_set, adm_class, adm_objective_denied, adm_hint_not_applied, pd_phase;
+  void *h2_session; uint8_t sse_active, reap_resp, end_cause; time_t stream_start_ts;
   _Atomic uint8_t cresp_in_msg, cresp_answer_open; llhttp_t cresp_parser;
   uint64_t metric_req_start_ns;
   char tenant_id[32], auth_user_id[32], auth_key_id[32], l7_peer_ip[32];
@@ -83,11 +109,13 @@ struct proxy_fd_ent {
 enum { SP_REAP_NONE = 0, SP_REAP_SSE_CAP, SP_REAP_PD_PREFILL_TIMEOUT, SP_REAP_PD_DECODE_TIMEOUT,
   SP_REAP_PD_PARK_TIMEOUT, SP_REAP_PD_GRACEFUL_DONE, SP_REAP_PD_STREAM_TIMEOUT, SP_REAP_PD_IDLE_TIMEOUT,
   SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED, SP_REAP_SSE_STALL, SP_REAP_KINDS };
-static int records, record_status, record_stream, freed_inline;
-static void capture(int status, int stream) { records++; record_status = status; record_stream = stream; }
+static int records, record_status, record_stream, freed_inline, pd_aborted;
+static char record_code[64];
+static void capture(int status, int stream, const char *code) {
+  records++; record_status = status; record_stream = stream; snprintf(record_code, sizeof(record_code), "%s", code); }
 #define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj) \
  ((void)(t),(void)(m),(void)(lat),(void)(ti),(void)(to),(void)(r),(void)(u),(void)(k),(void)(svc),(void)(worker), \
-  (void)(peer),(void)(origin),(void)(hops),(void)(auth),(void)(net),(void)(prio),(void)(cls),(void)(obj),capture(st,stream))
+  (void)(peer),(void)(origin),(void)(hops),(void)(auth),(void)(net),(void)(prio),(void)(cls),(void)(obj),capture(st,stream,c))
 static uint64_t get_timestamp_ns(void) { return 2000000; }
 static const char *proxy_effective_model(proxy_fd_ent_t *p) { return p->model; }
 static const char *proxy_request_id(proxy_fd_ent_t *p) { return p->request_id; }
@@ -122,6 +150,7 @@ static const char *kname(int k) {
   case SP_REAP_PD_IDLE_TIMEOUT: return "generic idle reaper";
   case SP_REAP_SSE_CAP: return "duration cap";
   case SP_REAP_SSE_STALL: return "stalled client";
+  case SP_REAP_NONE: return "the client leaving";
   default: return "?";
   }
 }
@@ -143,37 +172,73 @@ static proxy_fd_ent_t client(int answered) {
   }
   return c;
 }
-/* The reaper's hand-off on the owner worker, then the end of the connection. */
+/* The event loop's proxy_pdestroy: it settles what the connection owes, with
+ * the end it reads (as the source reads it, checked above). */
+static void event_loop_teardown_(proxy_fd_ent_t *c, int shape) {
+  teardown_conn_t v;
+  int owes, end;
+  proxy_teardown_view(c, &v);
+  if (!teardown_conn_owes_settle(shape, &v) ||
+      !(teardown_owes_completion(&v) || teardown_owes_abort_record(&v)))
+    return;
+  owes = teardown_owes_completion(&v);
+  end = sp_end_cause_at_teardown(c->end_cause, shape == TEARDOWN_LISTENER,
+                                 !c->h2_session && atomic_load(&c->cresp_answer_open),
+                                 teardown_owes_abort_record(&v));
+  if (end == SP_END_CLIENT_NO_ANSWER) owes = 1;
+  c->metric_ai_recorded = 1;
+  if (owes && sp_end_client_left(end) && pd_reap_error_phase(c->pd_phase) >= 0) {
+    pd_aborted++; c->pd_phase = 7;   /* aborted (9), then ERROR */
+  }
+  if (owes) capture(c->metric_response_status, 0, sp_end_code(end));
+}
+static void event_loop_teardown(proxy_fd_ent_t *c) { event_loop_teardown_(c, TEARDOWN_CONN); }
+/* The reaper's hand-off on the owner worker, then the end of the connection.
+ * SP_REAP_NONE: no reaper, the client leaves. */
 static void reap(proxy_fd_ent_t *c, int k) {
-  records = 0; freed_inline = 0;
+  records = 0; freed_inline = 0; record_code[0] = 0; pd_aborted = 0;
   c->sse_active = 0;   /* every body kind's reaper ends the stream gauge first */
+  if (k == SP_REAP_SSE_CAP) c->end_cause = SP_END_DURATION_CAP;    /* the pass names the cut */
+  if (k == SP_REAP_SSE_STALL) c->end_cause = SP_END_CLIENT_STALL;
+  if (k == SP_REAP_NONE) { event_loop_teardown(c); return; }
   c->reap_resp = (uint8_t)k;
   sp_reap_finish(c);
   if (!sp_reap_texts[k].teardown) {
-    /* a shutdown: the event loop's proxy_pdestroy settles what is owed */
-    teardown_conn_t v;
-    proxy_teardown_view(c, &v);
-    if (teardown_conn_owes_settle(TEARDOWN_CONN, &v) && teardown_owes_completion(&v)) {
-      capture(c->metric_response_status, 0);
-      c->metric_ai_recorded = 1;
-    }
+    event_loop_teardown(c);   /* a shutdown: the event loop settles what is owed */
   } else {
     assert(freed_inline == 1);
   }
 }
 int main(void) {
-  static const int kinds[] = { SP_REAP_PD_GRACEFUL_DONE, SP_REAP_PD_STREAM_TIMEOUT,
-                               SP_REAP_PD_IDLE_TIMEOUT, SP_REAP_SSE_CAP, SP_REAP_SSE_STALL };
+  static const struct { int k; const char *code; } kinds[] = {
+    { SP_REAP_PD_GRACEFUL_DONE, "" },
+    { SP_REAP_PD_STREAM_TIMEOUT, "pd_decode_stream_timeout" },
+    { SP_REAP_PD_IDLE_TIMEOUT, "pd_idle_timeout" },
+    { SP_REAP_SSE_CAP, "max_stream_duration_exceeded" },
+    { SP_REAP_SSE_STALL, "client_stall" },
+    { SP_REAP_NONE, "client_abort" },
+  };
   int bad = 0;
   for (unsigned i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
-    int k = kinds[i];
+    int k = kinds[i].k;
     proxy_fd_ent_t c = client(1);
     reap(&c, k);
     if (records)
-      printf("  after a 200: %-24s -> %d request record(s), status %d\n", kname(k), records, record_status);
+      printf("  after a 200: %-24s -> %d request record(s), status %d, error_code \"%s\" (%s)\n", kname(k),
+             records, record_status, record_code, record_code[0] ? "aborted" : "completed");
     else
       printf("  after a 200: %-24s -> no request record\n", kname(k));
-    if (records != 1 || record_status != 200) bad = 1;
+    if (records != 1 || record_status != 200 || strcmp(record_code, kinds[i].code) != 0) bad = 1;
+  }
+  /* The client leaves after its answer ended whole (the record still waited
+   * for a usage object): completed, no end. */
+  {
+    proxy_fd_ent_t c = client(1);
+    atomic_store(&c.cresp_in_msg, 0); atomic_store(&c.cresp_answer_open, 0);
+    reap(&c, SP_REAP_NONE);
+    printf("  answer whole, then the client leaves -> %d request record(s), status %d, error_code \"%s\"\n",
+           records, record_status, record_code);
+    if (records != 1 || record_status != 200 || record_code[0]) bad = 1;
   }
   /* The twins: the same reapers before any answer began write their own
    * status, once (the SSE kinds have no answer to end there). */
@@ -184,13 +249,61 @@ int main(void) {
     for (unsigned i = 0; i < sizeof(twin) / sizeof(twin[0]); i++) {
       proxy_fd_ent_t c = client(0);
       reap(&c, twin[i].k);
-      printf("  no answer yet: %-23s -> %d request record(s), status %d\n", kname(twin[i].k),
-             records, record_status);
-      if (records != 1 || record_status != twin[i].status) bad = 1;
+      printf("  no answer yet: %-23s -> %d request record(s), status %d, error_code \"%s\"\n",
+             kname(twin[i].k), records, record_status, record_code);
+      if (records != 1 || record_status != twin[i].status || record_code[0]) bad = 1;
     }
   }
-  if (bad) { puts("FAIL: a reaped answer has no request record, or more than one"); return 1; }
-  puts("reaped answers: every reaper after a 200 leaves one request record, completed/200; before an answer, its own status, once PASS");
+  /* A P/D client that leaves: before any answer (the prefill, the decode
+   * leg's first byte still to come) its request record is status 0,
+   * client_abort_before_answer, and its lifecycle record aborted (9); with
+   * its answer open, client_abort and 9. One of each. A listener going before
+   * any answer records neither (no lifecycle value pairs with it); a request
+   * that is not P/D and has no status is not this record's. */
+  {
+    static const struct { const char *what; int pd_phase, answered, shape, records, status, pd9; const char *code; } left[] = {
+      { "P/D prefill, the client leaves", 2, 0, TEARDOWN_CONN, 1, 0, 1, "client_abort_before_answer" },
+      { "P/D decode sent, no byte yet", 4, 0, TEARDOWN_CONN, 1, 0, 1, "client_abort_before_answer" },
+      { "P/D answer open, the client leaves", 5, 1, TEARDOWN_CONN, 1, 200, 1, "client_abort" },
+      { "P/D prefill, the listener goes", 2, 0, TEARDOWN_LISTENER, 0, 0, 0, "" },
+      { "P/D already recorded (ERROR)", 7, 0, TEARDOWN_CONN, 0, 0, 0, "" },
+      { "not P/D, no status yet", 0, 0, TEARDOWN_CONN, 0, 0, 0, "" },
+    };
+    for (unsigned i = 0; i < sizeof(left) / sizeof(left[0]); i++) {
+      proxy_fd_ent_t c = client(left[i].answered);
+      c.pd_phase = left[i].pd_phase;
+      records = 0; record_status = 0; record_code[0] = 0; pd_aborted = 0;
+      event_loop_teardown_(&c, left[i].shape);
+      event_loop_teardown_(&c, left[i].shape);   /* a second walk owes nothing */
+      printf("  %-36s -> %d request record(s), status %d, error_code \"%s\"; %d aborted (9)\n",
+             left[i].what, records, record_status, record_code, pd_aborted);
+      if (records != left[i].records || pd_aborted != left[i].pd9 ||
+          (records && (record_status != left[i].status || strcmp(record_code, left[i].code) != 0)))
+        bad = 1;
+    }
+  }
+  /* The teardown's reading, case by case: a recorded end wins, an open answer
+   * is the client leaving (the gateway when the whole listener goes), a P/D
+   * request before any answer the client leaving before it (nothing when the
+   * listener goes), a whole one has no end. */
+  if (sp_end_cause_at_teardown(SP_END_CLIENT_STALL, 0, 0, 0) != SP_END_CLIENT_STALL ||
+      sp_end_cause_at_teardown(SP_END_BACKEND_DIED, 1, 1, 0) != SP_END_BACKEND_DIED ||
+      sp_end_cause_at_teardown(SP_END_NONE, 0, 1, 0) != SP_END_CLIENT_GONE ||
+      sp_end_cause_at_teardown(SP_END_NONE, 1, 1, 0) != SP_END_LISTENER_CLOSED ||
+      sp_end_cause_at_teardown(SP_END_NONE, 1, 0, 0) != SP_END_NONE ||
+      sp_end_cause_at_teardown(SP_END_NONE, 0, 0, 1) != SP_END_CLIENT_NO_ANSWER ||
+      sp_end_cause_at_teardown(SP_END_NONE, 1, 0, 1) != SP_END_NONE ||
+      sp_end_cause_at_teardown(SP_END_CAUSES, 0, 0, 0) != SP_END_NONE ||
+      !sp_end_client_left(SP_END_CLIENT_NO_ANSWER) || !sp_end_client_left(SP_END_CLIENT_GONE) ||
+      sp_end_client_left(SP_END_CLIENT_STALL) ||
+      strcmp(sp_end_code(SP_END_LISTENER_CLOSED), "listener_closed") != 0 ||
+      strcmp(sp_end_code(SP_END_CLIENT_NO_ANSWER), "client_abort_before_answer") != 0 ||
+      strcmp(sp_end_codes[SP_END_CLIENT_NO_ANSWER].cause, "client") != 0 ||
+      sp_end_code(SP_END_CAUSES)[0] != 0) {
+    puts("FAIL: sp_end_cause_at_teardown / sp_end_code"); bad = 1;
+  }
+  if (bad) { puts("FAIL: a reaped answer has no request record, more than one, or the wrong end"); return 1; }
+  puts("reaped answers: every reaper after a 200 leaves one request record, 200, named by its end (the sweep's clean end completed, a cut aborted); before an answer, its own status, once; a P/D client leaving at any stage, one request record and one aborted (9) PASS");
   return 0;
 }
 '''

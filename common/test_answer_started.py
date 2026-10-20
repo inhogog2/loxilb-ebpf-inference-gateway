@@ -128,6 +128,7 @@ enum { SP_REAP_NONE = 0, SP_REAP_SSE_CAP, SP_REAP_PD_PREFILL_TIMEOUT, SP_REAP_PD
   SP_REAP_PD_PARK_TIMEOUT, SP_REAP_PD_GRACEFUL_DONE, SP_REAP_PD_STREAM_TIMEOUT, SP_REAP_PD_IDLE_TIMEOUT,
   SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED, SP_REAP_SSE_STALL, SP_REAP_KINDS };
 static struct { void *ns; } proxy_struct_v = { (void *)1 }, *proxy_struct = &proxy_struct_v;
+static struct { _Atomic unsigned long long reap_fallback; } global_stats;
 static int owner = 1, ended, teardowns, recorded;
 static int notify_owner_thr(void *ns, int fd) { (void)ns; (void)fd; return owner; }
 static int notify_wake_worker(void *ns, int o, int fd) { (void)ns; (void)o; (void)fd; return -1; }

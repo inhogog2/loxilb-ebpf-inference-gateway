@@ -237,6 +237,8 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_terminator_synthesized; // graceful-[DONE] sweep wrote the terminator the engine never sent
+    _Atomic uint64_t reap_fallback;             // a reaper ended a client from the health thread: its owner worker could not be handed the end
+    _Atomic uint64_t route_host_missing;        // a request with no usable Host reached dispatch on a listener whose pools name models
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     // Same-EP reconnect on transient backend connect failure (affinity-bearing
     // services only — P/D disagg / KV-exact). A retry that succeeds keeps the
@@ -1619,6 +1621,10 @@ struct proxy_fd_ent {
   uint8_t  abandon_reason;            // enum abandon_reason + 1 when the end of an open stream is
                                       // already attributed (backend died, stall abort); 0 = a
                                       // teardown with the stream open is the client leaving
+  uint8_t  end_cause;                 // enum sp_end_cause: why this request's answer ended before
+                                      // the client had all of it, when that is known as it ends
+                                      // (a reaper's cut, a stall, its leg dying under it); 0 = the
+                                      // teardown decides (sockproxy_end_cause.h)
   uint64_t stream_start_mono_ns;      // CLOCK_MONOTONIC stamp at SSE activation; latency source for
                                       // llb_ai_record_request (wall-clock seconds truncated sub-second
                                       // streams to 0 and NTP steps could skew/negate the delta)

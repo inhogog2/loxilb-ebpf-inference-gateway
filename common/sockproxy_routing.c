@@ -283,10 +283,65 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
   return best_match;
 }
 
+/* The model a pool was added for: the third field of its key
+ * (build_ephash_key: "host|path|model" or "host||model"), "" for a wildcard
+ * pool. */
+static const char *
+sp_pool_key_model(const proxy_epval_t *p)
+{
+  const char *sep = strchr(p->ephash_key, '|');
+
+  sep = sep ? strchr(sep + 1, '|') : NULL;
+  return sep ? sep + 1 : "";
+}
+
+/* The pool of a request that reached dispatch with no usable Host (ROUTE-01's
+ * second defence). The listener's first pool is whatever rule was added first,
+ * so on a listener whose pools name models it would serve the request from
+ * another model's engine. There the request goes to the pool that names its
+ * model (exact name, the first in the table's order), or is refused when none
+ * does or it names none. A listener with no model pool keeps the first pool,
+ * as before: a plain rule, or a raw TCP stream, has no Host to lose.
+ * *pool is NULL on a refusal and when the listener has no pool. */
+int
+sp_route_hostless(const proxy_map_ent_t *ent, const char *model,
+                  proxy_epval_t **pool)
+{
+  const sp_pool_index_t *ix = sp_pool_index(ent);
+  proxy_epval_t *named = NULL;
+  int any_model = 0;
+
+  *pool = NULL;
+  if (!ix) {
+    return SP_HOSTLESS_FIRST;
+  }
+  for (uint32_t i = 0; i < ix->n; i++) {
+    proxy_epval_t *p = ix->order[i];
+    const char *pm = sp_pool_key_model(p);
+
+    if (pm[0] == '\0') {
+      continue;
+    }
+    any_model = 1;
+    if (!named && model && model[0] != '\0' && strcmp(pm, model) == 0) {
+      named = p;
+    }
+  }
+  if (!any_model) {
+    *pool = ix->first;
+    return SP_HOSTLESS_FIRST;
+  }
+  if (!named) {
+    return SP_HOSTLESS_REFUSE;
+  }
+  *pool = named;
+  return SP_HOSTLESS_MODEL;
+}
+
 /* The default reservation of the pool a request's host, path and model
  * select: the lookup dispatch runs, read for one field. host NULL = no
- * usable Host, where dispatch takes the listener's first pool. 0 when no
- * pool matches. */
+ * usable Host, where dispatch asks sp_route_hostless. 0 when no pool
+ * matches. */
 int
 sp_resv_default_tokens_route(proxy_map_ent_t *ent, const char *host,
                              const char *path, const char *model)
@@ -296,7 +351,7 @@ sp_resv_default_tokens_route(proxy_map_ent_t *ent, const char *host,
   if (!ent)
     return 0;
   if (!host)
-    ep = sp_pool_first(ent);
+    sp_route_hostless(ent, model, &ep);
   else
     ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
   return ep ? (int)ep->ai_default_tokens : 0;
@@ -313,7 +368,7 @@ sp_resv_objective_strict_route(proxy_map_ent_t *ent, const char *host,
   if (!ent)
     return 0;
   if (!host)
-    ep = sp_pool_first(ent);
+    sp_route_hostless(ent, model, &ep);
   else
     ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
   return ep ? (int)ep->ai_objective_strict : 0;

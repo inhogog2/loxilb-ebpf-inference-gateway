@@ -210,7 +210,7 @@ int sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
 void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                              const char *code);
 void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status);
-void proxy_record_reaped_answer(proxy_fd_ent_t *pfe);
+void proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end);
 void sp_pd_record(proxy_fd_ent_t *pfe, const char *model, int64_t prefill_ms,
                   int64_t decode_ms, int kv, int error_phase);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
@@ -269,8 +269,8 @@ void sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind);
 /* The default reservation of the rule a request routes to, for the
  * admission gate (ai_gw_req_ctx_t.default_tokens_of): the pool the listener's
  * host, path and model lookup selects, exactly as dispatch will select it.
- * host NULL = the request carried no usable Host, and dispatch takes the
- * listener's first pool. 0 when no pool matches (the request is refused at
+ * host NULL = the request carried no usable Host, and dispatch takes the pool
+ * sp_route_hostless names. 0 when no pool matches (the request is refused at
  * dispatch). An L7 policy that forwards to another pool is not followed. */
 typedef struct sp_resv_route {
   proxy_map_ent_t *ent;

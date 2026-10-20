@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* The header defines pd_teardown_legs() as a static inline that dereferences
@@ -349,44 +350,57 @@ test_resp_error_excerpt(void)
   printf("  [PASS] pd_resp_error_excerpt: message of either shape, else body; bounded\n");
 }
 
-/* pd_prefill_status_verdict: an origin 4xx prefill reply is relayed verbatim
- * and decode is not called; a 5xx, a 408 and a 429 keep the decode-recompute
- * degradation; an unknown status is neither; a truncated reply is never
- * relayed. */
+/* pd_prefill_status_verdict: an origin 4xx prefill reply is relayed and
+ * decode is not called, cut at the buffer cap or not (F-12); a 5xx, a 408
+ * and a 429 keep the decode-recompute degradation; an unknown status is
+ * neither. pd_prefill_cut_reject is what a cut 4xx is relayed as. */
 static void
 test_prefill_status_verdict(void)
 {
-  assert(pd_prefill_status_verdict(0, 0)   == PD_PR_DECODE && "unknown -> decode");
-  assert(pd_prefill_status_verdict(200, 0) == PD_PR_DECODE);
-  assert(pd_prefill_status_verdict(204, 0) == PD_PR_DECODE);
-  assert(pd_prefill_status_verdict(301, 0) == PD_PR_DECODE);
-  assert(pd_prefill_status_verdict(399, 0) == PD_PR_DECODE);
-  assert(pd_prefill_status_verdict(400, 0) == PD_PR_RELAY);
-  assert(pd_prefill_status_verdict(404, 0) == PD_PR_RELAY && "unknown model is a reject");
-  assert(pd_prefill_status_verdict(408, 0) == PD_PR_DECODE && "engine timeout is transient");
-  assert(pd_prefill_status_verdict(409, 0) == PD_PR_RELAY);
-  assert(pd_prefill_status_verdict(413, 0) == PD_PR_RELAY);
-  assert(pd_prefill_status_verdict(422, 0) == PD_PR_RELAY);
-  assert(pd_prefill_status_verdict(429, 0) == PD_PR_DECODE && "engine backpressure is transient");
-  assert(pd_prefill_status_verdict(499, 0) == PD_PR_RELAY);
-  assert(pd_prefill_status_verdict(404, 1) == PD_PR_DECODE &&
-         "a truncated reply is not the origin's response: never relayed");
-  assert(pd_prefill_status_verdict(500, 0) == PD_PR_DECODE && "5xx keeps decode recompute");
-  assert(pd_prefill_status_verdict(503, 0) == PD_PR_DECODE);
-  assert(pd_prefill_status_verdict(599, 0) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(0)   == PD_PR_DECODE && "unknown -> decode");
+  assert(pd_prefill_status_verdict(200) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(204) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(301) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(399) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(400) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(404) == PD_PR_RELAY && "unknown model is a reject");
+  assert(pd_prefill_status_verdict(408) == PD_PR_DECODE && "engine timeout is transient");
+  assert(pd_prefill_status_verdict(409) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(413) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(422) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(429) == PD_PR_DECODE && "engine backpressure is transient");
+  assert(pd_prefill_status_verdict(499) == PD_PR_RELAY);
+  {
+    /* a cut 4xx: the engine's status, the gateway's body, framed by length */
+    char out[384];
+    size_t n = pd_prefill_cut_reject(404, out, sizeof(out));
+    const char *body;
+    assert(n > 0 && n == strlen(out));
+    assert(strncmp(out, "HTTP/1.1 404 Not Found\r\n", 24) == 0);
+    body = strstr(out, "\r\n\r\n");
+    assert(body && strstr(out, "Content-Length: ") &&
+           (size_t)atoi(strstr(out, "Content-Length: ") + 16) == strlen(body + 4));
+    assert(strstr(body, "\"error\":\"prefill_rejected\",\"status\":404"));
+    assert(pd_prefill_cut_reject(499, out, sizeof(out)) > 0 &&
+           strncmp(out, "HTTP/1.1 499 Client Error\r\n", 27) == 0);
+    assert(pd_prefill_cut_reject(404, out, 40) == 0 && "no room: nothing");
+  }
+  assert(pd_prefill_status_verdict(500) == PD_PR_DECODE && "5xx keeps decode recompute");
+  assert(pd_prefill_status_verdict(503) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(599) == PD_PR_DECODE);
   /* composed with the parser, as pd_initiate_decode uses them */
   {
     static const char nf404[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\n{}";
     static const char ok200[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
     assert(pd_prefill_status_verdict(
-               pd_http_resp_status((const uint8_t *)nf404, sizeof(nf404) - 1), 0) == PD_PR_RELAY);
+               pd_http_resp_status((const uint8_t *)nf404, sizeof(nf404) - 1)) == PD_PR_RELAY);
     assert(pd_prefill_status_verdict(
-               pd_http_resp_status((const uint8_t *)ok200, sizeof(ok200) - 1), 0) == PD_PR_DECODE);
+               pd_http_resp_status((const uint8_t *)ok200, sizeof(ok200) - 1)) == PD_PR_DECODE);
     assert(pd_prefill_status_verdict(
-               pd_http_resp_status((const uint8_t *)"HTTP/1.1 40", 11), 0) == PD_PR_DECODE &&
+               pd_http_resp_status((const uint8_t *)"HTTP/1.1 40", 11)) == PD_PR_DECODE &&
            "an unparsable status line is unknown, not a reject");
   }
-  printf("  [PASS] pd_prefill_status_verdict: 4xx relay, 5xx/408/429/unknown/truncated decode\n");
+  printf("  [PASS] pd_prefill_status_verdict: 4xx relay (cut: by status, gateway body), 5xx/408/429/unknown decode\n");
 }
 
 /* pd_decode_error_phase: a completed decode leg is recorded by the status its
@@ -414,8 +428,8 @@ test_decode_error_phase(void)
 
 /* pd_prefill_fallback_reason: the condition that forced the fallback, in
  * verdict order. The status is the reason when it alone forces decode, cut or
- * not; a reply that would have been used or relayed is truncated only because
- * it was cut; a reply that is no status at all is no_status; 1xx/3xx other. */
+ * not; a reply that would have been used is truncated only because it was
+ * cut (a cut 4xx is relayed, never a fallback); a reply that is no status at all is no_status; 1xx/3xx other. */
 static void
 test_prefill_fallback_reason(void)
 {
@@ -425,9 +439,10 @@ test_prefill_fallback_reason(void)
     { 429, 0, PD_FB_ORIGIN_429 }, { 429, 1, PD_FB_ORIGIN_429 },
     {   0, 0, PD_FB_NO_STATUS },  {   0, 1, PD_FB_NO_STATUS },
     { 100, 0, PD_FB_OTHER },      { 301, 0, PD_FB_OTHER },      { 304, 1, PD_FB_OTHER },
-    { 200, 1, PD_FB_TRUNCATED },  { 404, 1, PD_FB_TRUNCATED },  { 422, 1, PD_FB_TRUNCATED },
+    { 200, 1, PD_FB_TRUNCATED },  { 204, 1, PD_FB_TRUNCATED },
     { 200, 0, PD_FB_NONE },       { 204, 0, PD_FB_NONE },
     { 404, 0, PD_FB_NONE },       /* relayed: never reaches the decode leg */
+    { 404, 1, PD_FB_NONE },       { 422, 1, PD_FB_NONE },  /* relayed by status (F-12) */
   };
   for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
     int got = pd_prefill_fallback_reason(cases[i].status, cases[i].cut);
@@ -438,11 +453,11 @@ test_prefill_fallback_reason(void)
     }
     /* a reason exactly when the verdict sends the reply to decode and the
      * reply was not a clean 2xx */
-    int to_decode = pd_prefill_status_verdict(cases[i].status, cases[i].cut) == PD_PR_DECODE;
+    int to_decode = pd_prefill_status_verdict(cases[i].status) == PD_PR_DECODE;
     int clean = cases[i].status >= 200 && cases[i].status < 300 && !cases[i].cut;
     assert((got != PD_FB_NONE) == (to_decode && !clean));
   }
-  printf("  [PASS] pd_prefill_fallback_reason: status first (5xx/408/429/none/other), truncated only for a cut usable reply\n");
+  printf("  [PASS] pd_prefill_fallback_reason: status first (5xx/408/429/none/other), truncated only for a cut 2xx\n");
 }
 
 /* pd_reap_error_phase: a request a reaper ends is named by the phase it was

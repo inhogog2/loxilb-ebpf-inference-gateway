@@ -91,11 +91,20 @@ pd_receipt_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
 static void
 pd_prefill_reject_relay(proxy_fd_ent_t *client_pfe, const uint8_t *resp,
                         size_t resp_len, int status, int is_trt,
-                        size_t orig_body_len)
+                        size_t orig_body_len, int truncated)
 {
   char engine_err[160];
+  char cut[384];
 
   pd_resp_error_excerpt(resp, resp_len, engine_err, sizeof(engine_err));
+  /* A reply cut at the buffer cap is not the engine's whole response: the
+   * client gets its status and a short gateway body instead of the cut one. */
+  if (truncated) {
+    size_t cl = pd_prefill_cut_reject(status, cut, sizeof(cut));
+
+    resp = cl ? (const uint8_t *)cut : NULL;
+    resp_len = cl;
+  }
   proxy_note_client_response(client_pfe, (uint16_t)status);
   if (client_pfe->fd > 0 && resp && resp_len > 0) {
     if (client_pfe->ssl) {
@@ -104,9 +113,10 @@ pd_prefill_reject_relay(proxy_fd_ent_t *client_pfe, const uint8_t *resp,
       send(client_pfe->fd, resp, resp_len, MSG_DONTWAIT | MSG_NOSIGNAL);
     }
   }
-  log_warn("prefill EP%d answered origin %d — relaying it verbatim, no decode "
+  log_warn("prefill EP%d answered origin %d — relaying it %s, no decode "
            "leg (client_fd=%d rewrite=%s failover=%u body=%zu->%zu "
            "engine=\"%s\")", client_pfe->pd_prefill_ep_idx, status,
+           truncated ? "by its status (reply cut at the buffer cap)" : "verbatim",
            client_pfe->fd,
            is_trt ? "trtllm-context-splice"
                   : "vllm-probe(max_tokens=1,stream=false,+kv_transfer_params)",
@@ -235,12 +245,13 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 
   int is_trt = (tepval->pd_engine == PD_ENGINE_TRTLLM);
 
-  /* An origin 4xx answers the request: relay it verbatim and do not call the
-   * decode leg (pd_prefill_status_verdict). A 5xx, a 408 or 429 and an unknown
-   * status keep the decode-recompute degradation below. */
-  if (pd_prefill_status_verdict(pr_status, l_prefill_truncated) == PD_PR_RELAY) {
+  /* An origin 4xx answers the request: relay it, verbatim or (cut at the
+   * buffer cap) by its status, and do not call the decode leg
+   * (pd_prefill_status_verdict). A 5xx, a 408 or 429 and an unknown status
+   * keep the decode-recompute degradation below. */
+  if (pd_prefill_status_verdict(pr_status) == PD_PR_RELAY) {
     pd_prefill_reject_relay(client_pfe, l_prefill, l_prefill_len, pr_status,
-                            is_trt, l_body_len);
+                            is_trt, l_body_len, l_prefill_truncated);
     ret = PD_DECODE_ANSWERED;
     goto out;
   }

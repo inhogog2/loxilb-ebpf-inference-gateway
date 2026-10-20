@@ -55,6 +55,7 @@ static int checks, failures;
 
 static proxy_struct_t pstruct;
 proxy_struct_t *proxy_struct = &pstruct;
+proxy_global_stats_t global_stats;
 
 /* The teardown primitives the force-close calls, recorded. A reset release
  * unlinks the entry from its rule's list, as the real one does. */
@@ -92,19 +93,22 @@ proxy_try_free_fd_ctx(proxy_fd_ent_t *e)
   freed[n_freed++] = e;
 }
 
-/* The reaper's hand-off: the owner is found and woken. */
+/* The reaper's hand-off: the owner is found and woken, unless a case says
+ * otherwise. */
+static int owner_rc = 3, wake_rc;
+
 int
 notify_owner_thr(void *ctx, int fd)
 {
   (void)ctx; (void)fd;
-  return 3;
+  return owner_rc;
 }
 
 int
 notify_wake_worker(void *ctx, int thr, int fd)
 {
   (void)ctx; (void)thr; (void)fd;
-  return 0;
+  return wake_rc;
 }
 
 /* The causes recorded for an HTTP/2 client's end line, as called. */
@@ -128,6 +132,18 @@ void
 proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
 {
   (void)pfe;
+}
+
+/* The active-streams gauge, as ended. An inline free skips proxy_pdestroy,
+ * whose settle would end a stream still open, so the teardown ends it. */
+static int n_stream_ends;
+
+int
+llb_ai_stream_end(char *tenant_id, char *model_name)
+{
+  (void)tenant_id; (void)model_name;
+  n_stream_ends++;
+  return 0;
 }
 
 /* The reaper's fallback asks whether an answer is in progress; none is
@@ -277,6 +293,36 @@ main(void)
   CHECK(w_deregs >= 1 && w_deregs <= 2 && !was(freed, n_freed, &w) && linked(&ent, &w),
         "a client a worker already claimed is passed, at most once per scan (%d tries)", w_deregs);
 
+  /* A reaper that reaches an open stream (ERR-01, the idle reaper) frees the
+   * client inline: its stream ends there, once. A client a worker already
+   * claimed is ended by that worker's settle; a pair torn down through its
+   * leg ends the client's stream in the leg loop. */
+  {
+    proxy_map_ent_t ent4;
+    proxy_fd_ent_t sc, sl, wc, wcl, lc, ll;
+
+    memset(&ent4, 0, sizeof(ent4));
+    mk(&ent4, &sc, 0, EP);
+    mk(&ent4, &sl, 1, -1);
+    pair(&sc, &sl, 0);
+    mk(&ent4, &wc, 0, EP);
+    mk(&ent4, &wcl, 1, -1);
+    pair(&wc, &wcl, 0);
+    mk(&ent4, &lc, 0, -1);
+    mk(&ent4, &ll, 1, EP);
+    pair(&lc, &ll, 0);
+    sc.sse_active = wc.sse_active = lc.sse_active = 1;
+    w_fd = wc.fd;
+    n_stream_ends = 0;
+    CHECK(pd_teardown_conn(&sc) == 1 && n_stream_ends == 1 && !sc.sse_active,
+          "a client with an open stream, freed inline, ends its stream once");
+    CHECK(pd_teardown_conn(&wc) == 0 && n_stream_ends == 1 && wc.sse_active,
+          "a client a worker already claimed keeps it for that worker's settle");
+    CHECK(pd_teardown_conn(&ll) == 1 && n_stream_ends == 2 && !lc.sse_active,
+          "a pair torn down through its leg ends the client's stream once");
+    w_fd = -1;
+  }
+
   /* The reaper's fallback (its owner could not be woken) hands a client to
    * pd_teardown_conn itself; an HTTP/2 client with no leg left has no peer
    * to recognise it by. */
@@ -314,6 +360,34 @@ main(void)
     pstruct.ns = NULL;
     CHECK(rc.reap_resp == SP_REAP_PD_PARK_TIMEOUT && marked(&rc, SP_H2_END_REAPER, NULL),
           "a reaped client handed to its owner is recorded as the reaper's end");
+    CHECK(atomic_load(&global_stats.reap_fallback) == 0,
+          "and the hand-off is not counted as a fallback");
+  }
+
+  /* A client whose owner cannot be handed the end (the wake fails, or no
+   * owner) is ended from here, and each such end is counted. */
+  {
+    proxy_map_ent_t ent5;
+    proxy_fd_ent_t fa, fb;
+
+    memset(&ent5, 0, sizeof(ent5));
+    mk(&ent5, &fa, 0, EP);
+    mk(&ent5, &fb, 0, EP);
+    pstruct.ns = &pstruct;
+    n_freed = 0;
+    wake_rc = -1;
+    pd_reap_respond(&fa, SP_REAP_PD_IDLE_TIMEOUT);
+    wake_rc = 0;
+    owner_rc = -1;
+    pd_reap_respond(&fb, SP_REAP_SSE_CAP);
+    owner_rc = 3;
+    pstruct.ns = NULL;
+    CHECK(fa.reap_resp == SP_REAP_NONE && was(freed, n_freed, &fa) &&
+          fb.reap_resp == SP_REAP_NONE && !was(freed, n_freed, &fb),
+          "a failed wake and a missing owner are ended from the health thread");
+    CHECK(atomic_load(&global_stats.reap_fallback) == 2,
+          "and both are counted (%llu)",
+          (unsigned long long)atomic_load(&global_stats.reap_fallback));
   }
 
   printf("%d checks, %d failures\n", checks, failures);

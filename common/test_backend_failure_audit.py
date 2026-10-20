@@ -15,6 +15,7 @@ prefix = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "sockproxy_end_cause.h"
 typedef struct {
  int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc, noted;
  uint64_t metric_req_start_ns;
@@ -27,7 +28,7 @@ typedef struct {
  struct { char model[32]; } prefix_key;
 } proxy_fd_ent_t;
 static int emitted, released, sent, send_rc, observed_status;
-static char observed_request[32], observed_tenant[32], observed_key[32];
+static char observed_request[32], observed_tenant[32], observed_key[32], observed_code[64];
 static uint64_t get_timestamp_ns(void){return 2000000;}
 static const char *proxy_effective_model(proxy_fd_ent_t *p){return p->model;}
 static const char *proxy_request_id(proxy_fd_ent_t *p){return p->request_id;}
@@ -57,14 +58,15 @@ static void ai_gw_record_local_deny(int stage,const char *rid,int prod,const cha
  snprintf(deny_tenant,sizeof(deny_tenant),"%s",tenant);snprintf(deny_request,sizeof(deny_request),"%s",rid);
 }
 static int observed_stream;
-static void capture(const char *t,int status,const char *r,const char *k,int stream){
+static void capture(const char *t,int status,const char *r,const char *k,int stream,const char *c){
  emitted++;observed_status=status;observed_stream=stream;
+ snprintf(observed_code,sizeof(observed_code),"%s",c);
  snprintf(observed_tenant,sizeof(observed_tenant),"%s",t);
  snprintf(observed_request,sizeof(observed_request),"%s",r);
  snprintf(observed_key,sizeof(observed_key),"%s",k);
 }
 #define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj) \
- ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k,stream))
+ ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k,stream,c))
 static int proxy_send_local_response(proxy_fd_ent_t *p,const void *buf,size_t n){
  (void)p;sent++;
  assert(n==strlen(buf));
@@ -147,27 +149,30 @@ int main(void){
  assert(emitted==4 && observed_status==200);
  assert(observed_stream==0);
  /* An answer a reaper ended after its 200 (the sweep's terminator, a cut):
-  * its request record is written once, with the status the client received,
-  * as a stream when it was sent as one; not again, and not for a connection
-  * outside the AI population. */
+  * its request record is written once, with the status the client received
+  * and the reaper's end ("" for the sweep's clean end), as a stream when it
+  * was sent as one; not again, and not for a connection outside the AI
+  * population. */
+ assert(emitted==4 && observed_code[0]==0);
  p=request();p.noted=1;p.metric_response_status=200;p.stream_start_ts=100;
- proxy_record_reaped_answer(&p);
+ proxy_record_reaped_answer(&p,SP_END_STREAM_TIMEOUT);
  assert(emitted==5 && observed_status==200 && observed_stream==1 && p.metric_ai_recorded);
- proxy_record_reaped_answer(&p);
+ assert(strcmp(observed_code,"pd_decode_stream_timeout")==0);
+ proxy_record_reaped_answer(&p,SP_END_STREAM_TIMEOUT);
  proxy_ai_record_completion(&p);
  assert(emitted==5);
  p=request();p.noted=1;p.metric_response_status=200;
- proxy_record_reaped_answer(&p);
- assert(emitted==6 && observed_status==200 && observed_stream==0);
- p=request();p.ai_gw_mode=0;p.metric_response_status=200;proxy_record_reaped_answer(&p);
- p=request();proxy_record_reaped_answer(&p); /* no status seen: nothing owed */
+ proxy_record_reaped_answer(&p,SP_END_NONE);
+ assert(emitted==6 && observed_status==200 && observed_stream==0 && observed_code[0]==0);
+ p=request();p.ai_gw_mode=0;p.metric_response_status=200;proxy_record_reaped_answer(&p,SP_END_IDLE_TIMEOUT);
+ p=request();proxy_record_reaped_answer(&p,SP_END_IDLE_TIMEOUT); /* no status seen: nothing owed */
  assert(emitted==6);
  puts("backend-failure audit: identity/status, once-only, send failure, non-AI/backend/started guards PASS");
- puts("reaped answer: recorded once, with the status the client received, as a stream when sent as one PASS");
+ puts("reaped answer: recorded once, with the status the client received and the reaper's end, as a stream when sent as one PASS");
  puts("local answers: an outage completes with its status, a refusal is one deny record at its stage and never a completion, both record the response PASS");
 }
 '''
 with tempfile.TemporaryDirectory() as td:
     p=Path(td);(p/'test.c').write_text(prefix+source[a:b]+source[c:d]+suffix)
-    subprocess.run([os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror','-o',str(p/'test'),str(p/'test.c')],check=True)
+    subprocess.run([os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror','-I',str(root),'-o',str(p/'test'),str(p/'test.c')],check=True)
     subprocess.run([str(p/'test')],check=True)

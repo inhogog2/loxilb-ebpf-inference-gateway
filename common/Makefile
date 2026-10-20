@@ -737,6 +737,8 @@ test_answer: test_answer_track
 	python3 test_reap_framing.py
 	python3 test_reap_framing_mutations.py
 	python3 test_reap_request_record.py
+	python3 test_reap_stream_gauge.py
+	python3 test_reap_stream_gauge_mutations.py
 
 .PHONY: test_admit test_uc5 test_backend_failure_audit
 test_backend_failure_audit:
@@ -812,6 +814,14 @@ test_pd_cache: test_pd_cache_aware
 # Phase 6: KV-cache exact routing unit tests (CBOR encoding + hash parity)
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
 	$(CC) -Wall -Wextra -DTEST_KV_EXACT -o $@ $< -I. -lssl -lcrypto
+
+# A request with no usable Host on a listener whose pools name models: the
+# pool that names its model or a counted route refusal (proxy_setup_ep__),
+# with mutations.
+.PHONY: test_route_hostless
+test_route_hostless:
+	python3 test_route_hostless.py
+	python3 test_route_hostless.py --mutations
 
 test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c
 	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c -I. -lpthread

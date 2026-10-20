@@ -177,7 +177,11 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *   stream_end:     1 when closing an SSE stream, 0 otherwise
  *   error_code:     for 429 responses, the specific denial reason from
  *                   ai_gw_decision_t ("rate_limit_exceeded", "tenant_quota_exceeded",
- *                   "token_quota_exceeded"); pass "" for non-429 responses
+ *                   "token_quota_exceeded"). For an answer the client did not
+ *                   get whole, how it ended: a code of sp_end_codes
+ *                   (sockproxy_end_cause.h: "client_abort", "backend_died",
+ *                   "pd_decode_stream_timeout", ...), which the gateway counts
+ *                   as outcome="aborted" with its cause. "" otherwise
  *   request_id:     the request's correlation key, the one its admission and
  *                   settle carried ("" when the request had none)
  *   user_id:        per-user identity from the deciding credential arm ("")
@@ -567,8 +571,18 @@ extern int llb_ai_class_resolve(char *tenant, char *key_id, char *binding,
  *                                                  a terminator or cut the answer
  *                                                  with an error is what
  *                                                  pd_terminator_synthesized
- *                                                  counts. A client that stopped
- *                                                  reading is not recorded here)
+ *                                                  counts. A client that left or
+ *                                                  stopped reading is 9)
+ *                        9 = aborted  / client    (the client left, at any stage:
+ *                                                  before any answer (the
+ *                                                  prefill, or the decode leg's
+ *                                                  first byte still to come),
+ *                                                  with its answer open, or it
+ *                                                  stopped reading. The request
+ *                                                  record names
+ *                                                  client_abort_before_answer
+ *                                                  (status 0: none was sent),
+ *                                                  client_abort or client_stall)
  *
  * Returns void.
  */
@@ -594,7 +608,7 @@ extern void llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
  *   fallback_reason why the prefill was recomputed on the decode leg; 0 when
  *                   it was not (PD_FB_* in sockproxy_pd_leak.h):
  *                     1 = origin_5xx  2 = origin_408  3 = origin_429
- *                     4 = no_status   5 = truncated   6 = other
+ *                     4 = no_status   5 = truncated (a cut 2xx)   6 = other
  */
 extern void llb_ai_pd_record_extra(char *model_name, int64_t decode_ttft_us,
                                    int fallback_reason);
