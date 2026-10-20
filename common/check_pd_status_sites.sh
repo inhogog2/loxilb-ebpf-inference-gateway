@@ -197,8 +197,8 @@ fi
 #    the generic idle reaper and the duration cap each call pd_reap_lifecycle
 #    right before handing the connection to pd_reap_respond; ERR-01 and the cap
 #    name decode/truncated (8): engine silence, a policy cap. The stalled-client
-#    abort makes no record (pd_reap_unrecorded): it is the client's, not the
-#    engine's. No reaper records decode/error (2), and pd_reap_error_phase never
+#    abort is the client's, not the engine's: decode/aborted (9), its end
+#    named client_stall. No reaper records decode/error (2), and pd_reap_error_phase never
 #    returns it: 2 is the engine's death, which the decode EOF mid-stream
 #    records, moving the request to ERROR before the sweep can see it.
 for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_PD_IDLE_TIMEOUT SP_REAP_SSE_CAP; do
@@ -215,9 +215,10 @@ for kind in SP_REAP_PD_STREAM_TIMEOUT SP_REAP_SSE_CAP; do
     fail=1
   fi
 done
-st=$(grep -B3 'pd_reap_respond(pfe, SP_REAP_SSE_STALL);' ./sockproxy_health.c)
-if ! printf '%s' "$st" | grep -q 'pd_reap_unrecorded(pfe);' || printf '%s' "$st" | grep -q 'pd_reap_lifecycle('; then
-  echo "sockproxy_health.c: the stalled-client reap must make no lifecycle record and leave the in-flight phases (pd_reap_unrecorded)"
+st=$(grep -B12 'pd_reap_respond(pfe, SP_REAP_SSE_STALL);' ./sockproxy_health.c)
+if ! printf '%s' "$st" | grep -q 'pd_reap_lifecycle(pfe, 9 /\*decode aborted\*/);' || \
+   ! printf '%s' "$st" | grep -q 'pfe->end_cause = SP_END_CLIENT_STALL;'; then
+  echo "sockproxy_health.c: the stalled-client reap must record decode/aborted (9) and name its end client_stall"
   fail=1
 fi
 r2=$(grep -n '2 /\*decode error\*/' ./sockproxy_health.c || true)
@@ -239,9 +240,36 @@ fi
 #     every teardown kind, with the status the client received
 #     (test_reap_request_record.py drives each reaper after a 200).
 gd=$(awk '/^sp_reap_record\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_health.c | tr '\n' ' ' \
-     | grep -c 'if (sp_reap_texts\[kind\].teardown) {[ ]*proxy_record_reaped_answer(pfe);' || true)
+     | grep -c 'if (sp_reap_texts\[kind\].teardown) {[ ]*proxy_record_reaped_answer(pfe, sp_reap_end(kind));' || true)
 if [ "$gd" != "1" ]; then
   echo "sockproxy_health.c: sp_reap_record must write the request record of an answer a teardown reaper ended (proxy_record_reaped_answer)"
+  fail=1
+fi
+
+# 6c. An answer the client did not get whole is recorded aborted, by its end
+#     (sockproxy_end_cause.h): the duration cap names its cut before the event
+#     loop's teardown records it; the teardown record carries the end it read
+#     (the cause recorded when it ended, or an open answer's client leaving);
+#     a P/D client that left with its answer open records decode/aborted (9)
+#     there, once; a leg ending under an open answer names the engine.
+cap=$(grep -B12 'pd_reap_respond(pfe, SP_REAP_SSE_CAP);' ./sockproxy_health.c)
+if ! printf '%s' "$cap" | grep -q 'pfe->end_cause = SP_END_DURATION_CAP;'; then
+  echo "sockproxy_health.c: the duration cap must name its cut (end_cause) for the teardown record"
+  fail=1
+fi
+col=$(awk '/^proxy_collect_conn_settles\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_http.c | tr '\n' ' ')
+if ! printf '%s' "$col" | grep -q 'u->end = sp_end_cause_at_teardown( *pfe->end_cause, shape == TEARDOWN_LISTENER, *!pfe->h2_session && *atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed));' || \
+   ! printf '%s' "$col" | grep -q 'if (u->owes_record && u->end == SP_END_CLIENT_GONE && *pd_reap_error_phase(pfe->pd_phase) >= 0) {.*9 /\*decode aborted\*/); *pfe->pd_phase = PD_PHASE_ERROR;'; then
+  echo "sockproxy_http.c: the teardown record must read how the answer ended, and a P/D client that left record decode/aborted (9) once"
+  fail=1
+fi
+if ! awk '/The connection.s last response \(collected above under PROXY_LOCK\)/ {on = 1} on && /llb_ai_record_usage_missing/ {exit} on' ./sockproxy_http.c \
+     | tr '\n' ' ' | grep -q 'llb_ai_record_request(u->tenant, u->model, u->status, u->latency_ms, *u->prompt_toks, u->complet_toks, 0, 0, *(char \*)sp_end_code(u->end),'; then
+  echo "sockproxy_http.c: the teardown's request record must name the end (sp_end_code(u->end))"
+  fail=1
+fi
+if ! grep -q 'cl->end_cause = SP_END_BACKEND_DIED;' ./sockproxy_http.c; then
+  echo "sockproxy_http.c: a leg ending under its client's open answer must name the engine (SP_END_BACKEND_DIED)"
   fail=1
 fi
 
@@ -266,8 +294,8 @@ if [ "$inpd" != "1" ] || ! printf '%s\n' "$helper" | grep -q 'llb_ai_pd_record_e
 fi
 nsites=$(grep -c 'sp_pd_record(' ./sockproxy_health.c ./sockproxy_http.c ./sockproxy_pd_sglang.c \
            ./sockproxy_pd_trtllm.c ./sockproxy_pd_vllm.c | awk -F: '{s += $2} END {print s}')
-if [ "$nsites" -lt 19 ]; then
-  echo "expected at least 19 P/D lifecycle record sites through sp_pd_record; found $nsites"
+if [ "$nsites" -lt 20 ]; then
+  echo "expected at least 20 P/D lifecycle record sites through sp_pd_record; found $nsites"
   fail=1
 fi
 
@@ -299,4 +327,4 @@ if [ "$fbn" != "1" ] || [ -z "$fbl" ] || [ -z "$relay" ] || [ -z "$early" ] || \
 fi
 
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; each record crosses as both calls; the first event and the fallback reason have one writer each)"
+echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; a cut answer is recorded by its end, a P/D client's abort is decode/aborted; each record crosses as both calls; the first event and the fallback reason have one writer each)"

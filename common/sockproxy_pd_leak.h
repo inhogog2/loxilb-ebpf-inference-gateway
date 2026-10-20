@@ -333,7 +333,8 @@ pd_decode_error_phase(int status)
  * whether the gateway wrote a terminator or cut it with an error;
  * pd_terminator_synthesized tells the two apart. decode/error (2) is the
  * engine's death, which only the decode leg sees. A client that stopped
- * reading is no reaper record at all (pd_reap_unrecorded). -1 for every other
+ * reading is the client's abort: the stall reaper records decode/aborted (9),
+ * not this table's value. -1 for every other
  * phase is what makes the record once: the reaper moves the request to ERROR
  * after recording it.
  */

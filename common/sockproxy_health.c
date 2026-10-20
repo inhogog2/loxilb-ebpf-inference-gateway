@@ -63,6 +63,7 @@ static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
  * Included AFTER the headers that define `struct proxy_fd_ent` and
  * notify_delete_ent so the helper's pfe* signature resolves here. */
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_end_cause.h"
 
 /* Forward declaration for internal use (defined later in this file) */
 static void check_draining_endpoints(void);
@@ -383,19 +384,6 @@ pd_reap_lifecycle(proxy_fd_ent_t *pfe, int error_phase)
   pfe->pd_phase = PD_PHASE_ERROR;
 }
 
-/* A P/D request a reaper ends for a cause the lifecycle record cannot name
- * yet: a client that stopped reading (the client's abort). It gets no record,
- * because none of the existing phases would name the client rather than the
- * engine. The request still leaves every in-flight phase, so no later pass and
- * no decode EOF records it under another cause. */
-static void
-pd_reap_unrecorded(proxy_fd_ent_t *pfe)
-{
-  if (pd_reap_error_phase(pfe->pd_phase) >= 0) {
-    pfe->pd_phase = PD_PHASE_ERROR;
-  }
-}
-
 static void
 pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
 {
@@ -534,6 +522,19 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
  * begun is recorded below). The SSE events are body bytes inside a response in
  * progress, not a response; their connection is shut, not freed here, and its
  * teardown writes what it owes. */
+static int
+sp_reap_end(uint8_t kind)
+{
+  switch (kind) {
+  case SP_REAP_PD_STREAM_TIMEOUT:
+    return SP_END_STREAM_TIMEOUT;
+  case SP_REAP_PD_IDLE_TIMEOUT:
+    return SP_END_IDLE_TIMEOUT;
+  default:      /* the sweep's clean end; the rest end no answer in progress */
+    return SP_END_NONE;
+  }
+}
+
 static void
 sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
 {
@@ -562,11 +563,11 @@ sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
   }
   /* A teardown kind frees the client inline (pd_teardown_conn), so the record
    * a teardown owes is never written there. An answer the client was already
-   * receiving (the sweep's terminator, or a stream-silence or idle cut after
-   * its 200) is recorded here, once: completed, with the status the client
-   * received. Anything recorded above owes nothing more. */
+   * receiving is recorded here, once, with the status the client received:
+   * completed after the sweep's terminator, aborted by the gateway after a
+   * stream-silence or idle cut. Anything recorded above owes nothing more. */
   if (sp_reap_texts[kind].teardown) {
-    proxy_record_reaped_answer(pfe);
+    proxy_record_reaped_answer(pfe, sp_reap_end(kind));
   }
 }
 
@@ -1177,14 +1178,16 @@ check_draining_endpoints(void)
             abandon_record(&global_stats.stream_abandon, ABANDON_STALL_ABORT,
                            pfe->stream_start_ts > 0 ? (long)(now - pfe->stream_start_ts) : 0);
             pfe->abandon_reason = ABANDON_STALL_ABORT + 1;
+            pfe->end_cause = SP_END_CLIENT_STALL;
             llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;
             pfe->bp_since = 0;
             /* A P/D stream ended for its stalled client: the client's
-             * abort, not the engine's. No lifecycle record
-             * (pd_reap_unrecorded). */
-            pd_reap_unrecorded(pfe);
+             * abort, not the engine's: decode/aborted (9), as for a
+             * client that left. The request record (the event loop's
+             * teardown) names client_stall. */
+            pd_reap_lifecycle(pfe, 9 /*decode aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);
             pfe = pfe_next;
             continue;
@@ -1213,6 +1216,9 @@ check_draining_endpoints(void)
             llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;  /* Reset so eviction suppression no longer blocks cleanup */
+            /* The client did not get the whole answer: the event loop's
+             * teardown records it aborted, by the gateway's cap. */
+            pfe->end_cause = SP_END_DURATION_CAP;
             /* An error SSE event so the client can react, then both
              * directions shut; the event loop cleans up. Written by the
              * socket's owner worker (pd_reap_respond). A P/D answer the

@@ -210,7 +210,7 @@ int sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
 void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                              const char *code);
 void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status);
-void proxy_record_reaped_answer(proxy_fd_ent_t *pfe);
+void proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end);
 void sp_pd_record(proxy_fd_ent_t *pfe, const char *model, int64_t prefill_ms,
                   int64_t decode_ms, int kv, int error_phase);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,

@@ -1621,6 +1621,10 @@ struct proxy_fd_ent {
   uint8_t  abandon_reason;            // enum abandon_reason + 1 when the end of an open stream is
                                       // already attributed (backend died, stall abort); 0 = a
                                       // teardown with the stream open is the client leaving
+  uint8_t  end_cause;                 // enum sp_end_cause: why this request's answer ended before
+                                      // the client had all of it, when that is known as it ends
+                                      // (a reaper's cut, a stall, its leg dying under it); 0 = the
+                                      // teardown decides (sockproxy_end_cause.h)
   uint64_t stream_start_mono_ns;      // CLOCK_MONOTONIC stamp at SSE activation; latency source for
                                       // llb_ai_record_request (wall-clock seconds truncated sub-second
                                       // streams to 0 and NTP steps could skew/negate the delta)

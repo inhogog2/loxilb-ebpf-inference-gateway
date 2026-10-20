@@ -101,14 +101,18 @@ PY
   expect "6: the $k reap names the engine's death" "the SP_REAP_$k reap must record decode/truncated (8)"
 done
 fresh
-mut sockproxy_health.c '            pd_reap_unrecorded(pfe);
+mut sockproxy_health.c '            pd_reap_lifecycle(pfe, 9 /*decode aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);' '            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);'
-expect "6: the stalled client is recorded as the engine's" "the stalled-client reap must make no lifecycle record"
+expect "6: the stalled client is recorded as the gateway's" "the stalled-client reap must record decode/aborted (9)"
 fresh
-mut sockproxy_health.c '            pd_reap_unrecorded(pfe);
+mut sockproxy_health.c '            pd_reap_lifecycle(pfe, 9 /*decode aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);' '            pd_reap_respond(pfe, SP_REAP_SSE_STALL);'
-expect "6: the stalled client stays in flight" "the stalled-client reap must make no lifecycle record"
+expect "6: the stalled client makes no lifecycle record" "the stalled-client reap must record decode/aborted (9)"
+fresh
+mut sockproxy_health.c '            pfe->end_cause = SP_END_CLIENT_STALL;
+' ''
+expect "6: the stall does not name its end" "the stalled-client reap must record decode/aborted (9) and name its end client_stall"
 fresh
 mut sockproxy_pd_leak.h '  if (pd_phase == 5) return 8;' '  if (pd_phase == 5) return 2;'
 expect "6: the idle reaper names a begun answer decode/error" "a reaper records decode/error (2)"
@@ -128,9 +132,36 @@ expect "6: the decode EOF mid-stream leaves the request to the sweep" "the decod
 # 6b: the request record of an answer a teardown reaper ended.
 fresh
 mut sockproxy_health.c '  if (sp_reap_texts[kind].teardown) {
-    proxy_record_reaped_answer(pfe);
+    proxy_record_reaped_answer(pfe, sp_reap_end(kind));
   }' ''
 expect "6b: an answer a teardown reaper ended has no request record" "sp_reap_record must write the request record of an answer a teardown reaper ended"
+fresh
+mut sockproxy_health.c '    proxy_record_reaped_answer(pfe, sp_reap_end(kind));' '    proxy_record_reaped_answer(pfe, SP_END_NONE);'
+expect "6b: a reaper's cut is recorded as a whole answer" "sp_reap_record must write the request record of an answer a teardown reaper ended"
+
+# 6c: an answer the client did not get whole is recorded by its end.
+fresh
+mut sockproxy_health.c '            pfe->end_cause = SP_END_DURATION_CAP;' ''
+expect "6c: the duration cap does not name its cut" "the duration cap must name its cut"
+fresh
+mut sockproxy_http.c '        pfe->end_cause, shape == TEARDOWN_LISTENER,' '        SP_END_NONE, shape == TEARDOWN_LISTENER,'
+expect "6c: the teardown ignores the end recorded when the answer ended" "the teardown record must read how the answer ended"
+fresh
+mut sockproxy_http.c '        !pfe->h2_session &&
+            atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed));' '        0);'
+expect "6c: an open answer at teardown reads as whole" "the teardown record must read how the answer ended"
+fresh
+mut sockproxy_http.c '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*decode aborted*/);
+      pfe->pd_phase = PD_PHASE_ERROR;' '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*decode aborted*/);'
+expect "6c: the P/D client's abort can be recorded twice" "a P/D client that left record decode/aborted (9) once"
+fresh
+mut sockproxy_http.c '                            (char *)sp_end_code(u->end),
+                            u->request_id,' '                            "",
+                            u->request_id,'
+expect "6c: the teardown record drops the end" "the teardown's request record must name the end"
+fresh
+mut sockproxy_http.c '            cl->end_cause = SP_END_BACKEND_DIED;' '            (void)0;'
+expect "6c: a dying leg does not name the engine" "must name the engine (SP_END_BACKEND_DIED)"
 
 # 7: one record, both calls, through the helper only.
 fresh
