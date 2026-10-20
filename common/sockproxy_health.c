@@ -120,6 +120,22 @@ pd_h2_conn(const proxy_fd_ent_t *e)
   return e && (e->h2_session || (e->odir == 1 && e->backend_h2_session));
 }
 
+/* The active-streams gauge side of a client this thread frees. The inline
+ * free skips proxy_pdestroy, whose settle ends a stream still open, so a
+ * reaper that reaches an active stream (ERR-01 or the idle reaper, when the
+ * decode idle cap is at or above the stream timeout) left the gauge counting
+ * it until the process restarts. Every ender clears sse_active, so a stream
+ * ends once. Called under PROXY_LOCK, as the health thread's other enders. */
+static void
+pd_teardown_stream_end(proxy_fd_ent_t *e)
+{
+  if (e && e->odir == 0 && e->sse_active) {
+    llb_ai_stream_end("", (char *)proxy_effective_model(e));
+    e->sse_active = 0;
+    e->stream_end_ts = time(NULL);
+  }
+}
+
 static int
 pd_teardown_conn(proxy_fd_ent_t *client)
 {
@@ -196,6 +212,7 @@ pd_teardown_conn(proxy_fd_ent_t *client)
           proxy_h2_client_end_log(be);
       }
       if (be_owned) {
+        pd_teardown_stream_end(be);    /* the client, when called with a leg */
         proxy_release_fd_ctx(be, 1);   /* reset: unlink fdlist + close be->fd */
         proxy_try_free_fd_ctx(be);     /* used-- -> free (single owner) */
       }
@@ -212,6 +229,7 @@ pd_teardown_conn(proxy_fd_ent_t *client)
   if (client_owned) {
     /* This thread frees it, so proxy_pdestroy never runs: log its end here. */
     proxy_h2_client_end_log(client);
+    pd_teardown_stream_end(client);
     proxy_release_fd_ctx(client, 1);   /* reset: unlink fdlist + close client->fd */
     proxy_try_free_fd_ctx(client);     /* used-- -> free (single owner) */
   }

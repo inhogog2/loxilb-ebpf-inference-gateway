@@ -130,6 +130,18 @@ proxy_h2_client_end_log(proxy_fd_ent_t *pfe)
   (void)pfe;
 }
 
+/* The active-streams gauge, as ended. An inline free skips proxy_pdestroy,
+ * whose settle would end a stream still open, so the teardown ends it. */
+static int n_stream_ends;
+
+int
+llb_ai_stream_end(char *tenant_id, char *model_name)
+{
+  (void)tenant_id; (void)model_name;
+  n_stream_ends++;
+  return 0;
+}
+
 /* The reaper's fallback asks whether an answer is in progress; none is
  * here, so it writes its status text as before. */
 int
@@ -276,6 +288,36 @@ main(void)
    * rescan after c1's free), never the endless retry of the same entry. */
   CHECK(w_deregs >= 1 && w_deregs <= 2 && !was(freed, n_freed, &w) && linked(&ent, &w),
         "a client a worker already claimed is passed, at most once per scan (%d tries)", w_deregs);
+
+  /* A reaper that reaches an open stream (ERR-01, the idle reaper) frees the
+   * client inline: its stream ends there, once. A client a worker already
+   * claimed is ended by that worker's settle; a pair torn down through its
+   * leg ends the client's stream in the leg loop. */
+  {
+    proxy_map_ent_t ent4;
+    proxy_fd_ent_t sc, sl, wc, wcl, lc, ll;
+
+    memset(&ent4, 0, sizeof(ent4));
+    mk(&ent4, &sc, 0, EP);
+    mk(&ent4, &sl, 1, -1);
+    pair(&sc, &sl, 0);
+    mk(&ent4, &wc, 0, EP);
+    mk(&ent4, &wcl, 1, -1);
+    pair(&wc, &wcl, 0);
+    mk(&ent4, &lc, 0, -1);
+    mk(&ent4, &ll, 1, EP);
+    pair(&lc, &ll, 0);
+    sc.sse_active = wc.sse_active = lc.sse_active = 1;
+    w_fd = wc.fd;
+    n_stream_ends = 0;
+    CHECK(pd_teardown_conn(&sc) == 1 && n_stream_ends == 1 && !sc.sse_active,
+          "a client with an open stream, freed inline, ends its stream once");
+    CHECK(pd_teardown_conn(&wc) == 0 && n_stream_ends == 1 && wc.sse_active,
+          "a client a worker already claimed keeps it for that worker's settle");
+    CHECK(pd_teardown_conn(&ll) == 1 && n_stream_ends == 2 && !lc.sse_active,
+          "a pair torn down through its leg ends the client's stream once");
+    w_fd = -1;
+  }
 
   /* The reaper's fallback (its owner could not be woken) hands a client to
    * pd_teardown_conn itself; an HTTP/2 client with no leg left has no peer
