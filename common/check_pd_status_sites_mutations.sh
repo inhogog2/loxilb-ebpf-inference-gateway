@@ -176,7 +176,7 @@ fresh
 mut sockproxy_teardown_settle.h '         teardown_owes_abort_record(c) || teardown_owes_usage_missing(c) ||' '         teardown_owes_usage_missing(c) ||'
 expect "6d: the teardown rule owes nothing for a request left before its answer" "must be owed its abort record by the teardown rule"
 fresh
-mut sockproxy_teardown_settle.h '      c->metric_response_status != 0 || c->has_h2_session) {' '      c->has_h2_session) {'
+mut sockproxy_teardown_settle.h '      c->metric_response_status != 0 || c->has_h2_session || c->resp_kernel) {' '      c->has_h2_session || c->resp_kernel) {'
 expect "6d: a request a status accounts for is recorded again" "must be owed its abort record by the teardown rule"
 fresh
 mut sockproxy_teardown_settle.h 'c->ai_gw_mode || c->metric_ai_recorded ||' 'c->ai_gw_mode ||'
@@ -207,8 +207,11 @@ fresh
 mut sockproxy_http.c '         (u->end == SP_END_CLIENT_NO_ANSWER && pfe->pd_rule))) {' '         0)) {'
 expect "6c: a P/D client leaving at the gate, queued or parked gets no aborted (9)" "a P/D client that left record aborted (9) once"
 fresh
-mut sockproxy_end_cause.h '  return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_BACKEND_DIED;' '  return end == SP_END_CLIENT_NO_ANSWER;'
-expect "6f: the leg ending before any answer is not an end recorded then" "a request is recorded before any answer when the client left or the leg ended"
+mut sockproxy_end_cause.h '  return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_LISTENER_CLOSED ||' '  return end == SP_END_CLIENT_NO_ANSWER ||'
+expect "6f: the listener going before any answer is not an end recorded then" "a request is recorded before any answer when the client left"
+fresh
+mut sockproxy_end_cause.h '         end == SP_END_BACKEND_DIED;' '         0;'
+expect "6f: the leg ending before any answer is not an end recorded then" "a request is recorded before any answer when the client left"
 
 # 6e: off P/D, the request record alone, for a whole request the client left.
 fresh
@@ -232,6 +235,29 @@ mut sockproxy_http.c '              !cl->metric_ai_recorded && cl->metric_respon
             cl->end_cause = SP_END_BACKEND_DIED;' '              !cl->metric_ai_recorded && cl->metric_response_status == 0) {
             (void)0;'
 expect "6e: a leg dying before any answer reads as the client leaving" "off P/D, a leg ending before any answer must name the engine"
+
+# 6h: the listener going before any answer: listener_closed.
+fresh
+mut sockproxy_end_cause.h '    return listener ? SP_END_LISTENER_CLOSED : SP_END_CLIENT_NO_ANSWER;' '    return listener ? SP_END_NONE : SP_END_CLIENT_NO_ANSWER;'
+expect "6h: the listener going before any answer is not recorded" "the listener going before any answer must be the gateway's end"
+
+# 6g: a connection whose answers go by the kernel owes nothing before any answer.
+fresh
+mut sockproxy_teardown_settle.h 'c->has_h2_session || c->resp_kernel) {' 'c->has_h2_session) {'
+expect "6g: a kernel-answered request reads as left before any answer" "a connection whose answers go by the kernel must owe no record"
+fresh
+mut sockproxy_http.c '  v->resp_kernel           = pfe->resp_kernel ? 1 : 0;
+' ''
+expect "6g: the view drops the kernel pairing" "a connection whose answers go by the kernel must owe no record"
+fresh
+mut sockproxy_http.c '          pfe->resp_kernel = 1;
+' ''
+expect "6g: the pairing does not mark the client" "a connection whose answers go by the kernel must owe no record"
+fresh
+mut sockproxy_http.c '!cl->pd_rule &&
+              !cl->resp_kernel && cl->odir == 0' '!cl->pd_rule &&
+              cl->odir == 0'
+expect "6g: a kernel-answered leg's close names the engine" "off P/D, a leg ending before any answer must name the engine"
 
 # 7: one record, both calls, through the helper only.
 fresh

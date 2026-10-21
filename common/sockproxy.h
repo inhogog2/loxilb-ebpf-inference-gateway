@@ -1482,6 +1482,7 @@ struct proxy_fd_ent {
   uint8_t  ai_gw_mode;                // 1=AI Gateway connection; copied from the rule at accept
   uint8_t  apikey_auth;               // 0=unset 1=required 2=declared-disabled; copied from the rule at accept
   uint8_t  pd_rule;                   // 1=the rule is P/D (pd_disagg_enabled); copied from the rule at accept
+  uint8_t  resp_kernel;               // 1=a response on this client connection was paired to the kernel (sockmap): its answers bypass userspace, no status is seen
   uint8_t  metric_ai_recorded;       // 1=this request already counted in ai_requests_total (dedup guard)
   uint8_t  metric_resp_noted;        // 1=this request's client-visible response is recorded (proxy_note_response_ latch)
 

@@ -58,6 +58,8 @@ typedef struct {
                                 * connection (metric_req_start_ns > 0) */
   int hold_gw_ended;           /* a half-close hold the gateway ended (it
                                 * expired, or an operator released it) */
+  int resp_kernel;             /* the connection's answers go by the kernel
+                                * (sockmap response pairing): no status is seen */
 } teardown_conn_t;
 
 /* 2xx, matching proxy_status_is_2xx. Restated rather than included so this
@@ -116,12 +118,17 @@ teardown_owes_completion(const teardown_conn_t *c)
  * a keep-alive connection re-arms only when it is whole. A hold the gateway
  * ended (expired, released) is the gateway's end, not the client's: not this
  * record. HTTP/2 is not walked for it (#415).
+ *
+ * A connection whose answers go by the kernel (sockmap response pairing, an
+ * api_key_auth rule's response-only mode) never shows userspace a status, so
+ * status 0 there proves nothing: an answered request would read as one that
+ * ended before any answer. Not recorded, as its answers are not.
  */
 static inline int
 teardown_owes_abort_record(const teardown_conn_t *c)
 {
   if (!c || c->odir != 0 || !c->ai_gw_mode || c->metric_ai_recorded ||
-      c->metric_response_status != 0 || c->has_h2_session) {
+      c->metric_response_status != 0 || c->has_h2_session || c->resp_kernel) {
     return 0;
   }
   if (c->pd_rule && c->pd_in_flight) {

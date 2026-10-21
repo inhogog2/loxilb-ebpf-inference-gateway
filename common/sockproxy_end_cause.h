@@ -6,8 +6,9 @@
  *
  * A request whose answer began and was cut is aborted, not completed: the
  * client did not receive a complete response. So is a request that ended
- * before any answer, the client leaving or, off P/D, the backend leg ending
- * (its record carries status 0: no status was sent;
+ * before any answer, the client leaving, the rule's listener going away or,
+ * off P/D, the backend leg ending (its record carries status 0: no status was
+ * sent;
  * sockproxy_teardown_settle.h says which requests are owed it). Its request record (llb_ai_record_request) names the end in
  * error_code; "" is an answer that ended whole, or a request a status already
  * accounts for. Each code has one cause:
@@ -37,7 +38,7 @@ enum sp_end_cause {
   SP_END_DURATION_CAP,    /* [SSE_CAP]: the stream's duration cap */
   SP_END_STREAM_TIMEOUT,  /* ERR-01: the decode engine went silent */
   SP_END_IDLE_TIMEOUT,    /* the idle reaper */
-  SP_END_LISTENER_CLOSED, /* the rule's listener went away with the answer open */
+  SP_END_LISTENER_CLOSED, /* the rule's listener went away (answer open, or none yet) */
   SP_END_CLIENT_NO_ANSWER, /* the client left a request before any answer */
   SP_END_CAUSES
 };
@@ -72,9 +73,11 @@ sp_end_code(int end)
  * whole listener is going. A request the teardown rule owes before any
  * answer (no status, `no_answer`: a P/D request in its prefill or before the
  * decode leg's first byte, or any whole request on a rule that is not P/D) is
- * the client leaving before it; a listener going then is not recorded (F-17,
- * open: the P/D lifecycle has no value to pair with it). An answer that ended
- * whole, or a request a status accounts for, has none. */
+ * the client leaving before it, or the gateway when the whole listener is
+ * going (the request record alone: the P/D lifecycle has no record for it,
+ * and nothing in the product tears a listener down with requests on it, see
+ * test_teardown_settle.c). An answer that ended whole, or a request a status
+ * accounts for, has none. */
 static inline int
 sp_end_cause_at_teardown(int recorded, int listener, int answer_open,
                          int no_answer)
@@ -85,19 +88,21 @@ sp_end_cause_at_teardown(int recorded, int listener, int answer_open,
   if (answer_open) {
     return listener ? SP_END_LISTENER_CLOSED : SP_END_CLIENT_GONE;
   }
-  if (no_answer && !listener) {
-    return SP_END_CLIENT_NO_ANSWER;
+  if (no_answer) {
+    return listener ? SP_END_LISTENER_CLOSED : SP_END_CLIENT_NO_ANSWER;
   }
   return SP_END_NONE;
 }
 
 /* The ends a request is recorded by before any answer, status 0: the client
- * leaving, or the leg the answer was to come on ending (off P/D; a P/D leg
- * that ends before an answer is answered by the gateway with its status). */
+ * leaving, the rule's listener going away, or the leg the answer was to come
+ * on ending (off P/D; a P/D leg that ends before an answer is answered by the
+ * gateway with its status). */
 static inline int
 sp_end_recorded_before_answer(int end)
 {
-  return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_BACKEND_DIED;
+  return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_LISTENER_CLOSED ||
+         end == SP_END_BACKEND_DIED;
 }
 
 /* The client left, at whatever stage: the P/D lifecycle's aborted (9). A

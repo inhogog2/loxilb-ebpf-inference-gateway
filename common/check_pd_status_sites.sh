@@ -299,8 +299,17 @@ fi
 # 6f. The ends recorded before any answer are the client leaving and the
 #     leg ending (sockproxy_end_cause.h), both status 0.
 rba=$(awk '/^sp_end_recorded_before_answer\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_end_cause.h | tr '\n' ' ')
-if ! printf '%s' "$rba" | grep -q 'return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_BACKEND_DIED;'; then
-  echo "sockproxy_end_cause.h: a request is recorded before any answer when the client left or the leg ended (sp_end_recorded_before_answer)"
+if ! printf '%s' "$rba" | grep -q 'return end == SP_END_CLIENT_NO_ANSWER || end == SP_END_LISTENER_CLOSED || *end == SP_END_BACKEND_DIED;'; then
+  echo "sockproxy_end_cause.h: a request is recorded before any answer when the client left, the listener went or the leg ended (sp_end_recorded_before_answer)"
+  fail=1
+fi
+
+# 6h. The rule's listener going before any answer is the gateway's end
+#     (listener_closed, status 0), the request record alone (F-17: no listener
+#     goes with requests on it in the product today; test_teardown_settle.c).
+eat=$(awk '/^sp_end_cause_at_teardown\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_end_cause.h | tr '\n' ' ')
+if ! printf '%s' "$eat" | grep -q 'if (no_answer) { *return listener ? SP_END_LISTENER_CLOSED : SP_END_CLIENT_NO_ANSWER;'; then
+  echo "sockproxy_end_cause.h: the listener going before any answer must be the gateway's end (listener_closed)"
   fail=1
 fi
 
@@ -320,8 +329,19 @@ if ! grep -q 'npfe1->pd_rule = ent_pool0->pd_disagg_enabled ? 1 : 0;' ./sockprox
   echo "sockproxy_http.c: the teardown view must say whether the rule is P/D, the request whole, and the hold ended by the gateway"
   fail=1
 fi
-if ! tr '\n' ' ' < ./sockproxy_http.c | grep -q '!cl->pd_rule && *cl->odir == 0 && cl->metric_req_start_ns > 0 && *!cl->metric_ai_recorded && cl->metric_response_status == 0) { *cl->end_cause = SP_END_BACKEND_DIED;'; then
+if ! tr '\n' ' ' < ./sockproxy_http.c | grep -q '!cl->pd_rule && *!cl->resp_kernel && cl->odir == 0 && cl->metric_req_start_ns > 0 && *!cl->metric_ai_recorded && cl->metric_response_status == 0) { *cl->end_cause = SP_END_BACKEND_DIED;'; then
   echo "sockproxy_http.c: off P/D, a leg ending before any answer must name the engine, not leave it to read as the client leaving"
+  fail=1
+fi
+
+# 6g. A connection whose answers go by the kernel (sockmap response pairing)
+#     shows userspace no status, so status 0 there is no proof that no answer
+#     came: no record is owed before any answer, and a leg ending does not
+#     name the engine. The pairing marks the client; the view carries it.
+if ! printf '%s' "$oar" | grep -q 'c->has_h2_session || c->resp_kernel) {' || \
+   ! grep -q 'v->resp_kernel           = pfe->resp_kernel ? 1 : 0;' ./sockproxy_http.c || \
+   ! tr '\n' ' ' < ./sockproxy_http.c | grep -q 'npfe2->peer_map_resp_verdict = 1; *hc_note_accel(pfe, HC_ACCEL_RESP);.*pfe->resp_kernel = 1;'; then
+  echo "sockproxy_http.c/sockproxy_teardown_settle.h: a connection whose answers go by the kernel must owe no record before any answer"
   fail=1
 fi
 

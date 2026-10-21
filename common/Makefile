@@ -739,6 +739,8 @@ test_answer: test_answer_track
 	python3 test_reap_request_record.py
 	python3 test_reap_stream_gauge.py
 	python3 test_reap_stream_gauge_mutations.py
+	python3 test_leg_ended_unanswered.py
+	python3 test_leg_ended_unanswered_mutations.py
 
 .PHONY: test_admit test_uc5 test_backend_failure_audit
 test_backend_failure_audit:

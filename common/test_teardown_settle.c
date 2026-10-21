@@ -219,6 +219,11 @@ main(void)
   teardown_conn_t plain_hold_expired = plain_left;
   plain_hold_expired.hold_gw_ended = 1;
 
+  /* Its answers paired to the kernel (sockmap response): the status never
+   * reaches userspace, so status 0 is no proof the answer did not come. */
+  teardown_conn_t plain_resp_kernel = plain_left;
+  plain_resp_kernel.resp_kernel = 1;
+
   printf("teardown: the shape decides the walk set, not the settle\n");
 
   printf("\n TEARDOWN_CONN - the shape that always worked:\n");
@@ -239,6 +244,7 @@ main(void)
   check("P/D rule, parked or queued", TEARDOWN_CONN, &pd_parked, 1, 1);
   check("P/D rule, no whole request", TEARDOWN_CONN, &pd_unread,  0, 0);
   check("not P/D, hold the gateway ended", TEARDOWN_CONN, &plain_hold_expired, 0, 0);
+  check("not P/D, answers by the kernel", TEARDOWN_CONN, &plain_resp_kernel, 0, 0);
 
   printf("\n TEARDOWN_LISTENER - the same connections, rule going away:\n");
   check("h1 unspent claim",        TEARDOWN_LISTENER, &h1_claim,    1, 1);
