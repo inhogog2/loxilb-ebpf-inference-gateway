@@ -102,14 +102,46 @@ mut sockproxy_h2.c '      l7_stream->metric_response_status = status_code;' '   
 expect "rule 1: an HTTP/2 L7 REDIRECT drops its status" "proxy_h2_send_l7_synthetic must record: l7_stream->metric_response_status = status_code"
 
 fresh
-mut sockproxy_http.c 'else shutdown(pfe->fd,SHUT_RDWR);' 'else proxy_send_local_response_and_shutdown(pfe,response,0);'
+mut sockproxy_http.c '  log_debug("[JSON_STREAM_CONTINUE] fd=%d sent local 100 Continue", pfe->fd);' '  proxy_send_local_response(pfe, response, 0);'
 expect "rule 1: a second answer under one allowlist key" "allowlist entry covers 1 call(s), found 2"
+
+# F-20: the MCP refusals, the HTTP/2 outages and the smuggling 400 record.
+
+fresh
+mut sockproxy_http.c '    proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status,
+                            sp_mcp_refusal_code(status));' '    ;'
+expect "rule 1: the MCP refusal drops its deny record" "sp_mcp_h1_refuse must record: proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status"
+
+fresh
+mut sockproxy_h2.c '    h2_record_local_deny(pfe, stream, AI_GW_STAGE_FRAMING, status_code,
+                         stream->effective_model, sp_mcp_refusal_code(status_code));' '    ;'
+expect "rule 1: the HTTP/2 MCP frame drops its deny record" "h2_send_mcp_frame must record: h2_record_local_deny(pfe, stream, AI_GW_STAGE_FRAMING"
+
+fresh
+mut sockproxy_h2.c 'h2_send_local_outage(pfe, stream, 503, "backend_unreachable",' 'proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "backend_unreachable",'
+expect "rule 1: an HTTP/2 connect failure answered raw" "proxy_h2_send_ai_deny:backend_unreachable"
+
+fresh
+mut sockproxy_h2.c 'h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 413,
+                            stream->effective_model,"mcp_headers_too_large",' 'proxy_h2_send_ai_deny(pfe,stream,413,0,0,"mcp_headers_too_large",'
+expect "rule 1: an HTTP/2 MCP header refusal answered raw" "proxy_h2_send_ai_deny:mcp_headers_too_large"
+
+fresh
+mut sockproxy_h2.c 'h2_send_mcp_frame(pfe,stream,status,body,(int)blen,' 'h2_send_deny_frame(pfe,stream,status,0,body,(int)blen,'
+expect "rule 1: the HTTP/2 MCP gate frames its refusal raw" "sockproxy_h2.c:sp_mcp_h2_gate:h2_send_deny_frame:-"
 
 fresh
 mut sockproxy_http.c 'if (proxy_send_local_response(pfe, response, sizeof(response) - 1) != 0) {' 'if (sp_send_raw(pfe, response, sizeof(response) - 1) != 0) {'
 expect "rule 1: an allowlist entry that matches nothing" "allowlist entry covers 1 call(s), found 0"
 
 # Rule 1b: a raw write of a built response records first.
+
+fresh
+mut sockproxy_http.c '              proxy_note_local_refusal(pfe, 400);
+              proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400,
+                                      "bad_request");
+' ''
+expect "rule 1b: the smuggling refusal writes its 400 unrecorded" "sockproxy_http.c:handle_client_data:raw:smuggle_400"
 fresh
 mut sockproxy_http.c '      proxy_record_local_completion(client, 502);
 ' ''
@@ -132,11 +164,9 @@ mut sockproxy_http.c '          proxy_note_local_refusal(pfe, 403);
 expect "rule 1b: the LlamaFirewall block written raw without its record" "sockproxy_http.c:handle_on_message_complete:raw:block_response"
 
 fresh
-mut sockproxy_http.c '              sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
-                                  MSG_NOSIGNAL);' '              sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
-                                  MSG_NOSIGNAL);
-              sp_raw_status_write(pfe, smuggle_400, 0, MSG_NOSIGNAL);'
-expect "rule 1b: a second raw write under one allowlist key" "allowlist entry covers 1 call(s), found 2"
+mut sockproxy_http.c '          memset(&pfe->prefix_key, 0, sizeof(pfe->prefix_key));  // P0.2: Reset prefix' '          memset(&pfe->prefix_key, 0, sizeof(pfe->prefix_key));  // P0.2: Reset prefix
+          sp_raw_status_write(pfe, smuggle_400, 0, MSG_NOSIGNAL);'
+expect "rule 1b: a second raw write of the smuggling 400, farther than 12 lines from its record" "sockproxy_http.c:handle_client_data:raw:smuggle_400"
 
 # Rule 2: a local answer never samples TTFB.
 fresh

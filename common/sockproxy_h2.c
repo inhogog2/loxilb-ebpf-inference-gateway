@@ -61,6 +61,11 @@ extern int is_tracing_enabled(void);
 static int proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     int status_code, int retry_after, int retry_body,
     const char *error_code, const char *error_msg);
+/* The recording senders (check_local_answers.sh rule 1): a refusal takes its
+ * deny record at its stage, an outage sets the stream's status for its
+ * settle. Defined with proxy_h2_send_ai_deny below. */
+static int h2_send_local_refusal(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream, int stage, int status_code, const char *model, const char *error_code, const char *error_msg);
+static int h2_send_local_outage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream, int status_code, const char *error_code, const char *error_msg);
 
 // ============================================================================
 // HTTP/2 BACKPRESSURE WATERMARKS (same pattern as HTTP/1.1)
@@ -748,7 +753,8 @@ proxy_h2_on_header_callback(nghttp2_session *session,
       (namelen==10 && !memcmp(name,":authority",10) &&
        (valuelen>=sizeof(stream->authority) || valuelen>=sizeof(pfe->host_url)));
     if (pseudo_oversize) {
-      proxy_h2_send_ai_deny(pfe,stream,413,0,0,"mcp_routing_operand_too_large",
+      h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 413,
+                            stream->effective_model,"mcp_routing_operand_too_large",
                             "MCP routing operands must fit without truncation");
       stream->response_sent=1;
       return 0;
@@ -757,7 +763,8 @@ proxy_h2_on_header_callback(nghttp2_session *session,
     for (size_t i=0; i<stream->request_headers_count; i++)
       total+=stream->request_headers[i].namelen+stream->request_headers[i].valuelen;
     if (stream->request_headers_count>=256 || total>128U*1024U) {
-      proxy_h2_send_ai_deny(pfe,stream,413,0,0,"mcp_headers_too_large",
+      h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 413,
+                            stream->effective_model,"mcp_headers_too_large",
                             "MCP request headers exceed the buffered validation limit");
       stream->response_sent=1;
       return 0;
@@ -917,7 +924,8 @@ proxy_h2_on_data_chunk_recv_callback(nghttp2_session *session,
   if (mcp_pool0 && mcp_pool0->mcp_stateless) {
     if (stream->response_sent) return 0;
     if (len > SP_MCP_PROXY_BODY_MAX - stream->data_len) {
-      proxy_h2_send_ai_deny(pfe, stream, 413, 0, 0, "mcp_body_too_large",
+      h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 413,
+                            stream->effective_model, "mcp_body_too_large",
                             "MCP request exceeds the buffered validation limit");
       stream->response_sent = 1;
       return 0;
@@ -3496,6 +3504,26 @@ h2_send_local_outage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                                error_msg);
 }
 
+/* An MCP answer the gateway frames on one stream, with the JSON-RPC body and
+ * the headers its caller built, recorded by what its status means: a 4xx
+ * refuses the request as framed (the deny record, AI_GW_STAGE_FRAMING, the
+ * error named after the status), a 5xx is an outage (the stream's status,
+ * which its settle records as a completion). The class counter has no
+ * HTTP/2 responses at all (F-7). */
+static int
+h2_send_mcp_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                  int status_code, const char *body, int blen,
+                  const nghttp2_nv *extra, size_t n_extra)
+{
+  if (status_code >= 500)
+    stream->metric_response_status = status_code; /* its settle completes it */
+  else
+    h2_record_local_deny(pfe, stream, AI_GW_STAGE_FRAMING, status_code,
+                         stream->effective_model, sp_mcp_refusal_code(status_code));
+  return h2_send_deny_frame(pfe, stream, status_code, 0, body, blen,
+                            extra, n_extra);
+}
+
 /* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
  * with the same admission headers an upstream router reads and the same
  * Retry-After (5 s for a drain, 1 s otherwise: a stream never queues), and
@@ -3735,7 +3763,7 @@ proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
       answered++;
       continue;
     }
-    if (proxy_h2_send_ai_deny(client, stream, 503, 0, 0, "backend_unreachable",
+    if (h2_send_local_outage(client, stream, 503, "backend_unreachable",
             "the backend endpoint closed the connection before it answered") == 0) {
       answered++;
     }
@@ -4645,7 +4673,7 @@ static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     size_t blen=0;
     char *body=sp_mcp_error_json(req,status,(const char *)stream->data_buf,stream->data_len,&blen);
     nghttp2_nv allow={(uint8_t *)"allow",(uint8_t *)"POST",5,4,NGHTTP2_NV_FLAG_NONE};
-    h2_send_deny_frame(pfe,stream,status,0,body,(int)blen,status==405?&allow:NULL,status==405?1:0);
+    h2_send_mcp_frame(pfe,stream,status,body,(int)blen,status==405?&allow:NULL,status==405?1:0);
     free(body);free(req);
     return -1;
   }
@@ -5163,7 +5191,7 @@ h2_have_tepval:
       ep_idx=sp_mcp_request_select(tepval,pfe);
       if (ep_idx<0) {
         static const char body[]="{\"error\":\"mcp_backend_unavailable\"}";
-        h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
+        h2_send_mcp_frame(pfe,stream,503,body,sizeof(body)-1,NULL,0);
         return 0;
       }
     } else if (sp_route_subset(pfe, tepval)) {
@@ -5257,7 +5285,7 @@ h2_have_tepval:
   if (tepval->mcp_stateless && !sp_mcp_reserve_probe(tepval,ep_idx)) {
     static const char body[]="{\"error\":\"mcp_backend_unavailable\"}";
     fc_permit_release(&stream->fc);
-    h2_send_deny_frame(pfe,stream,503,0,body,sizeof(body)-1,NULL,0);
+    h2_send_mcp_frame(pfe,stream,503,body,sizeof(body)-1,NULL,0);
     return 0;
   }
   /* A route's pick: the selector only looked at the breaker, the half-open
@@ -5428,8 +5456,8 @@ h2_have_tepval:
       if (pfe && pfe->h2_session && pfe->h2_session->session && failed_stream_id > 0) {
         /* The same error name the HTTP/1.1 answer carries, so a client can
          * tell this 503 from a capacity refusal. */
-        proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "backend_unreachable",
-                              "no healthy backend endpoint accepted the connection");
+        h2_send_local_outage(pfe, stream, 503, "backend_unreachable",
+                             "no healthy backend endpoint accepted the connection");
       }
       
       return -1;

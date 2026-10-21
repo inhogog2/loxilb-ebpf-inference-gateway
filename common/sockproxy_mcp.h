@@ -399,4 +399,14 @@ static inline char *sp_mcp_error_json(const struct sp_mcp_request *r,int status,
   }
   free(j);return out;
 }
+/* The error a refused MCP request is recorded under (its deny record), named
+ * after the status its answer carries: the body above tells the client why
+ * in JSON-RPC terms, the record tells the operator which limit refused. */
+static inline const char *sp_mcp_refusal_code(int status) {
+  switch (status) {
+  case 405: return "mcp_method_not_allowed";
+  case 413: return "mcp_request_too_large";
+  default: return "mcp_invalid_request";
+  }
+}
 #endif
