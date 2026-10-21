@@ -247,7 +247,8 @@ typedef struct proxy_metrics_snapshot {
     uint64_t route_host_missing;
 
     /* P/D admission units held now on prefill and on decode endpoints, and
-     * the connections PARKED for one (request-lifetime occupancy).
+     * the clients parked on a prefill endpoint's queue (the per-EP FIFO's
+     * live count, not a connection phase).
      * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
     uint64_t pd_prefill_inflight;
     uint64_t pd_decode_inflight;

@@ -163,9 +163,6 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
         proxy_fd_ent_t *pfe = node->val.fdlist;
         while (pfe) {
             snapshot.active_connections++;
-            if (pfe->pd_phase == PD_PHASE_PARKED) {
-                snapshot.pd_parked_connections++;
-            }
             if (pfe->ssl) {
                 snapshot.active_ssl_connections++;
             }
@@ -202,6 +199,15 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
                             snapshot.pd_decode_inflight += units;
                         }
                     }
+                    /* Clients parked on a prefill endpoint's queue: the per-EP
+                     * FIFO's live count under its own lock (taken under
+                     * PROXY_LOCK here as at every other site). A connection's
+                     * pd_phase is the owner worker's and is not read here. */
+                    pthread_mutex_lock(&tepval->pd_parked_lock);
+                    for (int ep = 0; ep < tepval->n_eps; ep++) {
+                        snapshot.pd_parked_connections += tepval->pd_parked[ep].count;
+                    }
+                    pthread_mutex_unlock(&tepval->pd_parked_lock);
                     pthread_rwlock_rdlock(&tepval->pd_session_lock);
                     snapshot.pd_sessions_active += HASH_COUNT(tepval->pd_session_map);
                     pthread_rwlock_unlock(&tepval->pd_session_lock);
