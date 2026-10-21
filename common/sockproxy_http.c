@@ -1591,6 +1591,30 @@ proxy_note_client_response(proxy_fd_ent_t *pfe, uint16_t status)
   return proxy_note_response_(pfe, status, 1);
 }
 
+/* Origin-error breaker feed for plain (non-P/D) relay, from a backend reply
+ * the client receives: an endpoint that accepts TCP but keeps answering 5xx
+ * never trips the connect-level breaker, and prefix affinity keeps
+ * re-selecting it. P/D flows are excluded — their dialect handlers feed the
+ * breaker with leg-accurate EP indexes. The endpoint handle lives on the
+ * CLIENT entry (the backend entry keeps epv/ep_num unset by design for load
+ * accounting). 4xx neither extends nor resets the streak: engines answer
+ * 4xx/5xx to client-fault bodies, and only a consecutive-5xx streak should
+ * demote. Fed once per reply, by the site whose note took the latch. */
+static void
+proxy_origin_status_feed(proxy_fd_ent_t *client, uint16_t status)
+{
+  proxy_epval_t *repval;
+
+  if (client->pd_phase != PD_PHASE_NONE || !client->epv || client->ep_num < 0)
+    return;
+  repval = (proxy_epval_t *)client->epv;
+  if (status >= 500) {
+    circuit_breaker_record_origin_error(repval, client->ep_num);
+  } else if (status < 400) {
+    circuit_breaker_record_origin_success(repval, client->ep_num);
+  }
+}
+
 /* Record a response the gateway wrote itself to its client, in place of a
  * backend: a refusal or an outage answer. Status and class, no TTFB sample:
  * the histogram has no labels, and a refusal storm would pull the inference
@@ -1968,26 +1992,12 @@ skip_deferred_masking:
           uint16_t status = (status_start[0] - '0') * 100 +
                             (status_start[1] - '0') * 10 +
                             (status_start[2] - '0');
-          // Status, class counter and TTFB sample, once per request.
+          // Status, class counter and TTFB sample, once per request. A
+          // status line split across reads ("HTTP/1.1 200" then " OK\r\n…")
+          // is never a read this sniff takes; the response framer, which
+          // assembles it, records it (cresp_on_headers_complete).
           int noted = proxy_note_client_response(rfd_ent, status);
-          // Origin-error breaker feed for plain (non-P/D) relay: an endpoint
-          // that accepts TCP but keeps answering 5xx never trips the
-          // connect-level breaker, and prefix affinity keeps re-selecting it.
-          // P/D flows are excluded — their dialect handlers feed the breaker
-          // with leg-accurate EP indexes. The endpoint handle lives on the
-          // CLIENT entry (the backend entry keeps epv/ep_num unset by design
-          // for load accounting). 4xx neither extends nor resets the streak:
-          // engines answer 4xx/5xx to client-fault bodies, and only a
-          // consecutive-5xx streak should demote.
-          if (noted && rfd_ent->pd_phase == PD_PHASE_NONE &&
-              rfd_ent->epv && rfd_ent->ep_num >= 0) {
-            proxy_epval_t *repval = (proxy_epval_t *)rfd_ent->epv;
-            if (status >= 500) {
-              circuit_breaker_record_origin_error(repval, rfd_ent->ep_num);
-            } else if (status < 400) {
-              circuit_breaker_record_origin_success(repval, rfd_ent->ep_num);
-            }
-          }
+          if (noted) proxy_origin_status_feed(rfd_ent, status);
         }
       }
     }
@@ -11315,7 +11325,24 @@ cresp_on_headers_complete(llhttp_t *parser)
   if (!cresp_is_answer(parser->status_code)) {
     return 0;
   }
+  /* The answer's record (status, class counter, TTFB sample). The capture
+   * in proxy_try_epxmit sniffs the status line from the first bytes of a
+   * read, and misses one split across reads: "HTTP/1.1 200" is too short
+   * and " OK\r\n…" is no status line. The framer assembles it whatever the
+   * read boundaries, so it records too; the once-per-request latch makes
+   * whichever of the two runs second a no-op. The feed site skips the legs
+   * whose bytes never reach the client (the P/D prefill leg, the SGLang
+   * drain), as the capture does (MON-02-EDGE). */
+  {
+    uint16_t status = (uint16_t)parser->status_code;
+    if (proxy_note_client_response(pfe, status))
+      proxy_origin_status_feed(pfe, status);
+  }
   pfe->metric_response_status = parser->status_code;
+#ifdef HAVE_HTTP_TRACE
+  if (pfe->response_status_code == 0)
+    pfe->response_status_code = (uint16_t)parser->status_code;
+#endif
   if (pfe->cresp_sse.is_sse) proxy_sse_activate(pfe);
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
