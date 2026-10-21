@@ -6148,9 +6148,10 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
         !pfe->h2_session &&
             atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed),
         teardown_owes_abort_record(&v));
-    /* Before any answer the record is owed only when the client left
-     * (status 0, client_abort_before_answer). */
-    if (u->end == SP_END_CLIENT_NO_ANSWER) {
+    /* Before any answer the record is owed when the client left
+     * (client_abort_before_answer) or, off P/D, the leg ended under it
+     * (backend_died): status 0 either way. */
+    if (teardown_owes_abort_record(&v) && sp_end_recorded_before_answer(u->end)) {
       u->owes_record = 1;
     }
     /* Claimed under the lock: whatever this entry owes, it owes once. */
@@ -6159,11 +6160,16 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
 
     /* A P/D client that left, with its answer open or before any answer: the
      * request's lifecycle record is aborted (9), the cause the request record
-     * names (client_abort, client_abort_before_answer), once. Not for one a
-     * leg's death or a reaper already recorded (they moved it out of the
-     * in-flight phases, or named another cause). */
+     * names (client_abort, client_abort_before_answer), once. With its answer
+     * open, not for one a leg's death or a reaper already recorded (they
+     * moved it out of the in-flight phases, or named another cause). Before
+     * any answer, on a P/D rule at any stage (in flight, at the gate, queued,
+     * parked): status 0 and no request record mean no lifecycle record was
+     * written for this request, whatever pd_phase a kept connection carries
+     * from the one before. */
     if (u->owes_record && sp_end_client_left(u->end) &&
-        pd_reap_error_phase(pfe->pd_phase) >= 0) {
+        (pd_reap_error_phase(pfe->pd_phase) >= 0 ||
+         (u->end == SP_END_CLIENT_NO_ANSWER && pfe->pd_rule))) {
       int64_t prefill_ms = 0;
 
       if (pfe->pd_prefill_start_ns > 0 &&
@@ -6809,9 +6815,9 @@ proxy_pdestroy(void *priv)
           }
           /* The same leg ending before any answer, under a whole request on
            * a rule that is not P/D: the engine ended it too, not the client.
-           * Named here so the cascade's teardown does not read it as the
-           * client leaving before its answer (teardown_owes_abort_record);
-           * that teardown records no client_abort_before_answer for it. */
+           * Named here so the cascade's teardown records it as the engine's
+           * end (backend_died, status 0), not as the client leaving before
+           * its answer. The client gets the bare close, no 502 (F-18). */
           if (cl && !cl->end_cause && !pfe->pd_sg_drain && !cl->pd_rule &&
               cl->odir == 0 && cl->metric_req_start_ns > 0 &&
               !cl->metric_ai_recorded && cl->metric_response_status == 0) {
