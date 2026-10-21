@@ -305,15 +305,11 @@ if ! printf '%s' "$rba" | grep -q 'return end == SP_END_CLIENT_NO_ANSWER || end 
 fi
 
 # 6h. The rule's listener going before any answer is the gateway's end
-#     (listener_closed, status 0), and on a P/D rule, at any stage, its
-#     lifecycle record is aborted/gateway (10), once (F-17).
+#     (listener_closed, status 0), the request record alone (F-17: no listener
+#     goes with requests on it in the product today; test_teardown_settle.c).
 eat=$(awk '/^sp_end_cause_at_teardown\(/ {on = 1} on && /^}/ {exit} on' ./sockproxy_end_cause.h | tr '\n' ' ')
 if ! printf '%s' "$eat" | grep -q 'if (no_answer) { *return listener ? SP_END_LISTENER_CLOSED : SP_END_CLIENT_NO_ANSWER;'; then
   echo "sockproxy_end_cause.h: the listener going before any answer must be the gateway's end (listener_closed)"
-  fail=1
-fi
-if ! printf '%s' "$col" | grep -q 'if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status == 0 && *(pd_reap_error_phase(pfe->pd_phase) >= 0 || pfe->pd_rule)) {.*10 /\*aborted, gateway\*/); *pfe->pd_phase = PD_PHASE_ERROR;'; then
-  echo "sockproxy_http.c: a P/D request whose listener went before any answer must record aborted/gateway (10) once"
   fail=1
 fi
 

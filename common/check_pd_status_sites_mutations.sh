@@ -236,23 +236,10 @@ mut sockproxy_http.c '              !cl->metric_ai_recorded && cl->metric_respon
             (void)0;'
 expect "6e: a leg dying before any answer reads as the client leaving" "off P/D, a leg ending before any answer must name the engine"
 
-# 6h: the listener going before any answer: listener_closed, and 10 on P/D.
+# 6h: the listener going before any answer: listener_closed.
 fresh
 mut sockproxy_end_cause.h '    return listener ? SP_END_LISTENER_CLOSED : SP_END_CLIENT_NO_ANSWER;' '    return listener ? SP_END_NONE : SP_END_CLIENT_NO_ANSWER;'
 expect "6h: the listener going before any answer is not recorded" "the listener going before any answer must be the gateway's end"
-fresh
-mut sockproxy_http.c '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 10 /*aborted, gateway*/);' '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 9 /*aborted*/);'
-expect "6h: the listener's end reads as the client leaving (9)" "must record aborted/gateway (10) once"
-fresh
-mut sockproxy_http.c '    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status == 0 &&
-        (pd_reap_error_phase(pfe->pd_phase) >= 0 || pfe->pd_rule)) {' '    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED &&
-        (pd_reap_error_phase(pfe->pd_phase) >= 0 || pfe->pd_rule)) {'
-expect "6h: an open answer's listener end records 10" "must record aborted/gateway (10) once"
-fresh
-mut sockproxy_http.c '    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status == 0 &&
-        (pd_reap_error_phase(pfe->pd_phase) >= 0 || pfe->pd_rule)) {' '    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status == 0 &&
-        pd_reap_error_phase(pfe->pd_phase) >= 0) {'
-expect "6h: a parked P/D request's listener end has no 10" "must record aborted/gateway (10) once"
 
 # 6g: a connection whose answers go by the kernel owes nothing before any answer.
 fresh

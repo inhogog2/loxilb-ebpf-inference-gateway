@@ -74,8 +74,10 @@ sp_end_code(int end)
  * answer (no status, `no_answer`: a P/D request in its prefill or before the
  * decode leg's first byte, or any whole request on a rule that is not P/D) is
  * the client leaving before it, or the gateway when the whole listener is
- * going (on a P/D rule the lifecycle's aborted/gateway, 10, pairs with it). An
- * answer that ended whole, or a request a status accounts for, has none. */
+ * going (the request record alone: the P/D lifecycle has no record for it,
+ * and nothing in the product tears a listener down with requests on it, see
+ * test_teardown_settle.c). An answer that ended whole, or a request a status
+ * accounts for, has none. */
 static inline int
 sp_end_cause_at_teardown(int recorded, int listener, int answer_open,
                          int no_answer)
