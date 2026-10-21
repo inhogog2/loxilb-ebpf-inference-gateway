@@ -6186,8 +6186,8 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     /* A P/D request whose rule's listener went before any answer, at any
      * stage (in flight, at the gate, queued, parked): the gateway ended it.
      * Its lifecycle record is aborted/gateway (10), beside the request
-     * record's listener_closed with status 0, once. With its answer open the
-     * listener's end is not this record. */
+     * record's listener_closed with status 0, once. With its answer open it
+     * is the next block's. */
     if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status == 0 &&
         (pd_reap_error_phase(pfe->pd_phase) >= 0 || pfe->pd_rule)) {
       int64_t prefill_ms = 0;
@@ -6199,6 +6199,25 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
       }
       sp_pd_record(pfe, um_model ? um_model : "", prefill_ms, 0,
                    (pfe->pd_kv_params_len > 0) ? 1 : 0, 10 /*aborted, gateway*/);
+      pfe->pd_phase = PD_PHASE_ERROR;
+    }
+    /* The same listener going with the decode answer open: the gateway cut an
+     * answer that had begun, decode/truncated (8), beside the request record's
+     * listener_closed with the status the client got. The 8/10 boundary is
+     * the answer: 10 before it, 8 after. Not recorded otherwise, since the
+     * decode leg's own teardown finds the client already unlinked. */
+    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status != 0 &&
+        (pfe->pd_phase == PD_PHASE_DECODE_SENDING ||
+         pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {
+      int64_t prefill_ms = 0;
+
+      if (pfe->pd_prefill_start_ns > 0 &&
+          pfe->pd_decode_start_ns > pfe->pd_prefill_start_ns) {
+        prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
+                                pfe->pd_prefill_start_ns) / 1000000ULL);
+      }
+      sp_pd_record(pfe, um_model ? um_model : "", prefill_ms, 0,
+                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 8 /*decode, truncated*/);
       pfe->pd_phase = PD_PHASE_ERROR;
     }
   }
