@@ -83,6 +83,17 @@ mut sockproxy_health.c '    proxy_record_local_completion(pfe, 502);' '    ;'
 expect "rule 1: the reaper drops a P/D timeout's completion" "sp_reap_record must record: proxy_record_local_completion(pfe, 502)"
 
 fresh
+mut sockproxy_health.c '  case SP_REAP_FC_TTL:
+    proxy_note_local_refusal(pfe, 429);' '  case SP_REAP_FC_TTL:
+    ;'
+expect "rule 1: the reaper drops an eviction's or a client TTL's 429" "sp_reap_record must record: proxy_note_local_refusal(pfe, 429)"
+
+fresh
+mut sockproxy_health.c '  proxy_note_local_refusal(pfe, 429);
+  if (len > 0 && proxy_send_local_response(pfe, framed, len) == 0)' '  if (len > 0 && proxy_send_local_response(pfe, framed, len) == 0)'
+expect "rule 1: a kept eviction answer drops its record" "sp_fc_shed_answer_kept must record: proxy_note_local_refusal(pfe, 429)"
+
+fresh
 mut sockproxy_l7policy.c '    proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code, "l7_policy_reject");' ''
 expect "rule 1: an L7-policy REJECT drops its deny record" "l7_send_reject must record: proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code"
 

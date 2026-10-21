@@ -220,7 +220,9 @@ void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
  * was not written whole. */
 int sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                              const char *msg, uint32_t inflight, uint32_t queued,
-                             uint32_t limit, uint32_t retry_after, int keep);
+                             uint32_t limit, uint32_t retry_after, int keep,
+                             const char *cls, uint32_t band_wait_ms,
+                             const char *dropped_reason);
 /* Service identity "VIP:port" from the connection's rule head ("" when the
  * head is gone). */
 void proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len);
@@ -241,6 +243,8 @@ enum sp_reap_resp {
   SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
   SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
   SP_REAP_SSE_STALL,            /* SSE error event: client stopped reading; shutdown */
+  SP_REAP_FC_SHED,              /* 429 admission_shed: evicted from the queue; teardown */
+  SP_REAP_FC_TTL,               /* 429 admission_ttl_expired: the client's own TTL ended the wait (fc_llmd_headers on); teardown */
   SP_REAP_KINDS,
 };
 
@@ -250,6 +254,10 @@ enum sp_reap_resp {
  * gateway (sockproxy_abandon.h). */
 uint32_t sp_sse_stall_abort_sec(void);
 void sp_reap_finish(proxy_fd_ent_t *pfe);
+/* The 429 admission_shed an evicted request's own worker writes on a
+ * connection it keeps (Connection: keep-alive); 0 = written, kept; -1 = the
+ * connection was ended (answered with a close, or cut short). */
+int sp_fc_shed_answer_kept(proxy_fd_ent_t *pfe);
 /* Hand a response of `kind` to the connection's owner worker and end the
  * connection there (sockproxy_health.c; the reaper's own entry point). The
  * caller holds PROXY_LOCK. */
@@ -262,7 +270,8 @@ void sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind);
  * KEPT (refused, the response written, the connection kept for its next
  * request). The endpoint gate returns the endpoint the unit landed on,
  * which may differ from the selector's pick, or one of the outcomes. The
- * role gate takes `may_wait`: a prefill/decode leg never waits. */
+ * role gate takes `may_wait`; the P/D role gates (sp_fc_h1_gate_pd_roles)
+ * wait, like the service and endpoint gates. */
 #define SP_FC_H1_REFUSED (-1)
 #define SP_FC_H1_QUEUED  (-2)
 #define SP_FC_H1_KEPT    (-3)
@@ -287,6 +296,8 @@ int sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval);
 int sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel);
 int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
                        int may_wait);
+int sp_fc_h1_gate_pd_roles(proxy_fd_ent_t *pfe, proxy_epval_t *tepval,
+                           int prefill_ep, int decode_ep);
 int sp_fc_normal_eligible(void *ctx, int ep);
 /* ctx: sp_mcp_fc_scope (sockproxy_mcp_rr.h). */
 int sp_fc_route_eligible(void *ctx, int ep);
@@ -294,6 +305,10 @@ int sp_fc_route_eligible(void *ctx, int ep);
  * (SP_REAP_FC_DRAINED): the pool is going away, or the process drains.
  * The caller holds PROXY_LOCK. */
 void sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach);
+/* Answer, through the same path, every waiter evicted from the pool's queue
+ * at or before `before_ns` whose owner has not claimed its answer (its wake
+ * was lost). The caller holds PROXY_LOCK. */
+void sp_fc_evicted_sweep(proxy_epval_t *tepval, uint64_t before_ns);
 /* The adaptive ceiling's signal for one pool at the 1 Hz pass: fresh
  * scraped depths and TTFT estimates within the pool's telemetry window.
  * The caller holds PROXY_LOCK. */

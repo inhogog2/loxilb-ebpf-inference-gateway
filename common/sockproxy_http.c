@@ -140,6 +140,12 @@ void llamafirewall_set_initialized(int initialized) { atomic_store(&g_llamafirew
 
 #include "sockproxy_http.h"  /* own header — after all deps; provides PROXY_SESSION_* */
 
+/* A capacity band is the class constant the admission gate resolved. */
+_Static_assert(AI_GW_CLASS_STANDARD == FC_BAND_STANDARD &&
+               AI_GW_CLASS_CRITICAL == FC_BAND_CRITICAL &&
+               AI_GW_CLASS_SHEDDABLE == FC_BAND_SHEDDABLE,
+               "capacity bands are the class constants");
+
 /* Portable strnstr (needed by inject_forwarded_headers and url-matching) */
 /* Service identity "VIP:port" for the QoS ladder, from the connection's
  * rule head. "" when the head is gone (teardown races) — the ladder treats
@@ -934,6 +940,7 @@ inject_request_id_header(void *msg, size_t *len, size_t bufsize,
 /* The three header-block edits (strip a header, strip a family, splice a
  * line) live in sockproxy_h1_hdr.h, where the unit test reaches them. */
 #include "sockproxy_h1_hdr.h"
+#include "sockproxy_llmd_fwd.h"
 
 /* Emit-callback context for the H1 path: the mutable request buffer. */
 typedef struct {
@@ -1178,6 +1185,33 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
                                  pfe->auth_user_id);
     }
   }
+  return cur;
+}
+
+/*
+ * sp_llmd_forward_headers — with fc_llmd_headers on, the objective and the
+ * fairness identity that leave the gateway for the backend are the ones the
+ * gateway resolved. A client's copy of either name (the new and the
+ * deprecated one) is removed whatever the request is; the resolved values
+ * are written only at the gate, and not on a chunked request (an insertion
+ * needs room, as ai_strip_upstream_api_key's identity injection does).
+ * The objective is the class the admission gate resolved (standard when it
+ * resolved none); the fairness identity is the authenticated tenant, and
+ * none is written for a request without one.
+ */
+static size_t
+sp_llmd_forward_headers(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
+                        size_t bufsize, int at_gate)
+{
+  size_t cur = buflen;
+
+  if (!pfe || !buf || pfe->odir || !pfe->fc.fc || !pfe->fc.fc->cfg.llmd_headers)
+    return buflen;
+  if (sp_llmd_rewrite_head(buf, &cur, bufsize,
+                           sp_class_name(pfe->adm_class_set ? pfe->adm_class : 0),
+                           sp_class_hdr_value_ok(pfe->tenant_id) ? pfe->tenant_id : NULL,
+                           at_gate) != 0)
+    return buflen;   /* terminator lost: leave the buffer as it was */
   return cur;
 }
 
@@ -5016,10 +5050,16 @@ proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max)
  * the export carries no endpoint index (no per-endpoint series). */
 _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc.h");
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
+_Static_assert(PROXY_FC_BAND_OUTCOMES == FC_BO_COUNT,
+               "band outcome count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
 _Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
-_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 2 == FC_LIMITS,
+_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 2 + PROXY_FC_BAND_LIMITS == FC_LIMITS,
                "limit count drifted from sockproxy_fc.h");
+_Static_assert(PROXY_FC_BAND_LIMITS == FC_BAND_LIMITS && PROXY_FC_BANDS == FC_BANDS,
+               "band counts drifted from sockproxy_fc.h");
+_Static_assert(FC_L_WAKE_POLICY == FC_L_EXPOSE_HEADERS + 1,
+               "the band knobs' sources follow the admission headers'");
 _Static_assert(FC_L_ADAPTIVE == PROXY_FC_LIMITS,
                "the adaptive limits must follow the first block");
 _Static_assert(FC_L_TENANT_SHARE == PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS,
@@ -5028,7 +5068,7 @@ _Static_assert(FC_L_EXPOSE_HEADERS == FC_L_TENANT_SHARE + 1,
                "the admission headers' source follows the tenant share's");
 
 static void
-sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
+sp_fc_fill_queue_stat(fc_state_t *fc, proxy_fc_svc_stat_t *st)
 {
   st->queued = fc_queued(fc);
   st->max_queue_depth = fc->cfg.max_queue_depth;
@@ -5059,6 +5099,29 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   st->src_tenant = fc->cfg.src[FC_L_TENANT_SHARE];
   st->expose_headers = fc->cfg.expose_headers;
   st->src_expose = fc->cfg.src[FC_L_EXPOSE_HEADERS];
+  for (int b = 0; b < FC_BANDS; b++) {
+    st->band_inflight[b] = fc_band_inflight(fc, (uint8_t)b);
+    st->band_queued[b] = fc_band_queued(fc, (uint8_t)b);
+    st->band_wait_ms[b] = fc->cfg.band_wait_ms[b];
+    st->band_weight[b] = fc->cfg.band_weight[b];
+    st->band_min_share_pct[b] = fc->cfg.band_min_share_pct[b];
+    st->band_queue_pct[b] = fc->cfg.band_queue_pct[b];
+  }
+  st->critical_reserve_pct = fc->cfg.critical_reserve_pct;
+  st->wake_policy = fc->cfg.wake_policy;
+  st->shed_queue = fc->cfg.shed_queue;
+  st->tenant_wake = fc->cfg.tenant_wake;
+  st->llmd_headers = fc->cfg.llmd_headers;
+  st->bands = fc->cfg.bands;
+  st->band_fallback = fc->cfg.band_fallback;
+  st->wake_policy_cfg = fc->cfg.wake_policy_cfg;
+  st->shed_queue_cfg = fc->cfg.shed_queue_cfg;
+  st->tenant_wake_cfg = fc->cfg.tenant_wake_cfg;
+  for (int l = 0; l < PROXY_FC_BAND_LIMITS; l++)
+    st->src_band[l] = fc->cfg.src[FC_L_WAKE_POLICY + l];
+  for (int b = 0; b < FC_BANDS; b++)
+    for (int o = 0; o < FC_BO_COUNT; o++)
+      st->band_outcome[b][o] = fc_band_outcome(fc, (uint8_t)b, o);
 }
 
 int
@@ -5211,6 +5274,7 @@ proxy_get_fc_inflight_total(void)
 struct sp_fc_drain_ctx {
   uint8_t kind;
   uint8_t detach;
+  fc_state_t *fc;                /* SP_REAP_FC_SHED: the pool whose evicted list is swept */
 };
 
 static int
@@ -5222,11 +5286,20 @@ sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
 
   pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
   if (!pfe || pfe->fd != e->fd || reg_gen != e->gen ||
-      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen ||
-      pfe->fc.state != FC_P_QUEUED) {
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen) {
     return 0;
   }
-  pfe->fc.state = FC_P_NONE;
+  /* One swap decides the request: if the owner's resume made it first (its
+   * turn, or its eviction claimed), this path answers nothing. An evicted
+   * waiter is decided only with its entry still on the evicted list, taken
+   * in the same step: (fd, gen) names the connection, not the wait, and
+   * after the owner answered its eviction the next request on a kept
+   * connection may be parked under the same pair. */
+  if (d->kind == SP_REAP_FC_SHED
+          ? !fc_queue_evicted_settle(d->fc, &pfe->fc, e->fd, e->gen)
+          : !fc_permit_settle(&pfe->fc, FC_P_ENDED)) {
+    return 0;
+  }
   if (d->detach) {
     fc_permit_unbind(&pfe->fc);
   }
@@ -5239,11 +5312,28 @@ void
 sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach)
 {
   struct sp_fc_drain_ctx d = { .kind = kind, .detach = (uint8_t)(detach != 0) };
+  struct sp_fc_drain_ctx shed = { .kind = SP_REAP_FC_SHED,
+                                  .detach = (uint8_t)(detach != 0),
+                                  .fc = tepval ? &tepval->fc : NULL };
 
   if (!tepval || !proxy_struct || !proxy_struct->ns) {
     return;
   }
   fc_queue_drain(&tepval->fc, sp_fc_drain_cb, &d);
+  /* An evicted waiter still owed its answer gets the one it was owed. */
+  fc_queue_evicted_sweep(&tepval->fc, UINT64_MAX, sp_fc_drain_cb, &shed);
+}
+
+void
+sp_fc_evicted_sweep(proxy_epval_t *tepval, uint64_t before_ns)
+{
+  struct sp_fc_drain_ctx shed = { .kind = SP_REAP_FC_SHED, .detach = 0,
+                                  .fc = tepval ? &tepval->fc : NULL };
+
+  if (!tepval || !proxy_struct || !proxy_struct->ns) {
+    return;
+  }
+  fc_queue_evicted_sweep(&tepval->fc, before_ns, sp_fc_drain_cb, &shed);
 }
 
 void
@@ -9119,6 +9209,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->auth_jwt_capable = 0;
     pfe->auth_netid_fwd = 0;
     sp_obj_hint_reset(&pfe->obj_hint);
+    sp_ttl_hint_reset(&pfe->ttl_hint);
     pfe->adm_priority = 0;
     pfe->adm_class = 0;
     pfe->adm_class_set = 0;
@@ -9196,19 +9287,25 @@ sp_h1_send_framing_deny(proxy_fd_ent_t *pfe, int status, const char *code,
 /* A capacity refusal: the request passed policy and there is no room for it.
  * 429 carries Retry-After and the admission headers an upstream router reads
  * (inflight, queued, limit); 503 says no healthy endpoint has capacity at
- * all, or that the process is draining. Emitted through the bounded
- * TLS-aware sender like every refusal. With `keep` the response is framed
- * with its length and the connection stays open for the next request:
- * under overload a refusal that closes turns into a reconnect storm.
- * Returns 0 when the whole response was written; on a partial write the
- * connection cannot carry another response and the caller closes it. */
+ * all, or that the process is draining. A request whose class was resolved
+ * (`cls`) also carries its class and its band's wait window in force.
+ * Emitted through the bounded TLS-aware sender like every refusal. With
+ * `keep` the response is framed with its length and the connection stays
+ * open for the next request: under overload a refusal that closes turns
+ * into a reconnect storm. Returns 0 when the whole response was written; on
+ * a partial write the connection cannot carry another response and the
+ * caller closes it. */
 int
 sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                          const char *msg, uint32_t inflight, uint32_t queued,
-                         uint32_t limit, uint32_t retry_after, int keep)
+                         uint32_t limit, uint32_t retry_after, int keep,
+                         const char *cls, uint32_t band_wait_ms,
+                         const char *dropped_reason)
 {
   char body[256];
-  char resp_buf[768];
+  char resp_buf[960];
+  char band_hdrs[128] = "";
+  char reason_hdr[64] = "";
   const char *status_line = status == 503 ? "503 Service Unavailable"
                                           : "429 Too Many Requests";
   int blen, n, rc = -1;
@@ -9226,6 +9323,13 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     blen = 0;
     body[0] = '\0';
   }
+  if (cls)
+    snprintf(band_hdrs, sizeof(band_hdrs),
+             "X-Loxilb-Admission-Class: %s\r\n"
+             "X-Loxilb-Admission-Band-Wait-Ms: %u\r\n", cls, band_wait_ms);
+  if (dropped_reason)
+    snprintf(reason_hdr, sizeof(reason_hdr), SP_LLMD_REASON_HDR ": %s\r\n",
+             dropped_reason);
   n = snprintf(resp_buf, sizeof(resp_buf),
     "HTTP/1.1 %s\r\n"
     "Content-Type: application/json\r\n"
@@ -9234,11 +9338,12 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     "X-Loxilb-Admission-Inflight: %u\r\n"
     "X-Loxilb-Admission-Queued: %u\r\n"
     "X-Loxilb-Admission-Limit: %u\r\n"
+    "%s%s"
     "Connection: %s\r\n"
     "\r\n"
     "%s",
-    status_line, blen, retry_after, inflight, queued, limit,
-    keep ? "keep-alive" : "close", body);
+    status_line, blen, retry_after, inflight, queued, limit, band_hdrs,
+    reason_hdr, keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     /* The request record is the caller's (ai_gw_record_capacity_deny). */
     proxy_note_local_refusal(pfe, (uint16_t)status);
@@ -9329,6 +9434,7 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->has_custom_session_header = 0;
   pfe->x_model_header[0] = '\0';
   sp_obj_hint_reset(&pfe->obj_hint);
+  sp_ttl_hint_reset(&pfe->ttl_hint);
   l7_origin_reset(pfe);
   pfe->vllm_request_id[0] = '\0';
   pfe->has_vllm_request_id = 0;
@@ -9371,6 +9477,10 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
   int tenant_full = 0;
   int keep;
 
+  /* A sheddable request that may not wait is shed, whichever ceiling it
+   * met (the service gate already says so for its own). */
+  v = fc_band_verdict(fc, &pfe->fc, v);
+
   /* Whatever the service level granted before the refusal goes back now:
    * the teardown that follows would do it too, but a refused request must
    * not hold a unit for even the length of its own close, and a parked one
@@ -9385,6 +9495,8 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
    * may not wait here (a role leg, a stream) takes the refusal below. */
   if ((v == FC_QUEUE || v == FC_SHED) && may_wait && fc_queue_enabled(fc) &&
       !pfe->h2_session) {
+    /* The client's TTL rides this push (read only with fc_llmd_headers on). */
+    pfe->fc.q_ttl_ms = fc->cfg.llmd_headers ? sp_ttl_hint_ms(&pfe->ttl_hint) : 0;
     int prc = fc_queue_push(fc, &pfe->fc, pfe->fd,
                             atomic_load_explicit(&pfe->gen, memory_order_acquire),
                             qos_now_ns(), woken);
@@ -9402,6 +9514,11 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
       queue_full = 1;
     retry_after = fc_retry_after_s(fc);
   }
+  /* A woken request refused here (a sheddable one whose pool stopped
+   * letting it wait while it waited) ends its park: its wait is observed
+   * once, as an admission or an expiry would. Nothing for a request that
+   * never parked. */
+  fc_queue_wait_end(fc, &pfe->fc, qos_now_ns());
   if (v == FC_NO_CAPACITY) {
     status = 503;
     code = "admission_no_capacity";
@@ -9417,6 +9534,9 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
     msg = "the tenant holds its share of this service";
     if (!tenant_full)
       fc_count(fc, FC_R_TENANT_SHARE);
+  } else if (v == FC_BAND_SHED) {
+    code = "admission_shed";
+    fc_count_band(fc, FC_R_SHED, pfe->fc.band);
   } else if (!queue_full) {
     fc_count(fc, FC_R_CAPACITY_SHED);
   }
@@ -9430,7 +9550,10 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
 
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
   if (sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, queued, limit,
-                               retry_after, keep) != 0 && keep) {
+                               retry_after, keep,
+                               pfe->adm_class_set ? sp_class_name(pfe->adm_class) : NULL,
+                               fc_band_wait_ms(fc, pfe->fc.band),
+                               fc->cfg.llmd_headers ? sp_llmd_reason_of(code) : NULL) != 0 && keep) {
     /* A refusal cut short leaves the connection mid-response: it cannot
      * carry the next request. */
     shutdown(pfe->fd, SHUT_RDWR);
@@ -9501,9 +9624,11 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
     return 0;
   }
   /* Admitted as the tenant the credential resolved to (the admission gate
-   * ran before dispatch); no tenant is the keyless pseudo-tenant. */
-  v = fc_service_acquire_h1_tenant(&tepval->fc, &pfe->fc, woken,
-                                   fc_tenant_key(pfe->tenant_id));
+   * ran before dispatch); no tenant is the keyless pseudo-tenant. The band
+   * is the class the gate resolved; a request it gave none is standard. */
+  v = fc_service_acquire_h1_band(&tepval->fc, &pfe->fc, woken,
+                                 fc_tenant_key(pfe->tenant_id),
+                                 fc_band_of(pfe->adm_class));
   if (v == FC_ADMIT) {
     pfe->fc_expose_pending = 1;
     return 0;
@@ -9545,6 +9670,27 @@ sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
   if (fc_ep_acquire(&tepval->fc, &pfe->fc, ep, role) == FC_SHED)
     return sp_fc_h1_refuse(pfe, tepval, FC_SHED, role, may_wait);
   return 0;
+}
+
+/* The two role units of a P/D request, prefill then decode, each taken
+ * under its own ceiling. A request that meets a full role ceiling waits
+ * for a unit when the pool queues, as at the service and endpoint
+ * ceilings: whatever it took goes back first (sp_fc_h1_refuse), so a
+ * prefill unit granted before a refused decode is not held while it
+ * waits, and its wake drives the whole dispatch again. A request that
+ * waited in the P/D prefill park first carries that park's start
+ * (pd_resume_parked), and the queue counts its wait from then. Returns 0
+ * with both units held, else SP_FC_H1_QUEUED, SP_FC_H1_KEPT or
+ * SP_FC_H1_REFUSED. */
+int
+sp_fc_h1_gate_pd_roles(proxy_fd_ent_t *pfe, proxy_epval_t *tepval,
+                       int prefill_ep, int decode_ep)
+{
+  int rc = sp_fc_h1_gate_role(pfe, tepval, prefill_ep, FC_ROLE_PREFILL, 1);
+
+  if (rc == 0)
+    rc = sp_fc_h1_gate_role(pfe, tepval, decode_ep, FC_ROLE_DECODE, 1);
+  return rc;
 }
 
 /* The queue's wake: the popped entry's connection is driven again on its
@@ -9662,17 +9808,47 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   rule.ttft_target_ms = arg->fc_ttft_target_ms;
   rule.tenant_share_pct = arg->fc_tenant_share_pct;
   rule.expose_headers = arg->fc_expose_headers;
+  rule.wake_policy = arg->fc_wake_policy;
+  rule.shed_queue = arg->fc_shed_queue;
+  rule.tenant_wake = arg->fc_tenant_wake;
+  rule.llmd_headers = arg->fc_llmd_headers;
+  rule.critical_reserve_pct = arg->fc_critical_reserve_pct;
+  for (int b = 0; b < FC_BANDS; b++) {
+    rule.band_weight[b] = arg->fc_band_weight[b];
+    rule.band_min_share_pct[b] = arg->fc_band_min_share_pct[b];
+    rule.band_queue_pct[b] = arg->fc_band_queue_pct[b];
+    rule.band_wait_ms[b] = arg->fc_band_wait_ms[b];
+  }
   fc_cfg_from_env(&env);
   fc_cfg_resolve(&cfg, &env, &rule);
+  /* What the control plane refuses a rule to declare, the gate does not
+   * run when the rule inherits it either. */
+  fc_cfg_band_guard(&cfg, (arg->sockmap_en == 1 || arg->sockmap_en == 2) &&
+                          !arg->ai_gw_mode);
   if (!created && fc_cfg_equal(&cfg, &tepval->fc.cfg))
     return;
+  if (cfg.band_fallback != FC_BAND_FB_NONE)
+    log_warn("[AIGateway] %s:%u (%s) admission bands run on fallback (%s): "
+             "wake=%s(%s) runs %s, shed_queue=%s(%s) runs %s, "
+             "tenant_wake=%s(%s) runs %s",
+             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+             tepval->ephash_key, fc_band_fallback_name(cfg.band_fallback),
+             cfg.wake_policy_cfg == FC_WAKE_WEIGHTED ? "weighted" : "strict",
+             fc_src_name(cfg.src[FC_L_WAKE_POLICY]),
+             cfg.wake_policy == FC_WAKE_WEIGHTED ? "weighted" : "strict",
+             cfg.shed_queue_cfg ? "on" : "off",
+             fc_src_name(cfg.src[FC_L_SHED_QUEUE]),
+             cfg.shed_queue ? "on" : "off",
+             cfg.tenant_wake_cfg == FC_TENANT_WAKE_RR ? "rr" : "fifo",
+             fc_src_name(cfg.src[FC_L_TENANT_WAKE]),
+             cfg.tenant_wake == FC_TENANT_WAKE_RR ? "rr" : "fifo");
   old_depth = tepval->fc.cfg.max_queue_depth;
   fc_state_apply(&tepval->fc, &cfg);
   if (!created)
     fc_queue_wake_room(&tepval->fc);
   if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE ||
       cfg.adaptive || cfg.warmup_ms || cfg.tenant_share_pct ||
-      cfg.expose_headers) {
+      cfg.expose_headers || cfg.bands || cfg.llmd_headers) {
     log_info("[AIGateway] %s:%u (%s) admission: mode=%s max_outstanding=%u "
              "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums "
              "adaptive=%s warmup=%ums ttft_target=%ums tenant_share=%u%% "
@@ -9688,6 +9864,33 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
              tepval->fc.cfg.adaptive ? "on" : "off", tepval->fc.cfg.warmup_ms,
              tepval->fc.cfg.ttft_target_ms, tepval->fc.cfg.tenant_share_pct,
              tepval->fc.cfg.expose_headers ? "on" : "off");
+  }
+  if (tepval->fc.cfg.bands || tepval->fc.cfg.llmd_headers) {
+    const fc_cfg_t *c = &tepval->fc.cfg;
+    uint32_t t[FC_BANDS];
+    char weights[40], min_share[40], wait[40], queue_share[40];
+
+    /* Triples printed as operators write them (fc_band_triple_fmt). */
+    for (int b = 0; b < FC_BANDS; b++)
+      t[b] = c->band_weight[b];
+    fc_band_triple_fmt(weights, sizeof(weights), t);
+    for (int b = 0; b < FC_BANDS; b++)
+      t[b] = c->band_min_share_pct[b];
+    fc_band_triple_fmt(min_share, sizeof(min_share), t);
+    fc_band_triple_fmt(wait, sizeof(wait), c->band_wait_ms);
+    for (int b = 0; b < FC_BANDS; b++)
+      t[b] = c->band_queue_pct[b];
+    fc_band_triple_fmt(queue_share, sizeof(queue_share), t);
+    log_info("[AIGateway] %s:%u (%s) admission bands: wake=%s weights=%s "
+             "min_share=%s%% reserve=%u%% wait=%sms queue_share=%s%% "
+             "shed_queue=%s tenant_wake=%s llmd_headers=%s",
+             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+             tepval->ephash_key,
+             c->wake_policy == FC_WAKE_WEIGHTED ? "weighted" : "strict",
+             weights, min_share, c->critical_reserve_pct, wait, queue_share,
+             c->shed_queue ? "on" : "off",
+             c->tenant_wake == FC_TENANT_WAKE_RR ? "rr" : "fifo",
+             c->llmd_headers ? "on" : "off");
   }
   if (created || tepval->fc.cfg.max_queue_depth != old_depth) {
     uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);
@@ -11347,6 +11550,7 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
   // accumulation (handle_header_val appends across value fragments).
   pfe->bearer_capturing = 0;
   sp_obj_hint_name(&pfe->obj_hint);
+  sp_ttl_hint_name(&pfe->ttl_hint);
 
   if (strncasecmp("Host", str, length) == 0) {
     pfe->http_hok = 1;
@@ -11568,6 +11772,12 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
                     sp_obj_hint_which(pfe->last_header_name,
                                       strlen(pfe->last_header_name)),
                     at, length);
+
+  // The client's TTL, kept whole; it is read at the park and only when the
+  // rule runs with fc_llmd_headers on.
+  if (!pfe->odir &&
+      sp_ttl_hint_which(pfe->last_header_name, strlen(pfe->last_header_name)))
+    sp_ttl_hint_val(&pfe->ttl_hint, at, length);
 
   // AI Gateway: Extract X-Api-Key header for data-plane enforcement
   if (!strncasecmp("X-Api-Key", pfe->last_header_name, 9)) {
@@ -12437,6 +12647,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * header policy so an operator-configured rule cannot re-add it. */
     pfe->rcv_off = ai_strip_upstream_api_key(pfe, pfe->rcvbuf, pfe->rcv_off,
                                              SP_SOCK_MSG_LEN, 1);
+    pfe->rcv_off = sp_llmd_forward_headers(pfe, pfe->rcvbuf, pfe->rcv_off,
+                                           SP_SOCK_MSG_LEN, 1);
 
     /* P/D request-ID override — generate with prefill/decode addresses
  * so vllm-router can route correctly. Must happen BEFORE normal path. */
@@ -12641,6 +12853,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->has_custom_session_header = 0;
     pfe->x_model_header[0] = '\0';  // Reset X-Model header for next request
     sp_obj_hint_reset(&pfe->obj_hint);
+    sp_ttl_hint_reset(&pfe->ttl_hint);
 
 
     /* Snapshot the correlation key BEFORE the reset below clears it, for the
@@ -12804,14 +13017,47 @@ pd_resume_parked(int fd)
     return;
   }
 
-  /* A request waiting in the capacity queue is resumed only for its turn,
-   * and the queue pops an entry before it wakes the connection: an entry
-   * still waiting means this resume is not its turn. It stays parked as it
-   * is (reads paused, hang-up armed) until its turn, its deadline or its
-   * client's departure. */
-  if (pfe->fc.state == FC_P_QUEUED && fc_queue_holds(pfe->fc.fc, &pfe->fc)) {
+  /* A request evicted from the capacity queue for a higher band
+   * (fc_shed_queue) is woken for its answer: claimed here, on the socket's
+   * owner, it gets 429 admission_shed with its wait and the connection goes
+   * on to its next request, as a queue-full 429 leaves it. Only a request
+   * whose connection cannot carry another (its body not whole in the
+   * buffer) is answered with a close and ended. Whoever claims the eviction
+   * first owns the answer: this resume, the 1 Hz pass for a wake that was
+   * lost (it cannot drive the connection on, so it closes), a drain, or the
+   * client's own departure, which drops it. */
+  /* One compare-and-swap on the permit's state decides a request in the
+   * capacity queue (fc_queue_owner_resume): a resume that comes after the
+   * 1 Hz pass, the deadline or a drain decided it does nothing, and the
+   * answer that path owes arrives on its own. */
+  int fc_resume = fc_queue_owner_resume(pfe->fc.fc, &pfe->fc, qos_now_ns());
+  if (fc_resume == FC_RESUME_DECIDED || fc_resume == FC_RESUME_WAIT) {
     return;
   }
+  if (fc_resume == FC_RESUME_EVICTED) {
+    if (sp_h1_refusal_keeps_connection(pfe)) {
+      if (sp_fc_shed_answer_kept(pfe) == 0) {
+        pfe->park_ep_idx   = -1;
+        pfe->park_start_ts = 0;
+        pfe->pd_phase      = PD_PHASE_NONE;
+        cresp_note_local_answer(pfe);
+        sp_h1_kept_request_reset(pfe);
+        pfe->read_paused = 0;
+        sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
+                      pfe, pfe->gen);
+        return;
+      }
+      return;                      /* answered with a close, or cut short: ended */
+    }
+    pfe->pd_phase = PD_PHASE_ERROR;
+    pfe->reap_resp = SP_REAP_FC_SHED;
+    sp_reap_finish(pfe);
+    return;
+  }
+
+  /* A request waiting in the capacity queue is resumed only for its turn
+   * (FC_RESUME_WAIT returned above): it stays parked as it is (reads paused,
+   * hang-up armed) until its turn, its deadline or its client's departure. */
 
   /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
   pfe->read_paused = 0;
@@ -12823,16 +13069,21 @@ pd_resume_parked(int fd)
    * the unit ahead of newcomers. Ordered after the reaper's and the
    * shaper's resumes above and before the prefill park below: a connection
    * is in at most one of these states at a time. */
-  if (pfe->fc.state == FC_P_QUEUED) {
+  if (fc_resume == FC_RESUME_TURN) {
     uint64_t q_now = qos_now_ns();
     log_debug("[AIGateway] fd=%d woken after %llu ms in the queue", fd,
               (unsigned long long)((q_now > pfe->fc.q_enqueue_ns ?
                                     q_now - pfe->fc.q_enqueue_ns : 0) / 1000000ULL));
-    fc_queue_resumed(pfe->fc.fc, &pfe->fc, q_now);
   }
 
   /* Clear park markers; the conn re-enters dispatch as a fresh request. pd_phase back
-   * to NONE so pd_setup_and_forward's P/D entry block (gated on PD_PHASE_NONE) runs. */
+   * to NONE so pd_setup_and_forward's P/D entry block (gated on PD_PHASE_NONE) runs.
+   * A request leaving the P/D prefill park hands its start to the capacity
+   * queue, should a role ceiling make it wait there (sp_fc_h1_gate_pd_roles):
+   * one wait, counted from its first park. Both clocks are CLOCK_MONOTONIC.
+   * The next binding of the permit (the push, or the next request's
+   * service gate) clears it. */
+  pfe->fc.q_first_ns = pfe->park_start_ts;
   pfe->park_ep_idx   = -1;
   pfe->park_start_ts = 0;
   pfe->pd_phase      = PD_PHASE_NONE;
@@ -14329,6 +14580,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       if (!pfe->odir && pfe->creq_blk.hdr_block) {
         rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc,
                                                 SP_SOCK_MSG_LEN, 0);
+        rc = (ssize_t)sp_llmd_forward_headers(pfe, pfe->rcvbuf, (size_t)rc,
+                                              SP_SOCK_MSG_LEN, 0);
       }
 
       PROXY_ENT_LOCK(pfe);

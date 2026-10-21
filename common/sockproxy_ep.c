@@ -1007,18 +1007,31 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
           /* Capacity admission, role level: one prefill unit and one decode
            * unit for this request, each a CAS under its own ceiling, taken
-           * BEFORE the load counters move so a refusal leaves them untouched. */
-          if (pfe &&
-              (sp_fc_h1_gate_role(pfe, tepval, pd_prefill, FC_ROLE_PREFILL, 0) != 0 ||
-               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE, 0) != 0)) {
+           * BEFORE the load counters move so a refusal leaves them untouched.
+           * The legacy count above passes a request the role ceiling may
+           * still hold full (another request holds the unit and is not yet
+           * counted, or the legacy cap is above the ceiling): the request
+           * then waits at the gate, as at every other ceiling. */
+          int fc_pd = pfe ? sp_fc_h1_gate_pd_roles(pfe, tepval, pd_prefill, pd_decode) : 0;
+          if (fc_pd != 0) {
             /* The decode pick pd_select_decode (or the Tier-0 hint before it)
              * wrote into the connection is not held yet: the units are taken
              * below, after the gate. Left in place, pd_cleanup — on this
-             * teardown, on a park reap, or on the next request of a kept
-             * connection — would hand back a decode unit this request never
-             * took, stealing it from the request that holds it. */
+             * teardown, on a park reap, on the next request of a kept
+             * connection, or on the dispatch its wake drives again — would
+             * hand back a decode unit this request never took, stealing it
+             * from the request that holds it. */
             pfe->pd_decode_ep_idx = -1;
             pfe->pd_prefill_ep_idx = -1;
+            if (fc_pd == SP_FC_H1_QUEUED)
+              return PD_SETUP_PARKED;    /* waits at the gate: the caller suspends the client */
+            if (fc_pd == SP_FC_H1_KEPT) {
+              /* The pool hold a prefill park took goes with this request:
+               * the connection's next request may route to another pool,
+               * and pd_cleanup counts against the pool the hold names. */
+              sp_pool_hold(&pfe->epv, NULL);
+              return PD_SETUP_KEPT;      /* refused, answered, connection kept */
+            }
             return -1;
           }
           /* INTG-06: Increment active_conns for selected EPs */

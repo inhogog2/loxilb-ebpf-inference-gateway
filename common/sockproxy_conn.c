@@ -1698,6 +1698,7 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   memset(fd_ent->conversation_id, 0, sizeof(fd_ent->conversation_id));  // P0.3: Clear conversation ID
   fd_ent->x_model_header[0] = '\0';  // Reset X-Model header
   sp_obj_hint_reset(&fd_ent->obj_hint);
+  sp_ttl_hint_reset(&fd_ent->ttl_hint);
 
   // Reset vLLM request ID state
   fd_ent->vllm_request_id[0] = '\0';

@@ -23,6 +23,7 @@
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
 #include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
 #include "sockproxy_obj_hint.h"     /* the objective a request asks for by header (proxy_fd_ent member) */
+#include "sockproxy_llmd.h"         /* the llm-d TTL a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
 
 // Forward declaration for HTTP/2 support
@@ -1593,6 +1594,7 @@ struct proxy_fd_ent {
   // obj_hint is what the request's header asked for; the rest is the
   // admission gate's answer, zero while no class is configured.
   sp_obj_hint_t obj_hint;
+  sp_ttl_hint_t ttl_hint;             // x-llm-d-inference-ttl, read only by a rule with fc_llmd_headers on
   int32_t  adm_priority;              // the priority in force, after the cap
   uint8_t  adm_class;                 // AI_GW_CLASS_*
   uint8_t  adm_class_set;             // 1 = the class stage ran for this request
@@ -2246,6 +2248,17 @@ struct proxy_arg {
   // Admission headers on admitted responses, same hop: 0 = the
   // environment, 1 off, 2 on.
   uint8_t  fc_expose_headers;
+  // Priority bands, same hop (dp_proxy_tacts has the encodings): switches
+  // 0 = the environment; numeric knobs the rule's own, triples by band.
+  uint8_t  fc_wake_policy;
+  uint8_t  fc_shed_queue;
+  uint8_t  fc_tenant_wake;
+  uint8_t  fc_llmd_headers;
+  uint8_t  fc_band_weight[3];
+  uint8_t  fc_band_min_share_pct[3];
+  uint8_t  fc_critical_reserve_pct;
+  uint8_t  fc_band_queue_pct[3];
+  uint32_t fc_band_wait_ms[3];
 
   // The rule's connectionLimit (dp_proxy_tacts.conn_limit), copied by
   // llb_conv_nat2proxy. A fullproxy rule never enters nat_map, so the

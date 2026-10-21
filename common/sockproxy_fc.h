@@ -16,6 +16,7 @@
 #ifndef __SOCKPROXY_FC_H__
 #define __SOCKPROXY_FC_H__
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -126,8 +127,47 @@ enum fc_limit {
   FC_L_TTFT_TARGET,
   FC_L_TENANT_SHARE,
   FC_L_EXPOSE_HEADERS,
+  /* Priority bands. */
+  FC_L_WAKE_POLICY,
+  FC_L_BAND_WEIGHTS,
+  FC_L_BAND_MIN_SHARE,
+  FC_L_CRITICAL_RESERVE,
+  FC_L_BAND_WAIT,
+  FC_L_BAND_QUEUE,
+  FC_L_SHED_QUEUE,
+  FC_L_TENANT_WAKE,
+  FC_L_LLMD_HEADERS,
   FC_LIMITS,
 };
+#define FC_BAND_LIMITS (FC_LIMITS - FC_L_WAKE_POLICY)
+
+/* Which waiting band a freed unit wakes. */
+enum fc_wake_policy {
+  FC_WAKE_STRICT = 0,            /* the highest band with a runnable waiter */
+  FC_WAKE_WEIGHTED = 1,          /* deficit round robin by band_weight */
+};
+
+/* Which tenant's entry a wake takes inside one band. */
+enum fc_tenant_wake {
+  FC_TENANT_WAKE_FIFO = 0,       /* the oldest runnable entry */
+  FC_TENANT_WAKE_RR = 1,         /* rotate across the tenants with a runnable entry */
+};
+
+/* Why a pool runs band settings other than the ones it was configured with
+ * (fc_cfg_band_guard): a combination the control plane refuses when a rule
+ * declares it, reached by inheriting the environment (or by a restore
+ * replay), runs on the defaults instead. */
+enum fc_band_fallback {
+  FC_BAND_FB_NONE = 0,
+  FC_BAND_FB_SOCKMAP = 1,        /* sockMapMode request/both without an AI gateway: every band knob at its default */
+  FC_BAND_FB_NO_WEIGHTS = 2,     /* weighted with a zero weight: strict */
+  FC_BAND_FB_NO_QUEUE = 3,       /* shed queue on with no queue depth: off */
+};
+
+/* A band's weight under weighted wake is 1..62 and a round, the sum, at
+ * most 64; a band's TTL at most the queue's own window bound. */
+#define FC_BAND_WEIGHT_MAX 62u
+#define FC_BAND_ROUND_MAX  64u
 
 /* How long an endpoint's scraped queue depth is trusted without a refresh
  * (three default scrape intervals). */
@@ -149,6 +189,19 @@ enum fc_limit {
 #define FC_TENANT_SLOTS_DEFAULT 256
 #define FC_TENANT_SLOTS_MAX 4096
 
+/* Priority bands. A band is the request's class constant as the admission
+ * gate resolved it (AI_GW_CLASS_*: 0 standard, 1 critical, 2 sheddable), so
+ * a zeroed permit or entry is standard: a request with no class (MCP,
+ * keyless, a pool with no class configured) is standard and FIFO. Band
+ * order is by rank, not by number: critical first, then standard, then
+ * sheddable. The per-band counts below are kept for critical and sheddable
+ * only; standard is the total less those two, so a request with no class
+ * moves no counter it did not move before. */
+#define FC_BANDS 3
+#define FC_BAND_STANDARD  0
+#define FC_BAND_CRITICAL  1
+#define FC_BAND_SHEDDABLE 2
+
 typedef struct fc_cfg {
   uint8_t  mode;                 /* enum fc_mode */
   uint8_t  src[FC_LIMITS];       /* enum fc_src per enum fc_limit */
@@ -162,6 +215,27 @@ typedef struct fc_cfg {
   uint32_t ttft_target_ms;       /* an endpoint's TTFT above this is backpressure; 0 = TTFT unused */
   uint8_t  tenant_share_pct;     /* most of the ceiling and of the queue one tenant may hold; 0 or 100 = no share */
   uint8_t  expose_headers;       /* 1: an admitted response carries the admission headers */
+  /* Priority bands. Every triple is indexed by band (FC_BAND_*). */
+  uint8_t  wake_policy;          /* enum fc_wake_policy */
+  uint8_t  band_weight[FC_BANDS];        /* weighted wake: 1..62 each, 0 = not set */
+  uint8_t  band_min_share_pct[FC_BANDS]; /* floor, % of the ceiling in force: a guarantee under contention, binding only while the band has a waiter */
+  uint8_t  critical_reserve_pct; /* % of the ceiling in force that no other band may take, even while critical is idle */
+  /* A band's wait window is a cap inside the rule's window (max_queue_wait_ms), never above it; 0 = the rule's window. */
+  uint32_t band_wait_ms[FC_BANDS];
+  /* A band's queue share bounds that band's own occupancy of max_queue_depth, a ceiling and not a reservation: what a
+   * band does not use stays open to every other band, and the queue as a whole never holds more than max_queue_depth;
+   * 0 = the shared depth. */
+  uint8_t  band_queue_pct[FC_BANDS];
+  uint8_t  shed_queue;           /* 1: a sheddable request at the ceiling waits in its band instead of 429 */
+  uint8_t  tenant_wake;          /* enum fc_tenant_wake */
+  uint8_t  llmd_headers;         /* 1: refusals carry x-llm-d-request-dropped-reason; x-llm-d-inference-ttl shortens a wait */
+  uint8_t  bands;                /* derived: 1 when a band knob differs from its default (wake, weights, floors, waits, shares, shed queue, rr) */
+  /* The switches as configured (rule, else environment), before
+   * fc_cfg_band_guard; the fields above are what the gate runs. */
+  uint8_t  wake_policy_cfg;
+  uint8_t  shed_queue_cfg;
+  uint8_t  tenant_wake_cfg;
+  uint8_t  band_fallback;        /* enum fc_band_fallback */
 } fc_cfg_t;
 
 /* A rule's declarations, as the control plane sends them. 0 on any field
@@ -188,6 +262,26 @@ enum fc_rule_expose {
   FC_RULE_EXPOSE_ON = 2,
 };
 
+/* The band switches, the same shift: 0 inherits. */
+enum fc_rule_wake {
+  FC_RULE_WAKE_INHERIT = 0,
+  FC_RULE_WAKE_STRICT = 1,
+  FC_RULE_WAKE_WEIGHTED = 2,
+};
+
+enum fc_rule_tenant_wake {
+  FC_RULE_TENANT_WAKE_INHERIT = 0,
+  FC_RULE_TENANT_WAKE_FIFO = 1,
+  FC_RULE_TENANT_WAKE_RR = 2,
+};
+
+/* An on/off switch (shed queue, llm-d headers). */
+enum fc_rule_switch {
+  FC_RULE_SWITCH_INHERIT = 0,
+  FC_RULE_SWITCH_OFF = 1,
+  FC_RULE_SWITCH_ON = 2,
+};
+
 typedef struct fc_rule_cfg {
   uint8_t  mode;                 /* enum fc_rule_mode */
   uint32_t max_outstanding;
@@ -200,6 +294,18 @@ typedef struct fc_rule_cfg {
   uint32_t ttft_target_ms;
   uint8_t  tenant_share_pct;     /* 1..100; 0 inherits */
   uint8_t  expose_headers;       /* enum fc_rule_expose */
+  /* Priority bands. The switches inherit the environment at 0; the numeric
+   * knobs are the rule's own (no environment value: 0 is "none"). Triples
+   * are indexed by band (FC_BAND_*). */
+  uint8_t  wake_policy;          /* enum fc_rule_wake */
+  uint8_t  band_weight[FC_BANDS];
+  uint8_t  band_min_share_pct[FC_BANDS];
+  uint8_t  critical_reserve_pct; /* the reservation: units no other band may take; not a floor */
+  uint32_t band_wait_ms[FC_BANDS];
+  uint8_t  band_queue_pct[FC_BANDS];
+  uint8_t  shed_queue;           /* enum fc_rule_switch */
+  uint8_t  tenant_wake;          /* enum fc_rule_tenant_wake */
+  uint8_t  llmd_headers;         /* enum fc_rule_switch */
 } fc_rule_cfg_t;
 
 /* The adaptive ceiling's state, for the read-back and the metrics. */
@@ -244,13 +350,31 @@ enum fc_reason {
   FC_R_OBSERVE_WOULD_QUEUE,      /* over a ceiling in observe mode with a queue depth, admitted */
   FC_R_DRAINING,                 /* refused: the process is draining for maintenance */
   FC_R_TENANT_SHARE,             /* refused: the tenant holds its share of the ceiling or of the queue */
+  FC_R_SHED,                     /* refused or evicted by band policy: a sheddable request that may not wait */
   FC_R_COUNT,
+};
+
+/* How a request of a band ended, or that it waited: the per-band split of
+ * five decisions (enum fc_reason), counted where those are counted.
+ * admitted, shed, expired and cancelled are terminal, one per request;
+ * queued is counted once per park (a woken request that goes back to its
+ * place is the same park). Kept for critical and sheddable; standard is the
+ * decision less those two, so a request with no class moves no counter it
+ * did not move before. */
+enum fc_band_outcome {
+  FC_BO_ADMITTED = 0,            /* took a unit (FC_R_ADMITTED) */
+  FC_BO_QUEUED,                  /* parked (FC_R_QUEUED) */
+  FC_BO_SHED,                    /* refused or evicted by band policy, 429 admission_shed (FC_R_SHED) */
+  FC_BO_EXPIRED,                 /* its wait window ended, 504 (FC_R_QUEUE_TIMEOUT) */
+  FC_BO_CANCELLED,               /* its client left while it waited (FC_R_CANCELLED) */
+  FC_BO_COUNT,
 };
 
 enum fc_anomaly {
   FC_A_UNDERFLOW = 0,            /* a release found its counter at zero */
   FC_A_UNKNOWN_PERMIT,           /* an executing permit with no service */
   FC_A_TENANT_TABLE_FULL,        /* a tenant past the table was put in the shared slot */
+  FC_A_H2_DENY_HEADERS,          /* an HTTP/2 refusal had more headers than its frame holds: not sent */
   FC_A_COUNT,
 };
 
@@ -267,12 +391,26 @@ extern const uint32_t fc_qwait_bounds_ms[FC_QWAIT_BUCKETS];
  * the tenant slot whose queue count the entry holds, -1 for none. */
 typedef struct fc_queue_ent {
   int      fd;
-  uint16_t live;
+  uint8_t  live;
+  uint8_t  band;                 /* FC_BAND_*: the request's class when it parked */
   int16_t  tslot;
   uint64_t gen;
   uint64_t enqueue_ns;
   uint64_t deadline_ns;
 } fc_queue_ent_t;
+
+/* A waiter evicted from the queue (fc_shed_queue) whose answer is still
+ * owed: the 429 is written by its connection's owner worker, which claims
+ * the entry on its resume (fc_queue_evicted_claim); the 1 Hz pass answers
+ * one whose wake was lost. The list is bounded: while it is full nobody is
+ * evicted and the arrival is refused as a full queue. */
+#define FC_EVICT_PENDING 16
+
+typedef struct fc_evicted {
+  int      fd;
+  uint64_t gen;
+  uint64_t at_ns;                /* when it was evicted */
+} fc_evicted_t;
 
 /* Per-pool FIFO of waiting requests. The ring is allocated when a depth is
  * configured and grown when the depth grows; it is never shrunk while
@@ -285,7 +423,16 @@ typedef struct fc_queue {
   uint32_t tail;
   uint32_t used;
   uint32_t count;
+  uint32_t band_count[FC_BANDS]; /* live entries per band; the standard slot is never written */
+  /* Weighted wake: the credits each band has left in the round in progress (spent one per wake,
+   * set again from the weights when no band that has a runnable waiter has any left, and reset
+   * when the policy or the weights change). Round-robin tenant wake: the tenant slot a band's
+   * next turn starts from, one past the slot it served last. Both under the lock. */
+  uint32_t drr_credit[FC_BANDS];
+  uint32_t rr_next[FC_BANDS];
   uint32_t dead;                 /* the pool's rule is gone: nothing may wait here again */
+  fc_evicted_t evicted[FC_EVICT_PENDING]; /* evicted waiters owed their answer, oldest first */
+  _Atomic uint32_t n_evicted;    /* written under the lock, read without it */
   pthread_mutex_t lock;
 } fc_queue_t;
 
@@ -319,6 +466,16 @@ typedef struct fc_state {
   fc_cfg_t cfg;
   _Atomic uint32_t inflight;
   _Atomic uint32_t queued;                       /* live queue entries, mirrored for lock-free reads */
+  /* Per band (critical and sheddable; the standard slot is never written):
+   * service units held, and live queue entries mirrored like `queued`. */
+  _Atomic uint32_t band_inflight[FC_BANDS];
+  _Atomic uint32_t band_queued[FC_BANDS];
+  /* Per band and outcome (critical and sheddable; the standard row is
+   * never written, fc_band_outcome derives it). */
+  _Atomic uint64_t band_outcome[FC_BANDS][FC_BO_COUNT];
+  /* The standard count of each outcome last read: a derived count never
+   * steps back (fc_band_outcome). */
+  _Atomic uint64_t band_std_read[FC_BO_COUNT];
   _Atomic uint32_t ep_inflight[FC_MAX_EP][FC_ROLES];
   _Atomic uint64_t decisions[FC_R_COUNT];
   _Atomic uint64_t qwait_bucket[FC_QWAIT_BUCKETS];
@@ -362,23 +519,50 @@ enum fc_permit_state {
   FC_P_EXECUTING,                /* units held */
   FC_P_RELEASED,                 /* units handed back */
   FC_P_QUEUED,                   /* waiting in the pool's queue, nothing held */
+  FC_P_EVICTED,                  /* evicted, and the 1 Hz pass decided its answer */
+  FC_P_ENDED,                    /* the wait was ended by the deadline, a drain or a cancel */
 };
+
+/* A waiting request leaves FC_P_QUEUED exactly once, by one compare-and-swap
+ * on the state it already has: its owner's resume (to FC_P_NONE: its turn,
+ * or its eviction claimed by the owner) or one of the paths that end a wait
+ * from elsewhere (FC_P_EVICTED, FC_P_ENDED). Whoever swaps decides what
+ * happens to the request; the other does nothing, so no request is answered
+ * twice, and an owner's resume that comes after another path decided is
+ * dropped. */
 
 typedef struct fc_permit {
   fc_state_t *fc;                /* the service the units were taken from */
-  uint8_t state;                 /* enum fc_permit_state */
+  _Atomic uint8_t state;         /* enum fc_permit_state; leaves QUEUED by fc_permit_settle */
   uint8_t svc_held;
   uint8_t woken;                 /* popped from the queue: may not be made to queue again behind newcomers */
+  uint8_t band;                  /* FC_BAND_*: set at the service acquire, kept while queued */
+  uint8_t q_parked;              /* in a park whose wait is not yet observed (fc_queue_wait_end) */
+  uint8_t q_ttl_cut;             /* the park's deadline is the client's x-llm-d-inference-ttl, not a window of the rule's */
+  uint32_t q_ttl_ms;             /* the client's TTL for the next fc_queue_push, 0 = none; read only with llmd_headers on */
   int8_t  ep[FC_ROLES];          /* endpoint holding this role's unit, -1 = none */
   int      q_fd;                 /* the queue entry this permit sits in, while QUEUED */
   uint32_t q_slot;
   uint64_t q_gen;
   uint64_t q_enqueue_ns;
   uint64_t q_deadline_ns;
+  uint64_t q_first_ns;           /* when a request moved here from the P/D prefill park first parked, for the next fc_queue_push; 0 = none; cleared by the bind */
   uint64_t admit_ns;             /* fc_now_ns() when the first endpoint unit landed: dispatch */
   uint64_t tkey;                 /* the tenant the request is admitted as */
   int16_t  tslot;                /* tenant slot whose inflight count this permit holds, -1 = none */
 } fc_permit_t;
+
+/* QUEUED -> `to`, once: 1 when this caller made the transition (and so
+ * decides the request), 0 when the permit had already left QUEUED. */
+static inline int
+fc_permit_settle(fc_permit_t *p, uint8_t to)
+{
+  uint8_t from = FC_P_QUEUED;
+
+  return atomic_compare_exchange_strong_explicit(&p->state, &from, to,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire);
+}
 
 typedef enum fc_verdict {
   FC_ADMIT = 0,
@@ -387,6 +571,7 @@ typedef enum fc_verdict {
   FC_QUEUE = 3,                  /* over a ceiling with a queue: the caller parks the request */
   FC_DRAINING = 4,               /* the process is draining: 503 gateway_draining */
   FC_TENANT_SHARE = 5,           /* the tenant holds its share: 429 admission_tenant_share */
+  FC_BAND_SHED = 6,              /* a sheddable request that may not wait: 429 admission_shed */
 } fc_verdict_t;
 
 extern _Atomic uint64_t fc_anomaly_total[FC_A_COUNT];
@@ -398,6 +583,17 @@ void fc_cfg_from_env(fc_cfg_t *cfg);
  * `rule` in its place, the queue depth held at its ceiling and a depth
  * given a wait window, and the source of every value recorded. */
 void fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule);
+/* Holds a resolved configuration to what the control plane accepts from a
+ * declaring rule: a pool whose request direction bypasses the gate
+ * (`gate_bypassed`: sockMapMode request or both, not an AI-gateway service)
+ * runs every band knob at its default; weighted with a zero weight runs
+ * strict; a shed queue with no queue depth runs off. The configured
+ * switches are kept beside the effective ones and the first reason in
+ * band_fallback. Returns band_fallback. */
+uint8_t fc_cfg_band_guard(fc_cfg_t *cfg, int gate_bypassed);
+const char *fc_band_fallback_name(uint8_t reason);
+/* enum fc_src as the read-back spells it: rule, env, default. */
+const char *fc_src_name(uint8_t src);
 /* Whether two configurations differ in any value or source. */
 int fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b);
 void fc_state_init(fc_state_t *fc);
@@ -528,6 +724,13 @@ fc_verdict_t fc_service_acquire_tenant(fc_state_t *fc, fc_permit_t *p,
 fc_verdict_t fc_service_acquire_h1_tenant(fc_state_t *fc, fc_permit_t *p,
                                           int woken, uint64_t tkey);
 
+/* The same two, for a request of band `band` (FC_BAND_*; anything else is
+ * standard). The two above are band standard. */
+fc_verdict_t fc_service_acquire_band(fc_state_t *fc, fc_permit_t *p,
+                                     uint64_t tkey, uint8_t band);
+fc_verdict_t fc_service_acquire_h1_band(fc_state_t *fc, fc_permit_t *p,
+                                        int woken, uint64_t tkey, uint8_t band);
+
 /* The same, for a request that is not an inference request. */
 void fc_bypass(fc_state_t *fc, fc_permit_t *p);
 
@@ -574,6 +777,68 @@ void fc_permit_release_nowake(fc_permit_t *p);
 
 void fc_count(fc_state_t *fc, enum fc_reason reason);
 
+/* fc_count for one of the five decisions a band outcome splits (admitted,
+ * queued, shed, queue_timeout, cancelled), with the request's band: the
+ * decision is counted, and so is the band's outcome when the band is
+ * critical or sheddable. Any other reason is fc_count. */
+void fc_count_band(fc_state_t *fc, enum fc_reason reason, uint8_t band);
+
+/* A band's count of an outcome (enum fc_band_outcome). Standard is the
+ * decision less critical and sheddable, held at zero, and never below the
+ * value it last read. */
+uint64_t fc_band_outcome(fc_state_t *fc, uint8_t band, int outcome);
+const char *fc_band_outcome_name(int outcome);
+
+/* Whether a request of the permit's band may wait in this pool's queue: a
+ * sheddable request only with fc_shed_queue on. Enforce mode only; anything
+ * else may. */
+int fc_band_may_wait(const fc_state_t *fc, const fc_permit_t *p);
+
+/* ---- floors and the reserve ------------------------------------------------
+ * A floor (fc_band_min_share_pct) is a guarantee under contention, not a
+ * reservation: it binds only while its band has a waiter, so with no demand
+ * in a band the other bands take every unit. The reserve
+ * (fc_critical_reserve_pct) is the one true reservation: units no other band
+ * may take even while critical is idle. Both are a share of the ceiling in
+ * force, in units fc_floor_units.
+ *
+ * The rule the code implements: when a unit frees, the highest-ranked band
+ * that is below its floor and has a runnable waiter takes it; when no band
+ * is below its floor, the wake policy chooses. A request of a band at or
+ * above its own floor takes a unit only if the units left after it still
+ * cover what every other band with a waiter is short of its floor, and what
+ * critical is short of its reserve. */
+
+/* Whether the pool runs a floor or the reserve. */
+static inline int
+fc_floors_on(const fc_cfg_t *c)
+{
+  return (c->band_min_share_pct[0] | c->band_min_share_pct[1] |
+          c->band_min_share_pct[2] | c->critical_reserve_pct) != 0;
+}
+
+/* A share of a ceiling in whole units, rounded in the band's favour (up) but
+ * never to the whole ceiling for a share under 100: 0 without a ceiling or
+ * a share. */
+uint32_t fc_floor_units(uint32_t cap, uint8_t pct);
+
+/* The floors and the reserve of a configuration against a ceiling, in units
+ * as the gate enforces them: the three together never exceed the ceiling
+ * (rounding is clamped in rank order, critical first), and critical holds
+ * the larger of its floor and its reserve. floor[] is indexed by band. */
+void fc_floor_claims(const fc_cfg_t *c, uint32_t cap, uint32_t floor[FC_BANDS],
+                     uint32_t *reserve);
+
+/* The band's say over a capacity verdict: a sheddable request that would
+ * wait (FC_QUEUE) or that met a ceiling (FC_SHED) and may not wait is shed,
+ * FC_BAND_SHED. Every other verdict is returned as it is. */
+fc_verdict_t fc_band_verdict(const fc_state_t *fc, const fc_permit_t *p,
+                             fc_verdict_t v);
+
+/* A band triple as operators write it, critical:standard:sheddable, from
+ * values indexed by band. Returns what snprintf returns. */
+int fc_band_triple_fmt(char *out, size_t cap, const uint32_t v[FC_BANDS]);
+
 /* ---- the queue ------------------------------------------------------------ */
 
 /* Park a request: push its fd and generation with an absolute deadline
@@ -587,14 +852,55 @@ void fc_count(fc_state_t *fc, enum fc_reason reason);
  * Returns 0 with the permit QUEUED and the decision counted, -1 when the
  * queue is at its depth or the pool is dead (counted as queue_full, the
  * permit reset), -2 when the permit's tenant holds its share of the queue
- * (counted as tenant_share, the permit reset). */
+ * (counted as tenant_share, the permit reset). A first park is counted
+ * queued; a request going back to the head is the same park and is not
+ * counted again.
+ *
+ * Eviction (fc_shed_queue on): a request above sheddable that finds the
+ * queue at its depth takes the place of the youngest sheddable waiter. The
+ * evicted waiter is counted shed, kept on the evicted list until its answer
+ * is claimed, and its connection's owner is woken through the wake hook to
+ * write 429 admission_shed (fc_queue_evicted_claim). */
 int fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
                   uint64_t now_ns, int front);
 
-/* Take the permit's own entry out of the queue, wherever it sits. Returns 1
- * when the entry was still live (the caller now owns the terminal action),
- * 0 when a pop, a cancellation, the deadline or a drain got there first. Not
- * counted here: the caller says why. */
+/* Claim the answer owed to an evicted waiter (fd, gen): 1 when it was on
+ * the evicted list, now taken off it (the caller writes the 429), 0 when it
+ * was not evicted or another path has claimed it. */
+int fc_queue_evicted_claim(fc_state_t *fc, int fd, uint64_t gen);
+
+/* The pass's decision on an evicted waiter: (fd, gen)'s entry is taken off
+ * the evicted list and `p` swapped QUEUED -> FC_P_EVICTED in one hold of
+ * the queue lock. 1 when the pass now answers it. 0 when the entry is gone
+ * (its owner claimed it: the owner answers, and a later request on the same
+ * connection, parked under the same (fd, gen), is not this wait) or the
+ * permit had already left QUEUED. */
+int fc_queue_evicted_settle(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen);
+
+/* Evicted waiters whose answer is still owed. A read. */
+static inline uint32_t
+fc_queue_evicted(const fc_state_t *fc)
+{
+  return fc ? atomic_load_explicit(&fc->queue.n_evicted, memory_order_relaxed) : 0;
+}
+
+/* Every waiter evicted at or before `before_ns` is handed to `fn` (the
+ * entry's fd and gen, band sheddable) outside the queue lock, and taken off
+ * the evicted list after `fn` returned. `fn` decides the request with
+ * fc_queue_evicted_settle and answers it only when that returns 1, so a
+ * late resume of the owner that claims the entry meanwhile and a pass that
+ * answers it are never both: whoever takes the entry decides. For the 1 Hz pass
+ * (a wake that was lost or came late) and the drain of a pool (UINT64_MAX:
+ * all). Returns the number `fn` answered (returned nonzero for). */
+uint32_t fc_queue_evicted_sweep(fc_state_t *fc, uint64_t before_ns,
+                                int (*fn)(void *ctx, const fc_queue_ent_t *ent),
+                                void *ctx);
+
+/* Take the permit's own entry out of the queue, wherever it sits: under the
+ * queue lock the permit is moved QUEUED -> FC_P_ENDED and only then its entry
+ * removed. Returns 1 when it was (the caller now owns the terminal action),
+ * 0 when a pop, a cancellation, the deadline, a drain or the owner got there
+ * first. Not counted here: the caller says why. */
 int fc_queue_take(fc_state_t *fc, fc_permit_t *p);
 
 /* Pop the oldest live entry. Returns 1 and fills *out, 0 when nothing waits. */
@@ -604,9 +910,31 @@ int fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out);
  * permit whose entry was never popped did not come from its turn. */
 int fc_queue_holds(fc_state_t *fc, const fc_permit_t *p);
 
-/* The woken request is back at its gate: the wait is recorded, the permit
- * leaves the QUEUED state and is marked woken. */
-void fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
+/* The woken request is back at its gate: the permit leaves QUEUED (to
+ * FC_P_NONE, by fc_permit_settle) and is marked woken. Returns 1 when it did,
+ * 0 when another path had already decided the request. */
+int fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
+
+/* What the owner's resume of a parked connection is, for a request in the
+ * capacity queue (pd_resume_parked). */
+enum fc_resume {
+  FC_RESUME_NOT_QUEUED = 0,      /* not in the capacity queue: some other park */
+  FC_RESUME_WAIT,                /* still waiting: not its turn, stays parked */
+  FC_RESUME_TURN,                /* its turn: woken, back to its gate */
+  FC_RESUME_EVICTED,             /* evicted, the answer is the owner's: 429 admission_shed */
+  FC_RESUME_DECIDED,             /* another path decided it first: do nothing */
+};
+
+/* The owner's half of the one transition out of QUEUED: claims an eviction
+ * owed to it, leaves a request still waiting where it is, takes its turn, or
+ * finds that the 1 Hz pass, the deadline or a drain decided first. */
+int fc_queue_owner_resume(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
+/* A park ends: the queue-wait histogram takes its whole wait, from the first
+ * park, once (admitted, expired, cancelled; an evicted waiter is observed
+ * where it is evicted). A woken request that goes back to its place is the
+ * same park and is not observed in between. No-op for a permit not in a
+ * park. */
+void fc_queue_wait_end(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
 
 /* Wake a popped entry on its connection's owner. Installed by the proxy;
  * returns 0 when the wake was delivered, non-zero when it could not be (the
@@ -631,6 +959,14 @@ void fc_queue_wake_room(fc_state_t *fc);
  * zero for an entry whose connection had already moved on. */
 typedef int (*fc_drain_fn)(void *ctx, const fc_queue_ent_t *ent);
 void fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx);
+
+/* Hand every waiting entry to `fn`, oldest first, with the queue lock held;
+ * nothing is taken out and the order is kept. Returns the number of entries
+ * visited. `fn` runs under the lock, so a write it makes to its waiter's
+ * connection is ordered before that waiter's pop: it must not call back into
+ * this queue. */
+typedef void (*fc_visit_fn)(void *ctx, const fc_queue_ent_t *ent);
+uint32_t fc_queue_visit(fc_state_t *fc, fc_visit_fn fn, void *ctx);
 
 /* Process-wide drain for maintenance: while set, the gate refuses new
  * inference requests with FC_DRAINING and pools drain their queues. */
@@ -659,6 +995,76 @@ fc_queued(const fc_state_t *fc)
   return fc ? atomic_load_explicit(&fc->queued, memory_order_relaxed) : 0;
 }
 
+/* A class constant as a band: anything out of range is standard. */
+static inline uint8_t
+fc_band_of(int cls)
+{
+  return (cls == FC_BAND_CRITICAL || cls == FC_BAND_SHEDDABLE) ? (uint8_t)cls
+                                                              : FC_BAND_STANDARD;
+}
+
+/* The bands by rank, highest first: the order the strict wake serves them
+ * in, and the order every band triple is written in, at the API and in the
+ * log (critical:standard:sheddable). The one mapping between a position and
+ * a band; fc_band_rank is its inverse. */
+static inline uint8_t
+fc_band_at_rank(int rank)
+{
+  static const uint8_t by_rank[FC_BANDS] = {
+    FC_BAND_CRITICAL, FC_BAND_STANDARD, FC_BAND_SHEDDABLE,
+  };
+
+  return rank >= 0 && rank < FC_BANDS ? by_rank[rank] : FC_BAND_STANDARD;
+}
+
+/* Order between bands: 0 is served first. */
+static inline int
+fc_band_rank(uint8_t band)
+{
+  band = fc_band_of(band);
+  for (int r = 0; r < FC_BANDS; r++)
+    if (fc_band_at_rank(r) == band)
+      return r;
+  return FC_BANDS - 1;
+}
+
+/* Service units held, and requests waiting, in one band. Standard is the
+ * total less the two counted bands; the reads are not one snapshot, so it
+ * is clamped at zero. */
+static inline uint32_t
+fc_band_derive(uint32_t total, uint32_t crit, uint32_t shed, uint8_t band)
+{
+  if (band == FC_BAND_CRITICAL)
+    return crit;
+  if (band == FC_BAND_SHEDDABLE)
+    return shed;
+  return total > crit + shed ? total - crit - shed : 0;
+}
+
+static inline uint32_t
+fc_band_inflight(const fc_state_t *fc, uint8_t band)
+{
+  if (!fc)
+    return 0;
+  return fc_band_derive(
+      atomic_load_explicit(&fc->inflight, memory_order_relaxed),
+      atomic_load_explicit(&fc->band_inflight[FC_BAND_CRITICAL], memory_order_relaxed),
+      atomic_load_explicit(&fc->band_inflight[FC_BAND_SHEDDABLE], memory_order_relaxed),
+      fc_band_of(band));
+}
+
+static inline uint32_t
+fc_band_queued(const fc_state_t *fc, uint8_t band)
+{
+  if (!fc)
+    return 0;
+  return fc_band_derive(
+      atomic_load_explicit(&fc->queued, memory_order_relaxed),
+      atomic_load_explicit(&fc->band_queued[FC_BAND_CRITICAL], memory_order_relaxed),
+      atomic_load_explicit(&fc->band_queued[FC_BAND_SHEDDABLE], memory_order_relaxed),
+      fc_band_of(band));
+}
+
 static inline uint32_t
 fc_ep_inflight(const fc_state_t *fc, int ep, int role)
 {
@@ -666,6 +1072,24 @@ fc_ep_inflight(const fc_state_t *fc, int ep, int role)
     return 0;
   return atomic_load_explicit(&fc->ep_inflight[ep][role], memory_order_relaxed);
 }
+
+/* A band's wait window in force: its own, held inside the rule's window
+ * (max_queue_wait_ms), else the rule's. */
+static inline uint32_t
+fc_band_wait_ms(const fc_state_t *fc, uint8_t band)
+{
+  uint32_t own;
+
+  if (!fc)
+    return 0;
+  band = fc_band_of(band);
+  own = fc->cfg.band_wait_ms[band];
+  return own && own < fc->cfg.max_queue_wait_ms ? own : fc->cfg.max_queue_wait_ms;
+}
+
+/* The most live waiters a band may hold: its share of max_queue_depth
+ * (rounded up, at least one); 0 = no bound of its own. */
+uint32_t fc_band_queue_bound(const fc_state_t *fc, uint8_t band);
 
 /* The ceiling a shed response reports beside the inflight count. */
 static inline uint32_t

@@ -411,14 +411,60 @@ test_fc_expose: test_fc_expose.c sockproxy_fc.c sockproxy_fc.h
 test_fc_tenant_slots: test_fc_tenant_slots.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -Wl,--wrap=calloc -o $@ test_fc_tenant_slots.c sockproxy_fc.c -I. -lpthread
 
+test_fc_visit: test_fc_visit.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_visit.c sockproxy_fc.c -I. -lpthread
+
+test_fc_priority: test_fc_priority.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_priority.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_cfg: test_fc_band_cfg.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_cfg.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_shed: test_fc_band_shed.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_shed.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_floor: test_fc_band_floor.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_floor.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_ttl: test_fc_band_ttl.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_ttl.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_wrr: test_fc_band_wrr.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_wrr.c sockproxy_fc.c -I. -lpthread
+
+test_fc_settle: test_fc_settle.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_settle.c sockproxy_fc.c -I. -lpthread
+
+# The P/D role gates wait at a full role ceiling. The gate functions are the
+# production ones, taken from sockproxy_http.c (each from its return-type
+# line to its closing brace) into a generated file, so a change to them is
+# what the test runs; the extraction fails unless it finds all three.
+PD_ROLE_WAIT_FNS = sp_fc_h1_refuse|sp_fc_h1_gate_role|sp_fc_h1_gate_pd_roles
+test_pd_role_wait.gen.c: sockproxy_http.c
+	awk '/^($(PD_ROLE_WAIT_FNS))\(/ {print prev; on = 1} on {print} on && /^}/ {on = 0; n++; print ""} {prev = $$0} END {if (n != 3) exit 1}' \
+	  sockproxy_http.c > $@ || { rm -f $@; exit 1; }
+
+test_pd_role_wait: test_pd_role_wait.c test_pd_role_wait.gen.c sockproxy_fc.c sockproxy_fc.h sockproxy_llmd.h sockproxy_obj_hint.h
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -o $@ test_pd_role_wait.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr test_fc_settle test_pd_role_wait
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
 	./test_fc_tenant
 	./test_fc_expose
 	./test_fc_tenant_slots
+	./test_fc_visit
+	./test_fc_priority
+	./test_fc_band_cfg
+	./test_fc_band_shed
+	./test_fc_band_floor
+	./test_fc_band_ttl
+	./test_fc_band_wrr
+	./test_fc_settle
+	./test_pd_role_wait
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.
@@ -634,7 +680,7 @@ test_h2leg: test_h2_leg_end
 # gateway object itself is built with ASan here: a read after the free inside
 # sockproxy_h2.c is what this test must see.
 sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
-	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) -DSP_DEBUG_ASSERTS \
 		-ffunction-sections -fdata-sections -c -o $@ $<
 
 # The shared HTTP/2 fixture (test_h2_fixture.h): the gateway object with ASan,
@@ -956,6 +1002,10 @@ test_obj_hint: test_obj_hint.c sockproxy_obj_hint.h sockproxy_creq_block.h sockp
 test_objhint: test_obj_hint
 	./test_obj_hint
 
+test_llmd: test_llmd.c sockproxy_llmd.h sockproxy_llmd_fwd.h sockproxy_obj_hint.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_llmd.c -I.
+	./test_llmd
+
 # Backend connect in two halves: the relay path issues the connect and
 # finishes the leg from the writable event instead of holding its worker for
 # the round trip. Header-only and standalone; the test measures the kept
@@ -1105,7 +1155,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
+	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_fc_band_ttl test_fc_band_wrr test_llmd
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

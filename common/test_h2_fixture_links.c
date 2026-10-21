@@ -37,7 +37,8 @@ strip_port_from_hostname(const char *in, char *out, unsigned long size)
   out[i] = 0;
 }
 
-REACHED(ai_gw_class_on)
+int h2fx_class_on;
+int ai_gw_class_on(void) { return h2fx_class_on; }
 REACHED(ai_gw_mint_request_id)
 REACHED(ai_gw_netid_bound)
 REACHED(ai_gw_netid_fwd_any)

@@ -310,6 +310,7 @@ test_widening_wakes_the_waiters_that_fit(void)
   for (int i = 0; i < 8; i++)
     fc_permit_release_nowake(&run[i]);
   fc_set_wake_hook(NULL);
+  fc_state_destroy(&fc);
   printf("  adaptive: a unit given back wakes one waiter; a stale tick wakes none\n");
 }
 
@@ -463,6 +464,7 @@ test_ttft_is_measured_from_admission(void)
   fc_permit_ttft(&a);
   assert(atomic_load(&fc.ttft_ts_ns[4]) == 0);
   fc_set_clock(NULL);
+  fc_state_destroy(&fc);
   printf("  ttft: measured from admission, credited to the decode endpoint, only with a target\n");
 }
 

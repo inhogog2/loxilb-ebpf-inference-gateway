@@ -58,6 +58,11 @@ extern proxy_fd_ent_t *h2fx_pfe;
 extern nghttp2_session *h2fx_cl;
 #define H2FX_MAX_STREAMS 64
 extern int h2fx_status[H2FX_MAX_STREAMS];
+/* The value of response header <name> on stream id, NULL when it did not
+ * arrive. Regular headers only, the last 16 of a stream. */
+const char *h2fx_header(int32_t id, const char *name);
+/* What ai_gw_class_on() answers (0: classes off, as with nothing configured). */
+extern int h2fx_class_on;
 
 void h2fx_init(void);
 void h2fx_fini(void);
