@@ -204,21 +204,36 @@ printf '%s\n' "$ALLOW" | while IFS='|' read -r a n _; do
   [ "$got" = "$n" ] || { echo "allowlist entry covers $n call(s), found $got: $a"; echo x >> "$FAILF"; }
 done
 
-# 2. A local answer never samples TTFB.
-w=$(fnbody sockproxy_http.c proxy_note_response_)
+# 2. A local answer never samples TTFB. The writer (resp_note_write_) takes
+#    the latch with sample_ttfb; the HTTP/1.1 wrappers and the HTTP/2 ones
+#    (sockproxy_h2.c h2_note_backend_response / h2_note_local_answer) say
+#    which kind of response a site records, and every HTTP/2 note goes
+#    through one of the two.
+w=$(fnbody sockproxy_http.c resp_note_write_)
+h1=$(fnbody sockproxy_http.c proxy_note_response_)
+h2=$(fnbody sockproxy_http.c proxy_h2_note_stream_response)
 la=$(fnbody sockproxy_http.c proxy_note_local_answer)
 cr=$(fnbody sockproxy_http.c proxy_note_client_response)
+h2la=$(fnbody sockproxy_h2.c h2_note_local_answer)
+h2cr=$(fnbody sockproxy_h2.c h2_note_backend_response)
 printf '%s\n' "$la" | grep -q 'return proxy_note_response_(pfe, status, 0);' ||
   { echo "sockproxy_http.c: proxy_note_local_answer must be proxy_note_response_(pfe, status, 0)"; fail=1; }
 printf '%s\n' "$cr" | grep -q 'return proxy_note_response_(pfe, status, 1);' ||
   { echo "sockproxy_http.c: proxy_note_client_response must be proxy_note_response_(pfe, status, 1)"; fail=1; }
-if printf '%s\n%s\n' "$la" "$cr" | grep -qE 'record_latency_sample|global_stats\.'; then
-  echo "sockproxy_http.c: a wrapper writes the record itself; only proxy_note_response_ does"; fail=1
+printf '%s\n' "$h2la" | grep -q 'return proxy_h2_note_stream_response(stream, status, 0);' ||
+  { echo "sockproxy_h2.c: h2_note_local_answer must be proxy_h2_note_stream_response(stream, status, 0)"; fail=1; }
+printf '%s\n' "$h2cr" | grep -q 'return proxy_h2_note_stream_response(stream, status, 1);' ||
+  { echo "sockproxy_h2.c: h2_note_backend_response must be proxy_h2_note_stream_response(stream, status, 1)"; fail=1; }
+h2notes=$(grep -c 'proxy_h2_note_stream_response(' sockproxy_h2.c || true)
+[ "$h2notes" = "2" ] ||
+  { echo "sockproxy_h2.c: proxy_h2_note_stream_response is called $h2notes times; only h2_note_backend_response and h2_note_local_answer call it"; fail=1; }
+if printf '%s\n%s\n%s\n%s\n' "$la" "$cr" "$h1" "$h2" | grep -qE 'record_latency_sample|global_stats\.'; then
+  echo "sockproxy_http.c: a wrapper writes the record itself; only resp_note_write_ does"; fail=1
 fi
-printf '%s\n' "$w" | grep -q 'resp_note_take(&pfe->metric_resp_noted, sample_ttfb)' ||
-  { echo "sockproxy_http.c: proxy_note_response_ must take the latch with sample_ttfb (resp_note_take)"; fail=1; }
+printf '%s\n' "$w" | grep -q 'resp_note_take(noted, sample_ttfb)' ||
+  { echo "sockproxy_http.c: resp_note_write_ must take the latch with sample_ttfb (resp_note_take)"; fail=1; }
 printf '%s\n' "$w" | grep -B3 'record_latency_sample(' | grep -q 'if ((take & RESP_NOTE_TTFB)' ||
-  { echo "sockproxy_http.c: proxy_note_response_ must sample TTFB only under (take & RESP_NOTE_TTFB)"; fail=1; }
+  { echo "sockproxy_http.c: resp_note_write_ must sample TTFB only under (take & RESP_NOTE_TTFB)"; fail=1; }
 grep -A2 '^resp_note_take(' sockproxy_resp_note.h | grep -q 'resp_note_claim(noted)' &&
   grep -A5 '^resp_note_take(' sockproxy_resp_note.h | grep -q 'RESP_NOTE_COUNT | (sample_ttfb ? RESP_NOTE_TTFB : 0)' ||
   { echo "sockproxy_resp_note.h: resp_note_take must claim, then take TTFB only when sample_ttfb"; fail=1; }

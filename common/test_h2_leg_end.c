@@ -38,6 +38,17 @@
 
 static int checks, failures;
 
+/* The stream's response record lives in sockproxy_http.c, which this test
+ * does not link: the answers the leg's end writes take their class count
+ * through this stand-in. */
+int
+proxy_h2_note_stream_response(proxy_h2_stream_t *stream, uint16_t status,
+                              int sample_ttfb)
+{
+  (void)stream; (void)status; (void)sample_ttfb;
+  return 1;
+}
+
 #define CHECK(cond, ...) do {                                        \
     checks++;                                                        \
     if (cond) {                                                      \

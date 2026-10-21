@@ -118,12 +118,18 @@ small_body(nghttp2_session *s, int32_t id, uint8_t *buf, size_t len,
 
 static int32_t last_id;
 
+/* The stream's response record (test_h2_fixture_links.c keeps what the
+ * product noted): every answer here is the gateway's own, so it takes the
+ * class count once and never a TTFB sample. */
+extern int h2fx_notes, h2fx_note_status, h2fx_note_ttfb;
+
 static void
 run(int which, int want_status, const char *what)
 {
   int32_t id;
   proxy_h2_stream_t *st;
   int rc;
+  int notes_before = h2fx_notes;
 
   set_case(which);
   id = h2fx_submit("m-gone", NULL, 0);
@@ -139,6 +145,12 @@ run(int which, int want_status, const char *what)
   CHECK(rc == 0, "%s: answered by the gateway itself (rc %d)", what, rc);
   CHECK(h2fx_status[id / 2] == want_status, "%s: the client got %d (got %d)",
         what, want_status, h2fx_status[id / 2]);
+  CHECK(h2fx_notes == notes_before + 1 && h2fx_note_status == want_status &&
+        h2fx_note_ttfb == 0,
+        "%s: the answer took the class count once, status %d, no TTFB sample "
+        "(notes +%d, status %d, ttfb %d)",
+        what, want_status, h2fx_notes - notes_before, h2fx_note_status,
+        h2fx_note_ttfb);
   CHECK(h2fx_stream(id) == NULL,
         "%s: the answer ended the stream and freed it (the case can see a read after the free)",
         what);

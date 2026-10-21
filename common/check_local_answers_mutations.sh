@@ -174,8 +174,22 @@ mut sockproxy_http.c 'return proxy_note_response_(pfe, status, 0);' 'return prox
 expect "rule 2: the local wrapper samples TTFB" "proxy_note_local_answer must be proxy_note_response_(pfe, status, 0)"
 
 fresh
-mut sockproxy_http.c 'if ((take & RESP_NOTE_TTFB) && pfe->metric_req_start_ns > 0) {' 'if (pfe->metric_req_start_ns > 0) {'
+mut sockproxy_http.c 'if ((take & RESP_NOTE_TTFB) && req_start_ns > 0) {' 'if (req_start_ns > 0) {'
 expect "rule 2: the writer samples whatever the caller asked" "must sample TTFB only under (take & RESP_NOTE_TTFB)"
+
+fresh
+mut sockproxy_h2.c '  return proxy_h2_note_stream_response(stream, status, 0);' '  return proxy_h2_note_stream_response(stream, status, 1);'
+expect "rule 2: the HTTP/2 local wrapper samples TTFB" "h2_note_local_answer must be proxy_h2_note_stream_response(stream, status, 0)"
+
+fresh
+mut sockproxy_h2.c '  h2_note_local_answer(stream, (uint16_t)status_code);' '  proxy_h2_note_stream_response(stream, (uint16_t)status_code, 1);'
+expect "rule 2: an HTTP/2 site notes around the wrappers" "only h2_note_backend_response and h2_note_local_answer call it"
+
+fresh
+mut sockproxy_http.c '  return resp_note_write_(&stream->metric_resp_noted,
+                          stream->metric_req_start_ns, status, sample_ttfb);' '  atomic_fetch_add(&global_stats.http_responses_total, 1);
+  return 1;'
+expect "rule 2: the HTTP/2 wrapper writes the record itself" "a wrapper writes the record itself"
 
 fresh
 mut sockproxy_resp_note.h 'return RESP_NOTE_COUNT | (sample_ttfb ? RESP_NOTE_TTFB : 0);' 'return RESP_NOTE_COUNT | RESP_NOTE_TTFB;'
