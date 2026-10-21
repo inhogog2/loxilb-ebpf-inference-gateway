@@ -333,5 +333,34 @@ mut sockproxy_http.c '/
                         1000000ULL);'
 unit "7c: the TTFT goes out in milliseconds"
 
+# 1f: the framer no longer records the answer: a status line split across
+# reads is lost to the class counter and the TTFB sample again.
+fresh
+mut sockproxy_http.c '    if (proxy_note_client_response(pfe, status))
+      proxy_origin_status_feed(pfe, status);' '    (void)status;'
+expect "1f: the framer does not record the answer" "cresp_on_headers_complete must record the answer"
+
+# 1f: the framer records, but before it knows the status is an answer: an
+# interim 100 would take the latch from the real answer.
+fresh
+mut sockproxy_http.c '  if (!cresp_is_answer(parser->status_code)) {
+    return 0;
+  }
+  /* The answer'"'"'s record' '  {
+    uint16_t status = (uint16_t)parser->status_code;
+    if (proxy_note_client_response(pfe, status))
+      proxy_origin_status_feed(pfe, status);
+  }
+  if (!cresp_is_answer(parser->status_code)) {
+    return 0;
+  }
+  /* The answer'"'"'s record'
+expect "1f: the framer records an interim response" "cresp_on_headers_complete must record the answer"
+
+# 1f: the capture stops feeding the breaker.
+fresh
+mut sockproxy_http.c '          if (noted) proxy_origin_status_feed(rfd_ent, status);' '          (void)noted;'
+expect "1f: the capture does not feed the breaker" "must feed the breaker through proxy_origin_status_feed"
+
 echo "check_pd_status_sites.sh mutations: $((n - survived)) of $n killed"
 [ "$survived" = "0" ]

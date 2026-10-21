@@ -50,6 +50,33 @@ if ! printf '%s\n' "$cap" | grep -q 'proxy_note_client_response(rfd_ent, status)
   fail=1
 fi
 
+# 1f. The framer records the answer too. A status line split across reads
+#     ("HTTP/1.1 200" then " OK\r\n…") is never a read that begins "HTTP/1."
+#     with 16 bytes behind it, so the capture misses it and the request is
+#     missing from the class counter and the TTFB sample while its AI record
+#     carries the status the framer read (MON-02-EDGE). llhttp assembles the
+#     line whatever the read boundaries: cresp_on_headers_complete records
+#     through the same helper once the status is an answer, and the latch
+#     makes the second of the two sites a no-op. Both sites feed the origin
+#     breaker through proxy_origin_status_feed when their note took the latch.
+fr=$(awk '/^cresp_on_headers_complete\(/ {on = 1} on {print} on && /^}/ {exit}' ./sockproxy_http.c)
+ans_ln=$(printf '%s\n' "$fr" | grep -n 'if (!cresp_is_answer(parser->status_code)) {' | head -1 | cut -d: -f1)
+rec_ln=$(printf '%s\n' "$fr" | tr '\n' ' ' | grep -o 'if (proxy_note_client_response(pfe, status)) *proxy_origin_status_feed(pfe, status);' | head -1)
+rec_pos=$(printf '%s\n' "$fr" | grep -n 'if (proxy_note_client_response(pfe, status))' | head -1 | cut -d: -f1)
+if [ -z "$ans_ln" ] || [ -z "$rec_ln" ] || [ -z "$rec_pos" ] || [ "$rec_pos" -lt "$ans_ln" ]; then
+  echo "sockproxy_http.c: cresp_on_headers_complete must record the answer through proxy_note_client_response(pfe, status) after cresp_is_answer, and feed the breaker when its note took the latch (a status line split across reads is recorded by the framer)"
+  fail=1
+fi
+if ! printf '%s\n' "$cap" | grep -q 'if (noted) proxy_origin_status_feed(rfd_ent, status);'; then
+  echo "sockproxy_http.c: the L7 METRICS capture must feed the breaker through proxy_origin_status_feed when its note took the latch"
+  fail=1
+fi
+feeds=$(grep -c 'proxy_origin_status_feed(' ./sockproxy_http.c || true)
+if [ "$feeds" != "3" ]; then
+  echo "sockproxy_http.c: proxy_origin_status_feed has one definition and two callers (the capture, the framer); found $feeds mentions"
+  fail=1
+fi
+
 # 1c. The writer is the only one of the class counters and the TTFB sample,
 #     so no path can record a response around it (or twice).
 h_from=$(grep -n '^proxy_note_response_(' ./sockproxy_http.c | head -1 | cut -d: -f1)
@@ -399,4 +426,4 @@ if [ "$fbn" != "1" ] || [ -z "$fbl" ] || [ -z "$relay" ] || [ -z "$early" ] || \
 fi
 
 [ "$fail" = "0" ] || exit 1
-echo "P/D status sites: OK (captures skip the prefill leg; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; a cut answer is recorded by its end, a P/D client's abort is aborted at any stage, a P/D client leaving at the gate, queued or parked is recorded in both, off P/D a request ended before any answer (the client leaving, the engine ending it) is one request record; each record crosses as both calls; the first event and the fallback reason have one writer each)"
+echo "P/D status sites: OK (captures skip the prefill leg; the framer records a status line split across reads; prefill-leg answers set their status and are recorded; decode completions record their status; a gateway-ended stream is decode/truncated; reaped and dying-leg requests are recorded by cause, a teardown reaper writes the request record; a cut answer is recorded by its end, a P/D client's abort is aborted at any stage, a P/D client leaving at the gate, queued or parked is recorded in both, off P/D a request ended before any answer (the client leaving, the engine ending it) is one request record; each record crosses as both calls; the first event and the fallback reason have one writer each)"

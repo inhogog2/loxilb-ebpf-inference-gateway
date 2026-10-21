@@ -308,6 +308,65 @@ test_interim_response_completes_separately(void)
   printf("  [PASS] 100 + 103 + 200 -> 3 completions, 1 answer\n");
 }
 
+/* The L7 METRICS capture's sniff of a backend read (proxy_try_epxmit): a
+ * status line is taken from a read that begins "HTTP/1." with more than 16
+ * bytes in it. Mirrored here literally, so the case below falsifies the
+ * premise of the framer-side record: a read that is neither is one the
+ * capture never records from. */
+static int
+capture_sniffs_status(const char *rd, size_t len)
+{
+  return len > 16 && memcmp(rd, "HTTP/1.", 7) == 0 && len > 12 &&
+         rd[9] >= '1' && rd[9] <= '5';
+}
+
+/* ---- Case 7: the status line split across reads (MON-02-EDGE) ----
+ * QA's decode fixture sends "HTTP/1.1 200" and, 200 ms later, " OK\r\n" and
+ * the rest: a valid answer the client receives whole, but no read of it is
+ * one the capture's sniff takes, so the responses-by-status class counter
+ * and the TTFB sample went missing while the AI record carried the 200 the
+ * framer had read. For every cut inside the first 17 bytes, the sniff takes
+ * neither read, and the framer still completes the headers once, with the
+ * status, before the body: the site that records from it
+ * (cresp_on_headers_complete) sees every split the sniff misses. A cut at 17
+ * or beyond leaves the sniff a read it takes, as before. */
+static void
+test_status_line_split_across_reads(void)
+{
+  const char *wire =
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: text/event-stream\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n"
+      "e\r\ndata: [DONE]\n\n\r\n"
+      "0\r\n\r\n";
+  size_t len = strlen(wire);
+
+  for (size_t cut = 1; cut < len; cut++) {
+    llhttp_t p;
+    llhttp_settings_t s;
+    struct fctx c;
+    int sniffed = capture_sniffs_status(wire, cut) ||
+                  capture_sniffs_status(wire + cut, len - cut);
+    parser_init(&p, &s, &c);
+
+    assert((cut >= 17) == sniffed &&
+           "the capture takes a read of 17+ bytes that begins the status line, "
+           "and no other");
+    assert(feed(&p, wire, cut) == HPE_OK && "first read parses");
+    assert(c.message_complete == 0 || cut == len);
+    assert(feed(&p, wire + cut, len - cut) == HPE_OK && "second read parses");
+    assert(c.headers_complete == 1 && p.status_code == 200 &&
+           "the framer completes the headers once, with the status, "
+           "whatever the cut: the record it takes covers every split the "
+           "sniff misses");
+    assert(c.message_complete == 1 && c.body_bytes == 14 &&
+           "the answer completes once, its body whole");
+  }
+  printf("  [PASS] status line split at every cut -> framer reports 200 once; "
+         "the sniff misses cuts 1..16\n");
+}
+
 int
 main(void)
 {
@@ -319,6 +378,7 @@ main(void)
   test_cl_satisfied_no_double_complete();
   test_no_terminator_keepalive_silence();
   test_interim_response_completes_separately();
+  test_status_line_split_across_reads();
   printf("ALL PASS (test_resp_framing)\n");
   return 0;
 }
