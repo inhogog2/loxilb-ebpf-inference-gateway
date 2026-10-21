@@ -6045,6 +6045,7 @@ proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
   v->sse_active            = pfe->sse_active ? 1 : 0;
   v->pd_in_flight          = pd_reap_error_phase(pfe->pd_phase) >= 0;
   v->pd_rule               = pfe->pd_rule ? 1 : 0;
+  v->resp_kernel           = pfe->resp_kernel ? 1 : 0;
   v->req_framed            = pfe->metric_req_start_ns > 0;
   {
     uint8_t he = atomic_load_explicit(&pfe->hold_end, memory_order_relaxed);
@@ -6819,7 +6820,7 @@ proxy_pdestroy(void *priv)
            * end (backend_died, status 0), not as the client leaving before
            * its answer. The client gets the bare close, no 502 (F-18). */
           if (cl && !cl->end_cause && !pfe->pd_sg_drain && !cl->pd_rule &&
-              cl->odir == 0 && cl->metric_req_start_ns > 0 &&
+              !cl->resp_kernel && cl->odir == 0 && cl->metric_req_start_ns > 0 &&
               !cl->metric_ai_recorded && cl->metric_response_status == 0) {
             cl->end_cause = SP_END_BACKEND_DIED;
           }
@@ -8529,6 +8530,10 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
           npfe2->peer_map_resp_installed = 1;
           npfe2->peer_map_resp_verdict = 1;
           hc_note_accel(pfe, HC_ACCEL_RESP);
+          /* The client's answers now go by the kernel: no status reaches
+           * userspace, so its teardown cannot tell an answered request from
+           * one that ended before any answer. Kept for the connection. */
+          pfe->resp_kernel = 1;
         } else {
           proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
           log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "

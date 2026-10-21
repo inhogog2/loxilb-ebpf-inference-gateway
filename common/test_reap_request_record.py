@@ -113,7 +113,7 @@ struct proxy_fd_ent {
   int fd, odir, ai_gw_mode, metric_ai_recorded, metric_response_status, noted, fc;
   int usage_reserved_toks, usage_consumed, usage_prompt_toks, usage_complet_toks;
   int auth_src, adm_priority, adm_class_set, adm_class, adm_objective_denied, adm_hint_not_applied, pd_phase;
-  uint8_t pd_rule; _Atomic uint8_t hold_end;
+  uint8_t pd_rule, resp_kernel; _Atomic uint8_t hold_end;
   void *h2_session; uint8_t sse_active, reap_resp, end_cause; time_t stream_start_ts;
   _Atomic uint8_t cresp_in_msg, cresp_answer_open; llhttp_t cresp_parser;
   uint64_t metric_req_start_ns;
@@ -327,6 +327,23 @@ int main(void) {
     event_loop_teardown(&c);
     printf("  not P/D, no whole request, client leaves -> %d request record(s)\n", records);
     if (records != 0 || pd_aborted != 0) bad = 1;
+  }
+  /* A connection whose answers go by the kernel (sockmap response pairing):
+   * no status reaches userspace, so an answered request reads as status 0.
+   * Whether the client or the leg goes, nothing is recorded, as its answers
+   * are not. */
+  {
+    static const int ends[] = { 0, SP_END_BACKEND_DIED };
+    for (unsigned i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
+      proxy_fd_ent_t c = client(0);
+      c.resp_kernel = 1;
+      c.end_cause = (uint8_t)ends[i];
+      records = 0; pd_aborted = 0;
+      event_loop_teardown(&c);
+      printf("  not P/D, answers by the kernel, %s -> %d request record(s)\n",
+             ends[i] ? "leg ends" : "client leaves", records);
+      if (records != 0 || pd_aborted != 0) bad = 1;
+    }
   }
   /* The teardown's reading, case by case: a recorded end wins, an open answer
    * is the client leaving (the gateway when the whole listener goes), a

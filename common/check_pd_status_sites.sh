@@ -320,8 +320,19 @@ if ! grep -q 'npfe1->pd_rule = ent_pool0->pd_disagg_enabled ? 1 : 0;' ./sockprox
   echo "sockproxy_http.c: the teardown view must say whether the rule is P/D, the request whole, and the hold ended by the gateway"
   fail=1
 fi
-if ! tr '\n' ' ' < ./sockproxy_http.c | grep -q '!cl->pd_rule && *cl->odir == 0 && cl->metric_req_start_ns > 0 && *!cl->metric_ai_recorded && cl->metric_response_status == 0) { *cl->end_cause = SP_END_BACKEND_DIED;'; then
+if ! tr '\n' ' ' < ./sockproxy_http.c | grep -q '!cl->pd_rule && *!cl->resp_kernel && cl->odir == 0 && cl->metric_req_start_ns > 0 && *!cl->metric_ai_recorded && cl->metric_response_status == 0) { *cl->end_cause = SP_END_BACKEND_DIED;'; then
   echo "sockproxy_http.c: off P/D, a leg ending before any answer must name the engine, not leave it to read as the client leaving"
+  fail=1
+fi
+
+# 6g. A connection whose answers go by the kernel (sockmap response pairing)
+#     shows userspace no status, so status 0 there is no proof that no answer
+#     came: no record is owed before any answer, and a leg ending does not
+#     name the engine. The pairing marks the client; the view carries it.
+if ! printf '%s' "$oar" | grep -q 'c->has_h2_session || c->resp_kernel) {' || \
+   ! grep -q 'v->resp_kernel           = pfe->resp_kernel ? 1 : 0;' ./sockproxy_http.c || \
+   ! tr '\n' ' ' < ./sockproxy_http.c | grep -q 'npfe2->peer_map_resp_verdict = 1; *hc_note_accel(pfe, HC_ACCEL_RESP);.*pfe->resp_kernel = 1;'; then
+  echo "sockproxy_http.c/sockproxy_teardown_settle.h: a connection whose answers go by the kernel must owe no record before any answer"
   fail=1
 fi
 
