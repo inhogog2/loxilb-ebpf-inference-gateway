@@ -245,7 +245,18 @@ typedef struct proxy_metrics_snapshot {
      * Expected 0: non-zero says a path lost the Host.
      * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
     uint64_t route_host_missing;
+
+    /* P/D admission units held now on prefill and on decode endpoints, and
+     * the clients parked on a prefill endpoint's queue (the per-EP FIFO's
+     * live count, not a connection phase).
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t pd_prefill_inflight;
+    uint64_t pd_decode_inflight;
+    uint64_t pd_parked_connections;
 } proxy_metrics_snapshot_t;
+
+_Static_assert(sizeof(proxy_metrics_snapshot_t) == 6096,
+               "proxy_metrics_snapshot_t ABI: keep C, Go and stub mirrors aligned");
 
 /* =========================================================================
  * Public API

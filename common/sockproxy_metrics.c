@@ -190,6 +190,24 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
             proxy_epval_t *tepval, *tmp_epval;
             HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
                 if (tepval->pd_disagg_enabled) {
+                    /* Endpoint occupancy is independent of cached session count. */
+                    for (int ep = 0; ep < tepval->n_eps; ep++) {
+                        uint64_t units = atomic_load(&tepval->pd_ep_loads[ep].active_conns);
+                        if (tepval->ep_role[ep] == 1) {
+                            snapshot.pd_prefill_inflight += units;
+                        } else if (tepval->ep_role[ep] == 2) {
+                            snapshot.pd_decode_inflight += units;
+                        }
+                    }
+                    /* Clients parked on a prefill endpoint's queue: the per-EP
+                     * FIFO's live count under its own lock (taken under
+                     * PROXY_LOCK here as at every other site). A connection's
+                     * pd_phase is the owner worker's and is not read here. */
+                    pthread_mutex_lock(&tepval->pd_parked_lock);
+                    for (int ep = 0; ep < tepval->n_eps; ep++) {
+                        snapshot.pd_parked_connections += tepval->pd_parked[ep].count;
+                    }
+                    pthread_mutex_unlock(&tepval->pd_parked_lock);
                     pthread_rwlock_rdlock(&tepval->pd_session_lock);
                     snapshot.pd_sessions_active += HASH_COUNT(tepval->pd_session_map);
                     pthread_rwlock_unlock(&tepval->pd_session_lock);
