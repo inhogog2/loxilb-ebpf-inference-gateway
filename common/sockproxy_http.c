@@ -366,6 +366,7 @@ static void cresp_note_local_answer(proxy_fd_ent_t *client);
 #define PROXY_LEG_ANSWERED_H2  2
 static int proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
                                         const char *op, int sys_errno);
+static void proxy_backend_leg_ended_unanswered(proxy_fd_ent_t *pfe);
 
 static ssize_t
 proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
@@ -6281,6 +6282,9 @@ proxy_pdestroy(void *priv)
    * either way the leg is detached below and its client goes on. */
   proxy_h2_h1_backend_eof(pfe, 0);
   proxy_h2_backend_leg_end(pfe);
+  /* An HTTP/1.1 leg ending under a request it never answered: the client
+   * gets its 502 here, for the same reason. */
+  proxy_backend_leg_ended_unanswered(pfe);
 
   PROXY_LOCK();
   if (pfe) {
@@ -6816,9 +6820,10 @@ proxy_pdestroy(void *priv)
           }
           /* The same leg ending before any answer, under a whole request on
            * a rule that is not P/D: the engine ended it too, not the client.
-           * Named here so the cascade's teardown records it as the engine's
-           * end (backend_died, status 0), not as the client leaving before
-           * its answer. The client gets the bare close, no 502 (F-18). */
+           * The client was given its 502 above (completed/502); where it
+           * could not be, this names the end so the cascade's teardown
+           * records it as the engine's (backend_died, status 0), not as the
+           * client leaving before its answer. */
           if (cl && !cl->end_cause && !pfe->pd_sg_drain && !cl->pd_rule &&
               !cl->resp_kernel && cl->odir == 0 && cl->metric_req_start_ns > 0 &&
               !cl->metric_ai_recorded && cl->metric_response_status == 0) {
@@ -7749,6 +7754,56 @@ proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
   }
   PROXY_ENT_UNLOCK(client);
   return answered;
+}
+
+/* A backend leg going away under the whole HTTP/1.1 request it was to answer,
+ * before any answer, on an AI-gateway rule that is not P/D: the client is
+ * told what a refused connect tells it, a 502, and the request is recorded
+ * completed with that status, as the TLS leg's failure is
+ * (proxy_backend_leg_unanswered). Without it the client got the bare close.
+ * A P/D leg's end is answered by the P/D paths with their own status, and
+ * HTTP/2 answers its streams in proxy_h2_backend_leg_end.
+ *
+ * Not on a connection whose answers go by the kernel: no status is seen
+ * there, so the answer may already be out. Not when a reaper or a stall
+ * already named the end. A client that left first has recorded its request
+ * and unlinked this leg in its own teardown, so it is not reached here.
+ *
+ * Call with nothing held, before the teardown takes PROXY_LOCK: the record
+ * reaches the control plane. */
+static void
+proxy_backend_leg_ended_unanswered(proxy_fd_ent_t *pfe)
+{
+  proxy_fd_ent_t *client;
+  char ep[INET_ADDRSTRLEN + 16];
+
+  if (pfe->odir != 1 || pfe->pd_sg_drain || pfe->n_rfd <= 0) {
+    return;
+  }
+  client = pfe->rfd_ent[0];
+  if (!client || client->odir != 0 || client->fd <= 0 || !client->ai_gw_mode ||
+      client->pd_rule || client->pd_phase != PD_PHASE_NONE ||
+      client->h2_session || client->resp_kernel) {
+    return;
+  }
+  PROXY_ENT_LOCK(client);
+  if (client->metric_req_start_ns > 0 && !client->metric_ai_recorded &&
+      client->metric_response_status == 0 && !client->end_cause &&
+      !sp_answer_started(client)) {
+    proxy_backend_leg_name(pfe, client, ep, sizeof(ep));
+    log_error("backend %s closed the connection before any response: 502 to client fd=%d",
+              ep, client->fd);
+    if (proxy_send_backend_unreachable(client,
+            "the backend endpoint closed the connection before it answered") == 0) {
+      cresp_note_local_answer(client);
+    }
+    /* The answer says Connection: close; a TLS client is told the stream
+     * ended here, so it does not read the close that follows as a cut. */
+    if (client->ssl) {
+      (void)SSL_shutdown(client->ssl);
+    }
+  }
+  PROXY_ENT_UNLOCK(client);
 }
 
 static int
