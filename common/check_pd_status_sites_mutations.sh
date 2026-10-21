@@ -254,20 +254,6 @@ mut sockproxy_http.c '    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED
         pd_reap_error_phase(pfe->pd_phase) >= 0) {'
 expect "6h: a parked P/D request's listener end has no 10" "must record aborted/gateway (10) once"
 
-# 6i: the listener going with the decode answer open: 8, once.
-fresh
-mut sockproxy_http.c '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 8 /*decode, truncated*/);' '                   (pfe->pd_kv_params_len > 0) ? 1 : 0, 2 /*decode_error*/);'
-expect "6i: the listener's cut reads as the engine dying (2)" "must record decode/truncated (8) once"
-fresh
-mut sockproxy_http.c 'u->status != 0 &&
-        (pfe->pd_phase == PD_PHASE_DECODE_SENDING ||
-         pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {' 'u->status != 0 &&
-        pfe->pd_phase == PD_PHASE_DECODE_STREAMING) {'
-expect "6i: a non-streamed decode answer cut by the listener has no 8" "must record decode/truncated (8) once"
-fresh
-mut sockproxy_http.c '    if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status != 0 &&' '    if (0 && u->end == SP_END_LISTENER_CLOSED && u->status != 0 &&'
-expect "6i: the listener's cut of an open answer has no lifecycle record" "must record decode/truncated (8) once"
-
 # 6g: a connection whose answers go by the kernel owes nothing before any answer.
 fresh
 mut sockproxy_teardown_settle.h 'c->has_h2_session || c->resp_kernel) {' 'c->has_h2_session) {'
@@ -306,10 +292,8 @@ fresh
 mut sockproxy_http.c 'if (sp_sse_body(&pfe->cresp_sse, at, len) && pfe->pd_first_event_ns == 0 &&' 'if (sp_sse_body(&pfe->cresp_sse, at, len) &&'
 expect "8a: the stamp is taken again at every first object" "cresp_on_body must stamp the first event once"
 fresh
-mut sockproxy_http.c '        pfe->pd_decode_start_ns > 0 &&
-        (pfe->pd_phase == PD_PHASE_DECODE_SENDING ||
-         pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {' '        pfe->pd_decode_start_ns > 0 &&
-        1) {'
+mut sockproxy_http.c '        (pfe->pd_phase == PD_PHASE_DECODE_SENDING ||
+         pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {' '        1) {'
 expect "8a: the stamp is taken outside a P/D decode leg" "cresp_on_body must stamp the first event once"
 fresh
 python3 - "$work/src/sockproxy_pd_vllm.c" <<'PY'

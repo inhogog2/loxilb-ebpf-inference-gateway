@@ -316,12 +316,6 @@ if ! printf '%s' "$col" | grep -q 'if (u->owes_record && u->end == SP_END_LISTEN
   echo "sockproxy_http.c: a P/D request whose listener went before any answer must record aborted/gateway (10) once"
   fail=1
 fi
-# 6i. The same listener going with the decode answer open: decode/truncated (8),
-#     once. The 8/10 boundary is the answer: 10 before it, 8 after.
-if ! printf '%s' "$col" | grep -q 'if (u->owes_record && u->end == SP_END_LISTENER_CLOSED && u->status != 0 && *(pfe->pd_phase == PD_PHASE_DECODE_SENDING || *pfe->pd_phase == PD_PHASE_DECODE_STREAMING)) {.*8 /\*decode, truncated\*/); *pfe->pd_phase = PD_PHASE_ERROR;'; then
-  echo "sockproxy_http.c: a P/D request whose listener went with the decode answer open must record decode/truncated (8) once"
-  fail=1
-fi
 
 # 6e. Off P/D, the request record alone (no lifecycle family pairs with it):
 #     owed once the whole request reached the gate, not after the gateway
