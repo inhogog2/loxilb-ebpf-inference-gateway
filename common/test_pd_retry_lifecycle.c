@@ -196,6 +196,54 @@ void llb_sockproxy_emit_sync_event(const proxy_sync_event_t *e)
 {
   (void)e;
 }
+/* Service boundaries main's sockproxy_http.c reaches since this test was
+ * written (the request record, the capacity gate's permit, the TTFB sample,
+ * the service identity): none is under test here, each is a no-op. */
+void llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
+                           int64_t latency_ms, int prompt_tokens, int complet_tokens,
+                           int stream_start, int stream_end, char *error_code,
+                           char *request_id, char *user_id, char *key_id,
+                           char *svc_ident, int is_stream, int producer_id,
+                           char *client_ip, char *origin_ip, int trusted_hops,
+                           int auth_src, char *net_identity, int priority,
+                           int class_info, char *objective)
+{
+  (void)tenant_id; (void)model_name; (void)status_code; (void)latency_ms;
+  (void)prompt_tokens; (void)complet_tokens; (void)stream_start; (void)stream_end;
+  (void)error_code; (void)request_id; (void)user_id; (void)key_id; (void)svc_ident;
+  (void)is_stream; (void)producer_id; (void)client_ip; (void)origin_ip;
+  (void)trusted_hops; (void)auth_src; (void)net_identity; (void)priority;
+  (void)class_info; (void)objective;
+}
+void llb_ai_pd_record_extra(char *model_name, int64_t decode_ttft_us, int fallback_reason)
+{
+  (void)model_name;
+  (void)decode_ttft_us;
+  (void)fallback_reason;
+}
+void ai_gw_svc_ident(uint32_t xip_be, uint16_t xport_be, char *buf, size_t len)
+{
+  (void)xip_be;
+  (void)xport_be;
+  if (buf && len)
+    buf[0] = '\0';
+}
+uint64_t get_timestamp_ns(void)
+{
+  return 0;
+}
+int notify_worker_id(void)
+{
+  return 0;
+}
+void fc_permit_release(fc_permit_t *p)
+{
+  (void)p;
+}
+void record_latency_sample(uint64_t latency_us)
+{
+  (void)latency_us;
+}
 int pd_kv_exact_select(proxy_epval_t *t, proxy_fd_ent_t *p, int *ep, uint32_t mask)
 {
   (void)t;
