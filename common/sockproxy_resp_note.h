@@ -13,7 +13,9 @@
 #ifndef SOCKPROXY_RESP_NOTE_H
 #define SOCKPROXY_RESP_NOTE_H
 
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 /* Returns 1 to the first caller for the request, which records; 0 to every
  * later caller until resp_note_rearm. */
@@ -51,6 +53,43 @@ static inline int
 resp_status_class(unsigned int status)
 {
   return (status >= 200 && status < 600) ? (int)(status / 100) : 0;
+}
+
+/* A status that answers the request. An interim 1xx (100 Continue a backend
+ * sends itself when the gateway forwarded Expect, 103 Early Hints) is a
+ * message of its own and the final answer follows; 101 ends HTTP on the
+ * connection, so it answers. The framer (cresp_is_answer) and the status-line
+ * sniffs decide by this one predicate: an interim status must not take the
+ * once-per-request latch, or the answer that follows is never counted and the
+ * TTFB sample is the 100's (F-21). */
+static inline int
+resp_status_is_answer(int status)
+{
+  return status >= 200 || status == 101;
+}
+
+/* The status-line sniff of the backend capture in proxy_try_epxmit: 1 when
+ * the read begins with a complete "HTTP/1.x NNN" whose NNN answers the
+ * request, with the status in *status; 0 for a short read, another first
+ * line, a malformed status, or an interim status. The caller's own window
+ * (len > 16, the first bytes of a backend read) stays at the call site. */
+static inline int
+resp_sniff_status_line(const char *buf, size_t len, uint16_t *status)
+{
+  const char *status_start = buf + 9; /* "HTTP/1.x " */
+  int st;
+
+  if (len <= 12 || memcmp(buf, "HTTP/1.", 7) != 0) return 0;
+  if (status_start + 3 > buf + len) return 0;
+  if (status_start[0] < '1' || status_start[0] > '5' ||
+      status_start[1] < '0' || status_start[1] > '9' ||
+      status_start[2] < '0' || status_start[2] > '9')
+    return 0;
+  st = (status_start[0] - '0') * 100 + (status_start[1] - '0') * 10 +
+       (status_start[2] - '0');
+  if (!resp_status_is_answer(st)) return 0;
+  *status = (uint16_t)st;
+  return 1;
 }
 
 #endif /* SOCKPROXY_RESP_NOTE_H */

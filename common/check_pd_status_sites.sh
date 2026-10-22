@@ -77,6 +77,37 @@ if [ "$feeds" != "3" ]; then
   fail=1
 fi
 
+# 1g. The capture records an answer only. A backend's own interim "100
+#     Continue" (the gateway forwarded Expect) is a status line at the first
+#     bytes of a read, so the sniff took it: the latch closed on a status with
+#     no class, the TTFB sample was the 100's, and the answer behind it was a
+#     latched no-op, never counted (F-21). Both sniffs (L7 METRICS, the trace
+#     capture) read the line through resp_sniff_status_line, which returns 0
+#     for an interim status, and the framer's cresp_is_answer decides by the
+#     same predicate, resp_status_is_answer: >= 200, or 101.
+if ! printf '%s\n' "$cap" | grep -q 'resp_sniff_status_line((const char \*)msg, len, &status)'; then
+  echo "sockproxy_http.c: the L7 METRICS capture must read the status line through resp_sniff_status_line (an answer only; a backend 100 Continue must not take the latch)"
+  fail=1
+fi
+tcap=$(grep -A24 'rfd_ent->response_status_code == 0 && len > 16 &&$' ./sockproxy_http.c || true)
+if ! printf '%s\n' "$tcap" | grep -q 'resp_sniff_status_line(buf, len, &status)'; then
+  echo "sockproxy_http.c: the trace capture must read the status line through resp_sniff_status_line (an answer only)"
+  fail=1
+fi
+if ! grep -A3 '^resp_status_is_answer(' ./sockproxy_resp_note.h | grep -q 'return status >= 200 || status == 101;'; then
+  echo "sockproxy_resp_note.h: resp_status_is_answer must be '>= 200 || == 101' (an interim 1xx is not the answer; 101 ends HTTP)"
+  fail=1
+fi
+if ! grep -A6 '^resp_sniff_status_line(' ./sockproxy_resp_note.h | grep -q 'len <= 12 || memcmp(buf, "HTTP/1.", 7) != 0' ||
+   ! awk '/^resp_sniff_status_line\(/ {on = 1} on {print} on && /^}/ {exit}' ./sockproxy_resp_note.h | grep -q 'if (!resp_status_is_answer(st)) return 0;'; then
+  echo "sockproxy_resp_note.h: resp_sniff_status_line must take a complete HTTP/1.x status line and return 0 unless resp_status_is_answer"
+  fail=1
+fi
+if ! grep -A3 '^cresp_is_answer(' ./sockproxy_http.c | grep -q 'return resp_status_is_answer(status);'; then
+  echo "sockproxy_http.c: cresp_is_answer must decide by resp_status_is_answer, the predicate the sniffs use"
+  fail=1
+fi
+
 # 1c. The writer is the only one of the class counters and the TTFB sample,
 #     so no path can record a response around it (or twice). The product
 #     sources are the paths; a test fixture that links sockproxy_http.c

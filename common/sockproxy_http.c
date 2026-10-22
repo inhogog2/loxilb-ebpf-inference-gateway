@@ -1935,12 +1935,12 @@ skip_deferred_masking:
 
       // Check for HTTP response status line: "HTTP/1.1 200 OK\r\n"
       if (memcmp(buf, "HTTP/1.", 7) == 0 && len > 12) {
-        // Extract status code (3 digits after "HTTP/1.x ")
-        const char *status_start = buf + 9;  // Skip "HTTP/1.x "
-        if (status_start + 3 <= buf + len) {
-          rfd_ent->response_status_code = (status_start[0] - '0') * 100 +
-                                          (status_start[1] - '0') * 10 +
-                                          (status_start[2] - '0');
+        // The status that answers the request. A backend's own interim
+        // "100 Continue" is skipped, as the L7 METRICS sniff and the framer
+        // skip it, so the trace carries the answer's status (F-21).
+        uint16_t status;
+        if (resp_sniff_status_line(buf, len, &status)) {
+          rfd_ent->response_status_code = status;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[RESPONSE_STATUS_CAPTURED] frontend_fd=%d backend_fd=%d status=%u",
                     rfd_ent->fd, ent->fd, rfd_ent->response_status_code);
@@ -1984,20 +1984,17 @@ skip_deferred_masking:
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->metric_response_status == 0 && len > 16 &&
         rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
-      const char *buf = (const char *)msg;
-      if (memcmp(buf, "HTTP/1.", 7) == 0 && len > 12) {
-        const char *status_start = buf + 9;
-        if (status_start + 3 <= buf + len &&
-            status_start[0] >= '1' && status_start[0] <= '5' &&
-            status_start[1] >= '0' && status_start[1] <= '9' &&
-            status_start[2] >= '0' && status_start[2] <= '9') {
-          uint16_t status = (status_start[0] - '0') * 100 +
-                            (status_start[1] - '0') * 10 +
-                            (status_start[2] - '0');
-          // Status, class counter and TTFB sample, once per request. A
-          // status line split across reads ("HTTP/1.1 200" then " OK\r\n…")
-          // is never a read this sniff takes; the response framer, which
-          // assembles it, records it (cresp_on_headers_complete).
+      uint16_t status;
+      {
+        // Status, class counter and TTFB sample, once per request, for the
+        // status that answers the request. A backend's own interim "100
+        // Continue" (Expect forwarded) is not it: it took the latch, so the
+        // answer behind it was never counted and the TTFB sample was the
+        // 100's (F-21); resp_sniff_status_line skips every interim status.
+        // A status line split across reads ("HTTP/1.1 200" then " OK\r\n…")
+        // is never a read this sniff takes; the response framer, which
+        // assembles it, records it (cresp_on_headers_complete).
+        if (resp_sniff_status_line((const char *)msg, len, &status)) {
           int noted = proxy_note_client_response(rfd_ent, status);
           if (noted) proxy_origin_status_feed(rfd_ent, status);
         }
@@ -11302,7 +11299,7 @@ creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
 static int
 cresp_is_answer(int status)
 {
-  return status >= 200 || status == 101;
+  return resp_status_is_answer(status);
 }
 
 static void

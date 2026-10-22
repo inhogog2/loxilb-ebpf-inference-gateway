@@ -127,6 +127,62 @@ test_resp_note_take_local_and_backend(void)
   printf("  [PASS] resp_note take: a local answer and a backend reply share one record; TTFB only for the backend reply\n");
 }
 
+/* The status-line sniff of the backend capture records an answer only. A
+ * backend's own interim "100 Continue" (the gateway forwarded Expect) used to
+ * take the latch: no class (1xx has none), the TTFB sample at the 100, and the
+ * 200 or 5xx behind it a latched no-op, so the answer was never counted
+ * (F-21). The framer decides by the same predicate. */
+static void
+test_resp_sniff_status_line(void)
+{
+  uint16_t st = 0;
+  uint8_t noted = 0;
+  const char ok200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+  const char cont100[] = "HTTP/1.1 100 Continue\r\n\r\n";
+  const char sw101[] = "HTTP/1.1 101 Switching Protocols\r\n\r\n";
+  const char hints103[] = "HTTP/1.1 103 Early Hints\r\nLink: </s>\r\n\r\n";
+  const char err500[] = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
+  const char short200[] = "HTTP/1.1 200";                 /* 12 bytes: a cut */
+  const char bad6[] = "HTTP/1.1 6ab Nope\r\n\r\n";
+  const char bad0[] = "HTTP/1.1 099 Nope\r\n\r\n";
+  const char badalpha[] = "HTTP/1.1 2x0 Nope\r\n\r\n";
+  const char notresp[] = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+
+  assert(resp_status_is_answer(200) && resp_status_is_answer(299) && resp_status_is_answer(500));
+  assert(resp_status_is_answer(101) && "101 ends HTTP on the connection: it answers");
+  assert(!resp_status_is_answer(100) && !resp_status_is_answer(102) && !resp_status_is_answer(103));
+  assert(!resp_status_is_answer(0) && !resp_status_is_answer(199));
+
+  assert(resp_sniff_status_line(ok200, sizeof(ok200) - 1, &st) == 1 && st == 200);
+  st = 0;
+  assert(resp_sniff_status_line(err500, sizeof(err500) - 1, &st) == 1 && st == 500);
+  st = 0;
+  assert(resp_sniff_status_line(sw101, sizeof(sw101) - 1, &st) == 1 && st == 101);
+  st = 0;
+  assert(resp_sniff_status_line(cont100, sizeof(cont100) - 1, &st) == 0 && st == 0 &&
+         "a backend's 100 Continue is not the answer");
+  assert(resp_sniff_status_line(hints103, sizeof(hints103) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(short200, sizeof(short200) - 1, &st) == 0 && st == 0 &&
+         "12 bytes is a cut status line: the framer records it");
+  assert(resp_sniff_status_line(ok200, 13, &st) == 1 && st == 200 && "13 bytes carry the three digits");
+  st = 0;
+  assert(resp_sniff_status_line(bad6, sizeof(bad6) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(bad0, sizeof(bad0) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(badalpha, sizeof(badalpha) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(notresp, sizeof(notresp) - 1, &st) == 0 && st == 0);
+
+  /* the sequence the bug was: the backend's 100, then its 200, against one
+   * latch. The 100 is skipped, the latch stays open, the 200 takes it with a
+   * TTFB sample; a second record for the request is a no-op. */
+  assert(resp_sniff_status_line(cont100, sizeof(cont100) - 1, &st) == 0);
+  assert(resp_sniff_status_line(ok200, sizeof(ok200) - 1, &st) == 1 && st == 200);
+  assert(resp_note_take(&noted, 1) == (RESP_NOTE_COUNT | RESP_NOTE_TTFB) &&
+         "the answer behind a backend 100 takes the record");
+  assert(resp_status_class(st) == 2);
+  assert(resp_note_take(&noted, 1) == 0);
+  printf("  [PASS] resp_sniff_status_line: an answer only; a backend 100 Continue leaves the latch to the answer\n");
+}
+
 /* ---- Case 1: terminator wholly inside one packet still completes ---- */
 static void
 test_done_whole_packet(void)
@@ -490,6 +546,7 @@ main(void)
   printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
   test_resp_note_latch();
   test_resp_note_take_local_and_backend();
+  test_resp_sniff_status_line();
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();

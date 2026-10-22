@@ -407,5 +407,22 @@ fresh
 mut sockproxy_health.c '            pd_reap_respond(pfe, SP_REAP_SSE_CAP);' '            record_latency_sample(1); pd_reap_respond(pfe, SP_REAP_SSE_CAP);'
 expect "1c: a reaper records a sample outside the writer" "a response record outside proxy_note_response_"
 
+# 1g: the capture records an answer only (F-21).
+fresh
+mut sockproxy_resp_note.h '  return status >= 200 || status == 101;' '  return status >= 100;'
+expect "1g: an interim 1xx is an answer" "resp_status_is_answer must be '>= 200 || == 101'"
+fresh
+mut sockproxy_resp_note.h '  if (!resp_status_is_answer(st)) return 0;' '  (void)resp_status_is_answer;'
+expect "1g: the sniff takes an interim status" "return 0 unless resp_status_is_answer"
+fresh
+mut sockproxy_http.c '        if (resp_sniff_status_line((const char *)msg, len, &status)) {' '        if (len > 12 && (status = ((const char *)msg)[9] - 48) != 0) {'
+expect "1g: the L7 METRICS capture sniffs the line itself" "the L7 METRICS capture must read the status line through resp_sniff_status_line"
+fresh
+mut sockproxy_http.c '        if (resp_sniff_status_line(buf, len, &status)) {' '        if (len > 12 && (status = buf[9] - 48) != 0) {'
+expect "1g: the trace capture sniffs the line itself" "the trace capture must read the status line through resp_sniff_status_line"
+fresh
+mut sockproxy_http.c '  return resp_status_is_answer(status);' '  return status >= 100;'
+expect "1g: the framer decides on its own" "cresp_is_answer must decide by resp_status_is_answer"
+
 echo "check_pd_status_sites.sh mutations: $((n - survived)) of $n killed"
 [ "$survived" = "0" ]
