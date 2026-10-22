@@ -68,16 +68,7 @@ SRCS=$(ls sockproxy*.c | grep -v '^sockproxy_.*test' | grep -v '^test_' || true)
 # follow-ups (ANALYSIS-AND-FIX-DESIGN §4.1).
 ALLOW='
 sockproxy_http.c:proxy_send_local_100_continue:proxy_send_local_response:-|1|interim 100 Continue: the real response follows and takes the latch (rule 4)
-sockproxy_http.c:sp_mcp_h1_refuse:proxy_send_local_response_and_shutdown:-|1|MCP refusal: MCP services keep their own refusal accounting (ai_gw_denied); F-6
-sockproxy_h2.c:sp_mcp_h2_gate:h2_send_deny_frame:-|1|MCP refusal on HTTP/2: MCP accounting, and HTTP/2 has no class counter (F-7)
-sockproxy_h2.c:proxy_h2_on_header_callback:proxy_h2_send_ai_deny:mcp_routing_operand_too_large|1|MCP refusal on HTTP/2: MCP accounting; F-7
-sockproxy_h2.c:proxy_h2_on_header_callback:proxy_h2_send_ai_deny:mcp_headers_too_large|1|MCP refusal on HTTP/2: MCP accounting; F-7
-sockproxy_h2.c:proxy_h2_on_data_chunk_recv_callback:proxy_h2_send_ai_deny:mcp_body_too_large|1|MCP refusal on HTTP/2: MCP accounting; F-7
-sockproxy_h2.c:proxy_h2_forward_to_backend:h2_send_deny_frame:-|2|MCP outage on HTTP/2 (mcp_backend_unavailable, two sites): MCP accounting; F-7
 sockproxy_h2.c:proxy_h2_forward_to_backend:proxy_h2_send_ai_deny:-|1|the gate verdict on HTTP/2: the deny record is ai_gw_admit'"'"'s, at the verdict; no class counter on HTTP/2 (F-7)
-sockproxy_h2.c:proxy_h2_backend_leg_unanswered:proxy_h2_send_ai_deny:backend_unreachable|1|post-dispatch: the backend leg closed before it answered; F-6
-sockproxy_h2.c:proxy_h2_forward_to_backend:proxy_h2_send_ai_deny:backend_unreachable|1|post-dispatch: the backend connect failed after the pick; F-6
-sockproxy_http.c:handle_client_data:raw:smuggle_400|1|request-smuggling parse error (Content-Length with Transfer-Encoding): refused before a request exists to record
 sockproxy_health.c:pd_reap_respond:send:-|1|reaper fallback when the owner worker cannot be woken (no owner, ring full): the health thread may not write the request'"'"'s record fields, which the owner owns (a dispatch past its lookup may still record); counted in reap_fallback; F-6, F-13
 '
 
@@ -93,6 +84,8 @@ RECORDS='
 sockproxy_http.c:sp_send_local_refusal:proxy_note_local_refusal(pfe, status);proxy_record_local_deny(pfe, stage
 sockproxy_http.c:sp_send_local_outage:proxy_record_local_completion(pfe, status)
 sockproxy_http.c:proxy_send_backend_unreachable:proxy_record_local_completion(pfe, 502)
+sockproxy_http.c:sp_mcp_h1_refuse:proxy_record_local_completion(pfe, (uint16_t)status);proxy_note_local_refusal(pfe, (uint16_t)status);proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status
+sockproxy_h2.c:h2_send_mcp_frame:stream->metric_response_status = status_code;h2_record_local_deny(pfe, stream, AI_GW_STAGE_FRAMING
 sockproxy_http.c:sp_h1_send_admit_deny:proxy_note_local_refusal(pfe
 sockproxy_http.c:sp_h1_send_capacity_deny:proxy_note_local_refusal(pfe
 sockproxy_http.c:sp_h1_stream_model_unresolvable:proxy_note_local_refusal(pfe, 400);proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING

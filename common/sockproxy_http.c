@@ -10354,6 +10354,15 @@ static int sp_mcp_h1_refuse(proxy_fd_ent_t *pfe, int status)
       "%sConnection: close\r\n\r\n%s",status,reason,blen,status==405?"Allow: POST\r\n":"",body?body:""):-1;
   pfe->ai_gw_denied=1;
   pfe->lb_err_body_sent=1;
+  /* Recorded by what the status means (F-20): a 4xx refuses the request as
+   * framed, the 503 (no capture could be allocated) is an outage. */
+  if (status >= 500)
+    proxy_record_local_completion(pfe, (uint16_t)status);
+  else {
+    proxy_note_local_refusal(pfe, (uint16_t)status);
+    proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status,
+                            sp_mcp_refusal_code(status));
+  }
   if (n>0 && (size_t)n<cap) proxy_send_local_response_and_shutdown(pfe,response,(size_t)n);
   else shutdown(pfe->fd,SHUT_RDWR);
   free(response);free(body);
@@ -14376,6 +14385,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 "\r\n"
                 "{\"error\":\"bad_request\",\"message\":\"unparseable or "
                 "ambiguously framed request refused before admission\"}\r\n";
+              /* Refused as framed: its 400 is a response the client
+               * received and a refusal at the framing stage, recorded as
+               * every answer the gateway writes (F-20). */
+              proxy_note_local_refusal(pfe, 400);
+              proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400,
+                                      "bad_request");
               sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
                                   MSG_NOSIGNAL);
               shutdown(pfe->fd, SHUT_RDWR);
