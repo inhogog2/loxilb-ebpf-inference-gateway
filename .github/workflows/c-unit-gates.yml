@@ -137,6 +137,9 @@ jobs:
       - name: P/D completion detectors and the prefill/decode status verdicts (ASan)
         run: make -C common test_pd_complete && ./common/test_pd_complete
 
+      - name: What proves a P/D decode stream finished (ASan + UBSan)
+        run: make -C common test_pd_finish
+
       - name: The correlation key that joins a request's records across its keep-alive reset
         run: make -C common test_ridjoin
 

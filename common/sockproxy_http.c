@@ -91,6 +91,7 @@
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_pd_terminal.h"
 #include "sockproxy_end_cause.h"      /* why an answer ended before the client had it */
 #include "sockproxy_stream_fallback.h"
 #include "sockproxy_admit_response.h"
@@ -11253,6 +11254,11 @@ cresp_on_message_begin(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
   if (pfe) {
     memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+    /* A new response proves nothing yet. */
+    atomic_store_explicit(&pfe->pd_client_finished, 0, memory_order_release);
+    if (pfe->pd_client_finish) {
+      sp_pd_finish_reset(pfe->pd_client_finish);
+    }
     creq_block_msg_begin(&pfe->cresp_blk);
     sp_answer_msg_begin(&pfe->cresp_in_msg);
   }
@@ -11296,6 +11302,21 @@ static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
       clock_gettime(CLOCK_MONOTONIC, &ts);
       pfe->pd_first_event_ns = (uint64_t)ts.tv_sec * 1000000000ULL +
                                (uint64_t)ts.tv_nsec;
+    }
+    /* The finish evidence of a P/D decode stream, from the events the client
+     * receives (never a chunk-size line: this is the framed body). The
+     * tracker is allocated on the stream's first body bytes; without it a
+     * stream proves nothing, and an idle or closed one stays the engine's. */
+    if (pfe->cresp_sse.is_sse && pfe->pd_phase == PD_PHASE_DECODE_STREAMING) {
+      if (!pfe->pd_client_finish) {
+        pfe->pd_client_finish = calloc(1, sizeof(*pfe->pd_client_finish));
+      }
+      if (pfe->pd_client_finish) {
+        sp_pd_finish_feed(pfe->pd_client_finish, at, len);
+        atomic_store_explicit(&pfe->pd_client_finished,
+                              pfe->pd_client_finish->finished,
+                              memory_order_release);
+      }
     }
   }
   return 0;
