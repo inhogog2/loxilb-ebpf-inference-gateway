@@ -57,17 +57,37 @@ mut sockproxy_http.c '        sp_pd_record(rfd_ent, ns_model, prefill_ms, decode
                          0);'
 expect "5: the body-complete record is a literal success" "a P/D completion records a literal success (0)"
 
-# 5b: the graceful-[DONE] sweep records decode/truncated.
+# 5b: the graceful-[DONE] sweep records a completion on finish evidence only,
+#     decode/truncated without it.
 fresh
 mut sockproxy_health.c '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
-                             8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             finished ? 0 /*complete: finish evidence*/
+                                      : 8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
                              0);'
 expect "5b: the sweep records a success again" "a reaper records a literal success (0)"
 fresh
 mut sockproxy_health.c '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
-                             8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
-                             2 /*decode error*/);'
-expect "5b: the sweep records decode/error" "the graceful-[DONE] sweep must record decode/truncated (8) once"
+                             finished ? 0 /*complete: finish evidence*/
+                                      : 8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             0 /*complete: finish evidence*/);'
+expect "5b: the sweep records a success whatever the evidence" "a reaper records a literal success (0)"
+fresh
+mut sockproxy_health.c '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             finished ? 0 /*complete: finish evidence*/
+                                      : 8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             8 /*decode truncated*/);'
+expect "5b: the sweep ignores the finish evidence" "must record a completion (0) on finish evidence and decode/truncated (8) without it"
+fresh
+mut sockproxy_health.c '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             finished ? 0 /*complete: finish evidence*/
+                                      : 8 /*decode truncated*/);' '            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             finished ? 2 /*decode error*/
+                                      : 8 /*decode truncated*/);'
+expect "5b: the sweep records decode/error" "must record a completion (0) on finish evidence and decode/truncated (8) without it"
+fresh
+mut sockproxy_health.c '          int finished = atomic_load_explicit(&pfe->pd_client_finished,
+                                              memory_order_acquire);' '          int finished = 0;'
+expect "5b: the sweep does not read the evidence" "must read the stream's finish evidence (pd_client_finished)"
 fresh
 mut sockproxy_health.c 'sp_pd_record(pfe, pd_tmo_model, t_prefill_ms, 0, t_kv, 1);' 'sp_pd_record(pfe, pd_tmo_model, t_prefill_ms, 0, t_kv, 0);'
 expect "5b: another reaper records a success" "a reaper records a literal success (0)"

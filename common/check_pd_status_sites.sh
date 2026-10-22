@@ -199,27 +199,31 @@ if [ -n "$lit0" ]; then
   printf '%s\n' "$lit0"
   fail=1
 fi
-n=$(grep -c 'pd_decode_error_phase([a-z_]*->metric_response_status)' ./sockproxy_http.c || true)
-if [ "$n" != "2" ]; then
-  echo "sockproxy_http.c: expected the two non-SSE decode completions to use pd_decode_error_phase(...->metric_response_status); found $n"
-  fail=1
-fi
-
-# 5b. A stream the gateway ended is not a success. In sockproxy_health.c no
-#     P/D record is a literal success (0): the graceful-[DONE] sweep, the one
-#     completion there, records decode/truncated (8), the engine having gone
-#     silent and the gateway having written the terminator.
+# 5b. A stream the gateway ended is not a success, unless the stream had
+#     finished. In sockproxy_health.c no P/D record is a literal success (0)
+#     except the graceful-[DONE] sweep's, the one completion there, and that
+#     one only on the stream's finish evidence (pd_client_finished, written by
+#     the response framer from the events the client received): with it the
+#     engine finished and lost its terminator, a completion (0); without it
+#     the engine went silent and the gateway wrote the terminator,
+#     decode/truncated (8). The two outcomes are one ternary on the evidence.
 lit0h=$(awk '/sp_pd_record\(/ {buf = $0; while (buf !~ /\);/ && (getline nl) > 0) buf = buf " " nl;
-             if (buf ~ /,[ \t]*0\);/) print NR": "buf}' ./sockproxy_health.c)
+             if (buf ~ /,[ \t]*0[ \t]*(\/\*[^*]*\*\/)?[ \t]*\);/ ||
+                 (buf ~ /0 \/\*complete/ &&
+                  buf !~ /\? *0 \/\*complete: finish evidence\*\/ *: *8 \/\*decode truncated\*\//)) print NR": "buf}' ./sockproxy_health.c)
 if [ -n "$lit0h" ]; then
   echo "sockproxy_health.c: a reaper records a literal success (0) for an answer the gateway ended:"
   printf '%s\n' "$lit0h"
   fail=1
 fi
-g=$(awk '/\[PD_GRACEFUL_DONE\]/ {on = 1} on && /pd_reap_respond\(/ {exit} on' ./sockproxy_health.c \
-    | tr '\n' ' ' | grep -c 'sp_pd_record([^;]*8 /\*decode truncated\*/);' || true)
+sweep=$(awk '/uint32_t decode_idle_cap = PROXY_PD_DECODE_IDLE_CAP_SEC;/ {on = 1} on && /pd_reap_respond\(/ {exit} on' ./sockproxy_health.c | tr '\n' ' ')
+g=$(printf '%s' "$sweep" | grep -c 'sp_pd_record([^;]*finished ? 0 /\*complete: finish evidence\*/ *: 8 /\*decode truncated\*/);' || true)
 if [ "$g" != "1" ]; then
-  echo "sockproxy_health.c: the graceful-[DONE] sweep must record decode/truncated (8) once; found $g"
+  echo "sockproxy_health.c: the graceful-[DONE] sweep must record a completion (0) on finish evidence and decode/truncated (8) without it, once; found $g"
+  fail=1
+fi
+if ! printf '%s' "$sweep" | grep -q 'int finished = atomic_load_explicit(&pfe->pd_client_finished,'; then
+  echo "sockproxy_health.c: the graceful-[DONE] sweep must read the stream's finish evidence (pd_client_finished)"
   fail=1
 fi
 

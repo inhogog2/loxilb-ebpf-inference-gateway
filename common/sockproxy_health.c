@@ -1858,9 +1858,16 @@ check_draining_endpoints(void)
                 pfe->pd_phase == PD_PHASE_DECODE_STREAMING,
                 pfe->sse_active, pfe->stream_end_ts, pfe->pd_last_decode_ts,
                 now, decode_idle_cap)) {
+          /* The stream's finish evidence (sockproxy_pd_terminal.h), written by
+           * the response framer: a finish event for every choice, followed only
+           * by choice-less events. With it the engine finished and lost only
+           * its terminator; without it the engine went silent mid-generation. */
+          int finished = atomic_load_explicit(&pfe->pd_client_finished,
+                                              memory_order_acquire);
           log_debug("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
-                   "synthesizing data: [DONE] (vLLM dropped terminator)",
-                   pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap);
+                   "synthesizing data: [DONE] (vLLM dropped terminator; %s)",
+                   pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap,
+                   finished ? "the stream had finished" : "no finish evidence");
 
           const char *gc_model = proxy_effective_model(pfe);
 
@@ -1874,9 +1881,11 @@ check_draining_endpoints(void)
           pfe->stream_end_ts = now;
           pfe->sse_active = 0;
 
-          /* 3) Record P/D metrics. The lifecycle outcome is decode/truncated
-           * (8), not a success: the engine went silent and the gateway ended
-           * the answer. The client still received a 200 stream, and the request
+          /* 3) Record P/D metrics. With finish evidence the lifecycle outcome
+           * is a completion (0): the generation finished and only its
+           * terminator was lost. Without it, decode/truncated (8), not a
+           * success: the engine went silent and the gateway ended the answer.
+           * Either way the client received a 200 stream, and the request
            * record says so; the lifecycle record says how it ended. */
           {
             struct timespec _pdts;
@@ -1894,7 +1903,8 @@ check_draining_endpoints(void)
             }
             int pd_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
             sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
-                             8 /*decode truncated*/);
+                             finished ? 0 /*complete: finish evidence*/
+                                      : 8 /*decode truncated*/);
           }
 
           /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as

@@ -89,6 +89,7 @@ typedef struct proxy_epval {
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 struct proxy_fd_ent {
   proxy_fd_ent_t *next; int fd; int odir; int pd_phase; uint8_t sse_active;
+  _Atomic uint8_t pd_client_finished;   /* the stream's finish evidence */
   time_t stream_end_ts, pd_last_decode_ts, pd_phase_start_ts;
   uint64_t pd_prefill_start_ns, pd_decode_start_ns; int pd_kv_params_len;
   void *epv;
@@ -129,11 +130,15 @@ static const char *kname(int k) {
 static void tick(time_t now) {
 ''' + passes + r'''
 }
-/* One active SSE stream, engine silent from t=1000; ticks once a second. */
+/* One active SSE stream, engine silent from t=1000; ticks once a second.
+ * finished: the stream's finish evidence (a finish event for every choice,
+ * then only choice-less events) was seen before the silence. */
+static int finished;
 static int run(const char *name, proxy_epval_t cfg, long *end_gauge, int *at) {
   static proxy_fd_ent_t c; static proxy_epval_t e;
   memset(&c, 0, sizeof(c)); e = cfg; c.epv = &e; c.fd = 9;
   c.pd_phase = PD_PHASE_DECODE_STREAMING; c.sse_active = 1;
+  c.pd_client_finished = (uint8_t)finished;
   c.pd_phase_start_ts = 1000; c.pd_last_decode_ts = 1000;
   c.pd_prefill_start_ns = 1; c.pd_decode_start_ns = 2;
   node.val.fdlist = &c; node.next = NULL; proxy_struct->head = &node;
@@ -153,6 +158,19 @@ int main(void) {
   k = run("default, prefill timeout 600 s", (proxy_epval_t){ .pd_prefill_timeout_sec = 600 }, &g, &at);
   assert(k == SP_REAP_PD_GRACEFUL_DONE && g == 0);
   puts("stream gauge: under the default configuration the sweep ends a silent P/D stream first and the active-streams gauge returns to its start PASS");
+
+  /* The same silence after the stream finished (finish evidence): the sweep
+   * ends it the same way, at the same time, and records a completion, not a
+   * truncation; the lost terminator is still the gateway's to write. */
+  finished = 1;
+  k = run("default, the stream had finished", (proxy_epval_t){0}, &g, &at);
+  assert(k == SP_REAP_PD_GRACEFUL_DONE && at == 25);
+  assert(g == 0 && records == 1 && last_phase == 0);
+  assert(atomic_load(&global_stats.pd_terminator_synthesized) == 3);
+  finished = 0;
+  k = run("default, no finish evidence again", (proxy_epval_t){0}, &g, &at);
+  assert(k == SP_REAP_PD_GRACEFUL_DONE && records == 1 && last_phase == 8);
+  puts("stream gauge: with finish evidence the sweep records the silent stream a completion, without it decode/truncated PASS");
 
   /* F-14: configurations no rule sets today. */
   k = run("F-14: decode idle cap 300 s (>= 120 s)", (proxy_epval_t){ .pd_decode_idle_cap_sec = 300 }, &g, &at);
