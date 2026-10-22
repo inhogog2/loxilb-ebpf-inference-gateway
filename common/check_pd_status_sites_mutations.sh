@@ -362,5 +362,10 @@ fresh
 mut sockproxy_http.c '          if (noted) proxy_origin_status_feed(rfd_ent, status);' '          (void)noted;'
 expect "1f: the capture does not feed the breaker" "must feed the breaker through proxy_origin_status_feed"
 
+# 1c: a product path records a TTFB sample around the writer.
+fresh
+mut sockproxy_health.c '            pd_reap_respond(pfe, SP_REAP_SSE_CAP);' '            record_latency_sample(1); pd_reap_respond(pfe, SP_REAP_SSE_CAP);'
+expect "1c: a reaper records a sample outside the writer" "a response record outside proxy_note_response_"
+
 echo "check_pd_status_sites.sh mutations: $((n - survived)) of $n killed"
 [ "$survived" = "0" ]

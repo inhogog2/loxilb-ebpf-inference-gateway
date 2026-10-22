@@ -78,7 +78,10 @@ if [ "$feeds" != "3" ]; then
 fi
 
 # 1c. The writer is the only one of the class counters and the TTFB sample,
-#     so no path can record a response around it (or twice).
+#     so no path can record a response around it (or twice). The product
+#     sources are the paths; a test fixture that links sockproxy_http.c
+#     defines the sample as a no-op boundary (test_pd_retry_lifecycle.c), and
+#     a definition records nothing.
 h_from=$(grep -n '^proxy_note_response_(' ./sockproxy_http.c | head -1 | cut -d: -f1)
 h_to=$(awk -v f="${h_from:-0}" 'NR > f && /^}/ {print NR; exit}' ./sockproxy_http.c)
 if [ -z "$h_from" ] || ! sed -n "${h_from},${h_to}p" ./sockproxy_http.c | grep -q 'resp_note_take(&pfe->metric_resp_noted'; then
@@ -86,7 +89,8 @@ if [ -z "$h_from" ] || ! sed -n "${h_from},${h_to}p" ./sockproxy_http.c | grep -
   fail=1
 fi
 outside=$(grep -nE 'global_stats\.http_(responses_total|status_[1-5]xx)|record_latency_sample\(' ./*.c \
-            | grep -v '^\./sockproxy_metrics\.c:' | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(\*|/\*|//)' \
+            | grep -v '^\./sockproxy_metrics\.c:' | grep -v '^\./test_' \
+            | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(\*|/\*|//)' \
             | awk -F: -v a="${h_from:-0}" -v b="${h_to:-0}" '!($1 == "./sockproxy_http.c" && $2 >= a && $2 <= b)' || true)
 if [ -n "$outside" ]; then
   printf '%s\n' "$outside"
