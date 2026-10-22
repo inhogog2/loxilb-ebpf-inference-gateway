@@ -91,6 +91,7 @@
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_pd_terminal.h"
 #include "sockproxy_end_cause.h"      /* why an answer ended before the client had it */
 #include "sockproxy_stream_fallback.h"
 #include "sockproxy_admit_response.h"
@@ -6317,6 +6318,91 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
   }
 }
 
+/* The decode leg closed under an open stream (DECODE_STREAMING). Which of
+ * two things happened is told by the stream's finish evidence
+ * (sockproxy_pd_terminal.h, written by the response framer from the events
+ * the client received). With it, the engine finished and closed, and only
+ * the terminator was lost: the stream completes as the graceful-[DONE]
+ * sweep completes it for the same evidence (a completion recorded, no decode
+ * death, the terminator from the reaper's hand-off), this leg stops naming
+ * the client, and 1 is returned: the caller unlinks the leg's side and hands
+ * the client to the reaper once it holds PROXY_LOCK alone. Without it the
+ * stream was cut: the engine died, recorded here as decode/error, the
+ * request moved to ERROR so the sweep neither records it again nor dresses
+ * the cut up as a clean end; the client sees the cut when this leg's teardown
+ * ends it, and 0 is returned. Called under PROXY_LOCK with the leg's entry
+ * locked, the client's not: the evidence is one atomic byte. */
+static int
+sp_pd_decode_stream_eof(proxy_fd_ent_t *leg, proxy_fd_ent_t *client)
+{
+  if (atomic_load_explicit(&client->pd_client_finished, memory_order_acquire)) {
+    const char *model = proxy_effective_model(client);
+    struct timespec ts;
+    uint64_t now_ns;
+    int64_t prefill_ms = 0, decode_ms = 0;
+
+    log_debug("decode backend EOF after the stream finished — client_fd=%d "
+              "decode_fd=%d (close-delimited stream, terminator lost; complete)",
+              client->fd, leg->fd);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    if (client->pd_prefill_start_ns > 0 && client->pd_decode_start_ns > 0) {
+      prefill_ms = (int64_t)((client->pd_decode_start_ns -
+                              client->pd_prefill_start_ns) / 1000000ULL);
+    }
+    if (client->pd_decode_start_ns > 0) {
+      decode_ms = (int64_t)((now_ns - client->pd_decode_start_ns) / 1000000ULL);
+    }
+    /* The prefill drain leg has nothing left to carry: a janitorial close,
+     * not the decode-failure coupling. */
+    pd_sg_close_drain(client, 0);
+    /* End the active-streams gauge here, as the sweep does; the terminator
+     * is the gateway's to write, so it is counted as synthesized. */
+    if (client->sse_active) {
+      llb_ai_stream_end("", (char *)model);
+      client->sse_active = 0;
+      client->stream_end_ts = time(NULL);
+    }
+    client->pd_phase = PD_PHASE_COMPLETE;
+    sp_pd_record(client, model, prefill_ms, decode_ms,
+                     (client->pd_kv_params_len > 0) ? 1 : 0,
+                     0 /*complete: finish evidence*/);
+    atomic_fetch_add(&global_stats.pd_terminator_synthesized, 1);
+    /* This leg no longer names the client: its teardown must not cascade
+     * onto a connection the reaper is about to end. */
+    for (int i = 0; i < MAX_PROXY_EP; i++) {
+      if (client->rfd_ent[i] == leg) {
+        client->rfd_ent[i] = NULL;
+        client->rfd[i] = -1;
+        if (client->n_rfd > 0) {
+          client->n_rfd--;
+        }
+      }
+    }
+    return 1;
+  }
+  log_error("decode backend EOF mid-stream — client_fd=%d "
+            "decode_fd=%d (stream cut before [DONE]; decode/error)",
+            client->fd, leg->fd);
+  atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+  {
+    const char *pd_model = proxy_effective_model(client);
+    int64_t prefill_ms = 0;
+    if (client->pd_prefill_start_ns > 0 &&
+        client->pd_decode_start_ns > client->pd_prefill_start_ns) {
+      prefill_ms = (int64_t)((client->pd_decode_start_ns -
+                              client->pd_prefill_start_ns) / 1000000ULL);
+    }
+    int pd_kv = (client->pd_kv_params_len > 0) ? 1 : 0;
+    sp_pd_record(client, pd_model, prefill_ms, 0, pd_kv,
+                     2 /*decode error*/);
+  }
+  client->pd_phase = PD_PHASE_ERROR;
+  /* SGLang: decode-leg death must not orphan the prefill drain leg */
+  pd_sg_close_drain(client, 1);
+  return 0;
+}
+
 void
 proxy_pdestroy(void *priv)
 {
@@ -6338,6 +6424,11 @@ proxy_pdestroy(void *priv)
     uint8_t *body; size_t body_len;
   } pd_retry_pend[MAX_PROXY_EP];
   int n_pd_retry_pend = 0;
+  /* Decode streams that had finished when this leg closed: the reaper's
+   * hand-off (the terminator, then the end) is made below, under PROXY_LOCK
+   * alone, as the health thread makes it. */
+  proxy_fd_ent_t *pd_done_pend[MAX_PROXY_EP];
+  int n_pd_done_pend = 0;
 
   /* Deferred settles for every connection this teardown takes with it. A
    * connection teardown contributes one; a listener teardown contributes one
@@ -6780,34 +6871,19 @@ proxy_pdestroy(void *priv)
           pd_cleanup(client_pfe);
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
                    pfe->is_pd_decode_backend) {
-          /* Decode backend EOF mid-stream. A completed stream leaves
-           * DECODE_STREAMING via the SSE [DONE] scanner before its backend
-           * closes (pd_phase NONE ⇒ the detach branch above), so reaching
-           * here means the stream was CUT with no terminator: the engine
-           * died. The request is recorded here as decode/error and moved to
-           * ERROR, so the graceful-[DONE] sweep neither records it again nor
-           * dresses the cut up as a clean end with a terminator of its own;
-           * the client sees the cut when this leg's teardown ends it. The EP
-           * death is also ticked for the failover counters. */
-          log_error("decode backend EOF mid-stream — client_fd=%d "
-                    "decode_fd=%d (stream cut before [DONE]; decode/error)",
-                    client_pfe->fd, pfe->fd);
-          atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
-          {
-            const char *pd_model = proxy_effective_model(client_pfe);
-            int64_t prefill_ms = 0;
-            if (client_pfe->pd_prefill_start_ns > 0 &&
-                client_pfe->pd_decode_start_ns > client_pfe->pd_prefill_start_ns) {
-              prefill_ms = (int64_t)((client_pfe->pd_decode_start_ns -
-                                      client_pfe->pd_prefill_start_ns) / 1000000ULL);
-            }
-            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            sp_pd_record(client_pfe, pd_model, prefill_ms, 0, pd_kv,
-                             2 /*decode error*/);
+          /* The decode leg closed under an open stream. A completed stream
+           * leaves DECODE_STREAMING via the SSE [DONE] scanner before its
+           * backend closes (pd_phase NONE ⇒ the detach branch above), so
+           * this is either a stream that had finished and lost its
+           * terminator, or a stream the engine cut (sp_pd_decode_stream_eof). */
+          if (sp_pd_decode_stream_eof(pfe, client_pfe)) {
+            /* Finished: the leg's side of the link, and the reaper's hand-off
+             * once this teardown holds PROXY_LOCK alone (below). One client per
+             * slot, so the loop's bound is the array's. */
+            pfe->rfd_ent[pd_i] = NULL;
+            pfe->n_rfd--;
+            pd_done_pend[n_pd_done_pend++] = client_pfe;
           }
-          client_pfe->pd_phase = PD_PHASE_ERROR;
-          /* SGLang: decode-leg death must not orphan the prefill drain leg */
-          pd_sg_close_drain(client_pfe, 1);
         }
         /* DECODE_STREAMING completion (non-cut) handled by SSE [DONE] scanner */
       }
@@ -7069,6 +7145,20 @@ proxy_pdestroy(void *priv)
                        pd_retry_pend[ri].hdrs, pd_retry_pend[ri].hdrs_len,
                        pd_retry_pend[ri].body, pd_retry_pend[ri].body_len);
     }
+  }
+
+  /* Decode streams that had finished when their leg closed (collected above,
+   * sp_pd_decode_stream_eof): the terminator and the end are the reaper's
+   * hand-off, taken under PROXY_LOCK alone as the health thread takes it.
+   * Same-thread with the leg's teardown, so the client is still here (worker
+   * pinning); its stream is already ended and its phase COMPLETE, so no
+   * sweep reaches it first. */
+  if (n_pd_done_pend > 0) {
+    PROXY_LOCK();
+    for (int di = 0; di < n_pd_done_pend; di++) {
+      sp_reap_request(pd_done_pend[di], SP_REAP_PD_GRACEFUL_DONE);
+    }
+    PROXY_UNLOCK();
   }
 }
 
@@ -11253,6 +11343,11 @@ cresp_on_message_begin(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
   if (pfe) {
     memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+    /* A new response proves nothing yet. */
+    atomic_store_explicit(&pfe->pd_client_finished, 0, memory_order_release);
+    if (pfe->pd_client_finish) {
+      sp_pd_finish_reset(pfe->pd_client_finish);
+    }
     creq_block_msg_begin(&pfe->cresp_blk);
     sp_answer_msg_begin(&pfe->cresp_in_msg);
   }
@@ -11296,6 +11391,21 @@ static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
       clock_gettime(CLOCK_MONOTONIC, &ts);
       pfe->pd_first_event_ns = (uint64_t)ts.tv_sec * 1000000000ULL +
                                (uint64_t)ts.tv_nsec;
+    }
+    /* The finish evidence of a P/D decode stream, from the events the client
+     * receives (never a chunk-size line: this is the framed body). The
+     * tracker is allocated on the stream's first body bytes; without it a
+     * stream proves nothing, and an idle or closed one stays the engine's. */
+    if (pfe->cresp_sse.is_sse && pfe->pd_phase == PD_PHASE_DECODE_STREAMING) {
+      if (!pfe->pd_client_finish) {
+        pfe->pd_client_finish = calloc(1, sizeof(*pfe->pd_client_finish));
+      }
+      if (pfe->pd_client_finish) {
+        sp_pd_finish_feed(pfe->pd_client_finish, at, len);
+        atomic_store_explicit(&pfe->pd_client_finished,
+                              pfe->pd_client_finish->finished,
+                              memory_order_release);
+      }
     }
   }
   return 0;

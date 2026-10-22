@@ -1165,6 +1165,14 @@ struct proxy_fd_ent {
   uint8_t  cresp_parser_inited;
   sp_sse_observer_t cresp_sse;
   uint8_t cresp_payload_observed;
+  /* A P/D decode stream's finish evidence (sockproxy_pd_terminal.h). The 8 KiB
+   * parse state is allocated on the stream's first body bytes, so no other
+   * connection carries it, and freed when the shell is recycled. Written by
+   * the response framer under this entry's lock; pd_client_finished is its
+   * verdict, the one byte the health thread's sweep and the decode leg's EOF
+   * read without that lock. */
+  struct sp_pd_finish *pd_client_finish;
+  _Atomic uint8_t pd_client_finished;
   /* Set by the response framer under this entry's lock, consumed by the backend
    * leg's EOF without it, so it is atomic and the consumer takes it with an
    * exchange: whoever clears it is the one that counts the completion. A

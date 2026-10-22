@@ -1341,6 +1341,12 @@ pfe_recycle(proxy_fd_ent_t *pfe)
    * leave the pending count raised, or the fast tick keeps walking for nothing. */
   proxy_defer_close_clear(pfe);
 
+  /* A P/D decode stream's finish evidence (allocated on its first body
+   * bytes): only the shell's last user can have it, and that user is gone. */
+  free(pfe->pd_client_finish);
+  pfe->pd_client_finish = NULL;
+  atomic_store_explicit(&pfe->pd_client_finished, 0, memory_order_relaxed);
+
   /* Release the per-connection buffer to the cache with the span this user
    * wrote, so its next user gets exactly that zeroed. The shell is NEVER
    * free()d — its address must stay valid for any in-flight stale notify
