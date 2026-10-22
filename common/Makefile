@@ -759,6 +759,12 @@ test_pd_finish: test_pd_finish.c sockproxy_pd_terminal.c sockproxy_pd_terminal.h
 	  -o $@ test_pd_finish.c sockproxy_pd_terminal.c -I.
 	./test_pd_finish
 
+# The decode leg's EOF under an open P/D stream (sp_pd_decode_stream_eof,
+# sockproxy_http.c, run from the source): finished -> complete, cut -> death.
+test_pd_eof_finish: sockproxy_http.c test_pd_eof_finish.py test_pd_eof_finish_mutations.py
+	python3 test_pd_eof_finish.py
+	python3 test_pd_eof_finish_mutations.py
+
 # Phase 90-02 (REQ-REG / contract §5): adversarial HTTP-response message-framing
 # regression units for the M1 response-leg parser. UNLIKE the header-only
 # test_pd_complete recipe, this links the real llhttp parser triad
