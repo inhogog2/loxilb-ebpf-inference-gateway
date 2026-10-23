@@ -136,6 +136,9 @@ jobs:
       - name: A response the gateway writes itself is recorded once, as a staged refusal or an outage, without a TTFB sample (source invariant, mutation-tested)
         run: make -C common check_local_answers
 
+      - name: The capacity-queue deadline timer is opened by proxy_main before any worker thread (source invariant, mutation-tested)
+        run: make -C common check_deadline_init_order
+
       - name: P/D completion detectors and the prefill/decode status verdicts (ASan)
         run: make -C common test_pd_complete && ./common/test_pd_complete
 
