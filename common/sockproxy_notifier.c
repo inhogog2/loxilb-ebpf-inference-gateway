@@ -961,6 +961,16 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   pfe_pool_selftest();
 #endif
 
+  /* The capacity-queue deadline timer is opened HERE, before any worker
+   * thread exists: the drain checker reads its tfd on every pass (a process
+   * without a timer owes the deadline sweep to that pass) and the deadline
+   * thread waits on it; a pthread_create after this write orders both reads
+   * after it. Opened in the thread itself, the first drain-checker pass could
+   * read the field while the thread wrote it (TSan, candidate c59ba1fb). */
+  if (fc_deadline_init(fc_deadline_global()) != 0)
+    log_error("[AIGateway] queue deadline timer: timerfd_create failed (%s); "
+              "deadlines run on the 1 Hz health pass", strerror(errno));
+
   pthread_create(&proxy_struct->pthr, NULL, proxy_run, NULL);
 
   // P2: Start draining checker thread

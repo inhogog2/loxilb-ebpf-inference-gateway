@@ -1007,8 +1007,8 @@ typedef struct fc_deadline {
   _Atomic uint64_t passes;       /* times the pass ran */
 } fc_deadline_t;
 
-/* The process's timer; fc_deadline_init opens its timerfd (the proxy, at
- * start). Until then (every unit that does not test the timer) arming is a
+/* The process's timer; fc_deadline_init opens its timerfd (proxy_main, before
+ * any worker thread exists: the drain checker reads tfd on every pass). Until then (every unit that does not test the timer) arming is a
  * no-op. */
 fc_deadline_t *fc_deadline_global(void);
 int  fc_deadline_init(fc_deadline_t *d);
