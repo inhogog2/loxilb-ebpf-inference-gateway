@@ -965,6 +965,11 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
 
   // P2: Start draining checker thread
   pthread_create(&proxy_struct->drain_checker_thr, NULL, proxy_drain_checker_thread, NULL);
+
+  /* Capacity-queue deadlines: a thread asleep on a timer armed to the
+   * earliest pending deadline (not a cadence), so a configured wait window
+   * is the enforced window. */
+  pthread_create(&proxy_struct->fc_deadline_thr, NULL, proxy_fc_deadline_thread, NULL);
   
   // Start conversation mapping cleanup thread
   pthread_create(&proxy_struct->conversation_cleanup_thr, NULL, proxy_conversation_cleanup_thread, NULL);

@@ -19,6 +19,9 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/timerfd.h>
 
 #include "sockproxy_fc.h"
 
@@ -579,6 +582,41 @@ fc_queue_publish(fc_state_t *fc)
                         fc->queue.band_count[FC_BAND_SHEDDABLE], memory_order_relaxed);
 }
 
+/* Lock held. The earliest deadline among the live entries: kept by every
+ * insertion (a min) and every removal (a rescan when the removed deadline
+ * was the earliest), so the deadline pass reads one word per pool. */
+static void
+fc_ring_deadline_add(fc_queue_t *q, uint64_t deadline_ns)
+{
+  uint64_t cur = atomic_load_explicit(&q->next_deadline_ns, memory_order_relaxed);
+
+  if (deadline_ns && (!cur || deadline_ns < cur))
+    atomic_store_explicit(&q->next_deadline_ns, deadline_ns, memory_order_release);
+}
+
+static void
+fc_ring_deadline_rescan(fc_queue_t *q)
+{
+  uint64_t min = 0;
+  uint32_t i = q->head;
+
+  for (uint32_t k = 0; k < q->used && q->cap; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+    if (e->live && e->deadline_ns && (!min || e->deadline_ns < min))
+      min = e->deadline_ns;
+    i = fc_ring_wrap(q, i + 1);
+  }
+  atomic_store_explicit(&q->next_deadline_ns, min, memory_order_release);
+}
+
+static void
+fc_ring_deadline_gone(fc_queue_t *q, uint64_t deadline_ns)
+{
+  if (deadline_ns &&
+      deadline_ns == atomic_load_explicit(&q->next_deadline_ns, memory_order_relaxed))
+    fc_ring_deadline_rescan(q);
+}
+
 /* Re-lay the live entries, in order, from slot 0 of `dst` (a fresh buffer,
  * never the ring itself), then adopt it. Runs when the slots are used up by
  * tombstones, or when the depth grows. The slot hints held by waiting
@@ -752,6 +790,7 @@ fc_state_destroy(fc_state_t *fc)
   fc->queue.used = fc->queue.count = 0;
   memset(fc->queue.band_count, 0, sizeof(fc->queue.band_count));
   fc->queue.dead = 1;
+  atomic_store_explicit(&fc->queue.next_deadline_ns, 0, memory_order_release);
   fc_queue_publish(fc);
   /* The tenant table goes with the rule, so creating and deleting rules
    * does not grow the process. A request that still holds the pool settles
@@ -2201,6 +2240,7 @@ fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
   q->used++;
   q->count++;
   fc_ring_band_add(q, e->band);
+  fc_ring_deadline_add(q, e->deadline_ns);
   if (slot_out)
     *slot_out = slot;
   return 0;
@@ -2246,6 +2286,7 @@ fc_ring_evict(fc_state_t *fc, uint32_t slot, uint64_t now_ns)
   q->count--;
   fc_ring_band_sub(q, e->band);
   fc_tenant_dec(fc, e->tslot, 1);
+  fc_ring_deadline_gone(q, e->deadline_ns);
   while (q->used > 0 && !q->ring[q->head].live) {
     q->head = fc_ring_wrap(q, q->head + 1);
     q->used--;
@@ -2483,6 +2524,10 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
     fc_queue_publish(fc);
   pthread_mutex_unlock(&fc->queue.lock);
 
+  /* The park's deadline is met by the timer: set to it now when it is the
+   * earliest pending (a no-op in a process without the timer). */
+  if (rc == 0)
+    fc_deadline_arm(fc_deadline_global(), e.deadline_ns, at_ns);
   if (evicted) {
     /* Counted where it was decided; answered on its own connection by its
      * owner worker, which claims it on this wake. A wake that cannot be
@@ -2547,6 +2592,7 @@ fc_queue_take(fc_state_t *fc, fc_permit_t *p)
     fc->queue.count--;
     fc_ring_band_sub(&fc->queue, fc->queue.ring[slot].band);
     fc_tenant_dec(fc, fc->queue.ring[slot].tslot, 1);
+    fc_ring_deadline_gone(&fc->queue, fc->queue.ring[slot].deadline_ns);
     taken = 1;
     /* A tombstone at the head is dead weight: drop it now. */
     while (fc->queue.used > 0 && !fc->queue.ring[fc->queue.head].live) {
@@ -2587,6 +2633,7 @@ fc_ring_pop(fc_queue_t *q, fc_queue_ent_t *out)
     if (live) {
       q->count--;
       fc_ring_band_sub(q, e->band);
+      fc_ring_deadline_gone(q, e->deadline_ns);
       return 1;
     }
   }
@@ -2622,6 +2669,7 @@ fc_ring_take_at(fc_queue_t *q, uint32_t at, fc_queue_ent_t *out)
   e->live = 0;
   q->count--;
   fc_ring_band_sub(q, e->band);
+  fc_ring_deadline_gone(q, e->deadline_ns);
   while (q->used > 0 && !q->ring[q->head].live) {
     q->head = fc_ring_wrap(q, q->head + 1);
     q->used--;
@@ -2900,6 +2948,8 @@ fc_queue_wake_head(fc_state_t *fc, uint32_t pend[FC_BANDS])
     pthread_mutex_lock(&fc->queue.lock);
     if (fc_ring_insert(&fc->queue, &e, 1, 0, NULL) != 0)
       fc_tenant_dec(fc, e.tslot, 1);
+    else
+      fc_deadline_arm(fc_deadline_global(), e.deadline_ns, fc_now_ns());
     /* What the pick spent is given back, if nothing moved it since. */
     if (u.band >= 0) {
       if (u.credit && fc->queue.drr_credit[u.band] < FC_BAND_WEIGHT_MAX + 2)
@@ -3308,4 +3358,193 @@ fc_expose_h1(uint8_t *buf, size_t len, size_t cap, const fc_expose_t *v,
   if (res)
     *res = FC_EXPOSE_H1_DONE;
   return len + n;
+}
+
+/* ---- queue deadlines ------------------------------------------------------ */
+
+static fc_deadline_t fc_deadline_proc;
+
+fc_deadline_t *
+fc_deadline_global(void)
+{
+  return &fc_deadline_proc;
+}
+
+uint64_t
+fc_queue_next_deadline(const fc_state_t *fc)
+{
+  if (!fc)
+    return 0;
+  return atomic_load_explicit(&fc->queue.next_deadline_ns, memory_order_acquire);
+}
+
+uint32_t
+fc_queue_expired(fc_state_t *fc, uint64_t now_ns, fc_queue_ent_t *out, uint32_t cap)
+{
+  fc_queue_t *q;
+  uint32_t i, n = 0;
+
+  if (!fc || !out || cap == 0)
+    return 0;
+  q = &fc->queue;
+  pthread_mutex_lock(&q->lock);
+  if (q->cap > 0) {
+    i = q->head;
+    for (uint32_t k = 0; k < q->used && n < cap; k++) {
+      const fc_queue_ent_t *e = &q->ring[i];
+      if (e->live && e->deadline_ns && e->deadline_ns <= now_ns)
+        out[n++] = *e;
+      i = fc_ring_wrap(q, i + 1);
+    }
+  }
+  pthread_mutex_unlock(&q->lock);
+  return n;
+}
+
+int
+fc_deadline_init(fc_deadline_t *d)
+{
+  if (!d)
+    return -1;
+  atomic_store_explicit(&d->armed_ns, 0, memory_order_relaxed);
+  atomic_store_explicit(&d->last_fire_ns, 0, memory_order_relaxed);
+  atomic_store_explicit(&d->wakeups, 0, memory_order_relaxed);
+  atomic_store_explicit(&d->passes, 0, memory_order_relaxed);
+  d->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+  return d->tfd > 0 ? 0 : -1;
+}
+
+void
+fc_deadline_close(fc_deadline_t *d)
+{
+  if (!d)
+    return;
+  if (d->tfd > 0)
+    close(d->tfd);
+  d->tfd = 0;
+  atomic_store_explicit(&d->armed_ns, 0, memory_order_relaxed);
+}
+
+/* The timer is set to `target`, and set again while another thread lowered
+ * armed_ns under this one's call: the last word is the earliest. */
+static void
+fc_deadline_settime(fc_deadline_t *d, uint64_t target)
+{
+  for (;;) {
+    struct itimerspec its;
+    uint64_t cur;
+
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = (time_t)(target / 1000000000ULL);
+    its.it_value.tv_nsec = (long)(target % 1000000000ULL);
+    (void)timerfd_settime(d->tfd, TFD_TIMER_ABSTIME, &its, NULL);
+    cur = atomic_load_explicit(&d->armed_ns, memory_order_acquire);
+    if (cur == target || cur == 0)
+      return;
+    target = cur;
+  }
+}
+
+void
+fc_deadline_arm(fc_deadline_t *d, uint64_t deadline_ns, uint64_t now_ns)
+{
+  uint64_t cur, target, floor;
+
+  (void)now_ns;
+  if (!d || d->tfd <= 0 || deadline_ns == 0)
+    return;
+  /* Never before the last firing plus the grain: a burst of parks a few
+   * microseconds apart is one wake-up, not one each. A deadline already past
+   * is set as it is: an absolute time in the past fires at once. */
+  floor = atomic_load_explicit(&d->last_fire_ns, memory_order_relaxed);
+  floor = floor ? floor + FC_DEADLINE_GRAIN_NS : 0;
+  target = deadline_ns > floor ? deadline_ns : floor;
+  cur = atomic_load_explicit(&d->armed_ns, memory_order_acquire);
+  do {
+    if (cur && cur <= target)
+      return;                    /* set for an earlier time already */
+  } while (!atomic_compare_exchange_weak_explicit(&d->armed_ns, &cur, target,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire));
+  fc_deadline_settime(d, target);
+}
+
+int
+fc_deadline_wait(fc_deadline_t *d, int max_wait_ms)
+{
+  struct pollfd pfd;
+  uint64_t n = 0;
+  int rc;
+
+  if (!d || d->tfd <= 0)
+    return -1;
+  pfd.fd = d->tfd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  rc = poll(&pfd, 1, max_wait_ms);
+  if (rc < 0)
+    return errno == EINTR ? 0 : -1;
+  if (rc == 0)
+    return 0;
+  if (read(d->tfd, &n, sizeof(n)) != (ssize_t)sizeof(n))
+    return 0;                    /* a spurious readiness: nothing fired */
+  atomic_fetch_add_explicit(&d->wakeups, 1, memory_order_relaxed);
+  return 1;
+}
+
+typedef struct fc_deadline_pass_ctx {
+  uint64_t now_ns;
+  uint64_t earliest;
+  fc_expire_fn expire;
+  void *ctx;
+} fc_deadline_pass_ctx_t;
+
+static void
+fc_deadline_visit_pool(void *vctx, fc_state_t *fc)
+{
+  fc_deadline_pass_ctx_t *c = vctx;
+  uint64_t next = fc_queue_next_deadline(fc);
+
+  if (next && next <= c->now_ns) {
+    /* This pool's earliest deadline has passed: its queue, and only its
+     * queue, is read for the entries past theirs. Bounded batches, in case
+     * an expire leaves an entry where it is. */
+    fc_queue_ent_t batch[64];
+    uint32_t n;
+    int rounds = 0;
+
+    do {
+      n = fc_queue_expired(fc, c->now_ns, batch, 64);
+      for (uint32_t i = 0; i < n; i++)
+        if (c->expire)
+          c->expire(c->ctx, fc, &batch[i], c->now_ns);
+    } while (n == 64 && ++rounds < 16 &&
+             fc_queue_next_deadline(fc) &&
+             fc_queue_next_deadline(fc) <= c->now_ns);
+    next = fc_queue_next_deadline(fc);
+    if (next && next <= c->now_ns)
+      next = c->now_ns + FC_DEADLINE_GRAIN_NS;   /* left in place: again at the next grain */
+  }
+  if (next && (!c->earliest || next < c->earliest))
+    c->earliest = next;
+}
+
+uint64_t
+fc_deadline_pass(fc_deadline_t *d, uint64_t now_ns, fc_pools_fn pools,
+                 fc_expire_fn expire, void *ctx)
+{
+  fc_deadline_pass_ctx_t c = { now_ns, 0, expire, ctx };
+
+  if (d) {
+    atomic_fetch_add_explicit(&d->passes, 1, memory_order_relaxed);
+    atomic_store_explicit(&d->last_fire_ns, now_ns, memory_order_relaxed);
+    /* Disarmed before the pools are read: a park that lands during the
+     * read arms the timer itself, and the re-arm below is a min with it. */
+    atomic_store_explicit(&d->armed_ns, 0, memory_order_release);
+  }
+  if (pools)
+    pools(ctx, fc_deadline_visit_pool, &c);
+  if (d && c.earliest)
+    fc_deadline_arm(d, c.earliest, now_ns);
+  return c.earliest;
 }

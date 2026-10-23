@@ -117,6 +117,7 @@ typedef struct proxy_struct {
   pthread_rwlock_t lock;
   pthread_t pthr;
   pthread_t drain_checker_thr;          /* P2: Draining checker thread */
+  pthread_t fc_deadline_thr;            /* capacity-queue deadlines, on a timer */
   pthread_t conversation_cleanup_thr;   /* Conversation mapping cleanup thread */
   pthread_t watchdog_thr;               /* D2-wedge fix: proxy liveness watchdog (lock-wedge self-heal) */
 #ifdef HAVE_HTTP_TRACE

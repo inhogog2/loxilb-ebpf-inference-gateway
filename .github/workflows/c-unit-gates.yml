@@ -113,7 +113,7 @@ jobs:
       - name: The llm-d request headers (TTL parse and capture, dropped-reason mapping, the forwarded objective and fairness rewrite) and the X-Vllm-Priority strip of the request head (ASan + UBSan)
         run: make -C common test_llmd
 
-      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off), its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize) and its priority bands (order, shed, floors, wait windows and shares, weighted wake, tenant rotation), and the P/D role gates waiting at a full role ceiling (production gate code, ASan + UBSan)
+      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off), its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize), its priority bands (order, shed, floors, wait windows and shares, weighted wake, tenant rotation), the P/D role gates waiting at a full role ceiling, and the queue deadline timer (a window is enforced at its end, per pool, no idle wake-ups over 10 s) (production gate code, ASan + UBSan)
         run: make -C common test_fc
 
       - name: What the gateway reads from a request body's JSON (tier hint, model, stream, max tokens, usage), in the literal and the escaped spellings, and what it rewrites in place (the tier null, the priority key rename) (ASan)
