@@ -92,6 +92,15 @@ void json_null_value(char *body, size_t body_len, size_t off, size_t vlen);
  * spelling of key ("service\u005ftier") is key, and is overwritten too. */
 int json_null_top_key(char *body, size_t body_len, const char *key, size_t klen);
 
+/* Rename, in place and at the same length, EVERY top-level occurrence of
+ * key to `to` (tolen <= klen bytes; the bytes of a longer raw spelling past
+ * it become '_'): the document keeps its size and the value stays where it
+ * was, under a key no engine reads. Keys are matched decoded, as
+ * json_null_top_key matches them; a nested occurrence is left as sent.
+ * Returns how many were renamed. */
+int json_rename_top_key(char *body, size_t body_len, const char *key, size_t klen,
+                        const char *to, size_t tolen);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *

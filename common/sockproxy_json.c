@@ -722,20 +722,23 @@ json_value_extent(const char *vs, const char *end)
  * nested objects (depth != 1). Keys are compared decoded (json_str_eq): an
  * escaped spelling of the key is the key, as every parser downstream reads
  * it.
- * visit returns 0 to stop the walk there, non-zero to go on; it may rewrite
- * the bytes of the value it was handed, as long as what it leaves is a
- * value of the same extent with no quote, brace or bracket in it.
+ * visit is handed the raw bytes of the key between its quotes, [ks, ke),
+ * and the value, [vs, ve). It returns 0 to stop the walk there, non-zero
+ * to go on; it may rewrite the bytes of either span it was handed, as long
+ * as what it leaves is a key or a value of the same extent with no quote,
+ * brace, bracket or backslash in it.
  * Returns 0 when visit stopped the walk; -1 when the object ended (*root_close
  * then points at its closing brace); -2 when the input is not a complete
  * JSON object. */
-typedef int (*json_top_visit_fn)(const char *vs, const char *ve, void *ctx);
+typedef int (*json_top_visit_fn)(const char *ks, const char *ke,
+                                 const char *vs, const char *ve, void *ctx);
 
 static int
 json_top_walk(const char *body, size_t len, const char *key, size_t klen,
               json_top_visit_fn visit, void *ctx, const char **root_close)
 {
   const char *p = body, *end = body + len;
-  const char *str_start = NULL;
+  const char *str_start = NULL, *key_s = NULL, *key_e = NULL;
   int depth = 0, instr = 0, esc = 0, expect_value = 0, key_matched = 0;
 
   if (root_close) *root_close = NULL;
@@ -755,6 +758,8 @@ json_top_walk(const char *body, size_t len, const char *key, size_t klen,
       if (c == '"') {
         instr = 0;
         if (depth == 1 && !expect_value) {
+          key_s = str_start;
+          key_e = p;
           key_matched = json_str_eq(str_start, (size_t)(p - str_start),
                                     key, klen);
         }
@@ -776,7 +781,7 @@ json_top_walk(const char *body, size_t len, const char *key, size_t klen,
         ve = json_value_extent(vs, end);
         if (!ve)
           return -2;
-        if (!visit(vs, ve, ctx))
+        if (!visit(key_s, key_e, vs, ve, ctx))
           return 0;
         key_matched = 0;
       }
@@ -813,18 +818,24 @@ typedef struct {
 } json_top_span_t;
 
 static int
-json_top_first(const char *vs, const char *ve, void *ctx)
+json_top_first(const char *ks, const char *ke, const char *vs, const char *ve,
+               void *ctx)
 {
   json_top_span_t *sp = ctx;
+  (void)ks;
+  (void)ke;
   sp->vs = vs;
   sp->ve = ve;
   return 0;
 }
 
 static int
-json_top_last(const char *vs, const char *ve, void *ctx)
+json_top_last(const char *ks, const char *ke, const char *vs, const char *ve,
+              void *ctx)
 {
   json_top_span_t *sp = ctx;
+  (void)ks;
+  (void)ke;
   sp->vs = vs;
   sp->ve = ve;
   return 1;
@@ -1069,11 +1080,14 @@ json_null_value(char *body, size_t body_len, size_t off, size_t vlen)
 }
 
 static int
-json_top_null(const char *vs, const char *ve, void *ctx)
+json_top_null(const char *ks, const char *ke, const char *vs, const char *ve,
+              void *ctx)
 {
   int *n = ctx;
   size_t vlen = (size_t)(ve - vs);
 
+  (void)ks;
+  (void)ke;
   /* Shorter than "null" cannot be overwritten in place; it cannot name a
    * tier either. */
   if (vlen >= 4) {
@@ -1093,6 +1107,45 @@ json_null_top_key(char *body, size_t body_len, const char *key, size_t klen)
     return 0;
   (void)json_top_walk(body, body_len, key, klen, json_top_null, &n, NULL);
   return n;
+}
+
+typedef struct {
+  const char *to;
+  size_t tolen;
+  int n;
+} json_top_rename_t;
+
+static int
+json_top_rename(const char *ks, const char *ke, const char *vs, const char *ve,
+                void *ctx)
+{
+  json_top_rename_t *r = ctx;
+  size_t klen = (size_t)(ke - ks);
+
+  (void)vs;
+  (void)ve;
+  /* The raw spelling is never shorter than the name it spells (an escape
+   * is longer than the byte it encodes), so a name of the same length as
+   * the decoded key always fits; the bytes past it, if any, were an
+   * escape, and become underscores: a plain name of the same extent. */
+  if (ks && klen >= r->tolen) {
+    memcpy((char *)(uintptr_t)ks, r->to, r->tolen);
+    memset((char *)(uintptr_t)ks + r->tolen, '_', klen - r->tolen);
+    r->n++;
+  }
+  return 1;
+}
+
+int
+json_rename_top_key(char *body, size_t body_len, const char *key, size_t klen,
+                    const char *to, size_t tolen)
+{
+  json_top_rename_t r = { to, tolen, 0 };
+
+  if (!body || !key || !to || tolen == 0 || tolen > klen)
+    return 0;
+  (void)json_top_walk(body, body_len, key, klen, json_top_rename, &r, NULL);
+  return r.n;
 }
 
 
