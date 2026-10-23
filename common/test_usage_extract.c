@@ -486,6 +486,13 @@ main(void)
     } st_vecs[] = {
       { "tier-flex", "{\"model\":\"m\",\"service_tier\":\"flex\"}", AI_TIER_FLEX,
         "{\"model\":\"m\",\"service_tier\":null  }" },
+      /* The fast path, each side: a key and a value with no escape in them
+       * compare as bytes (json_str_eq's memchr, then memcmp), and a byte
+       * that differs is a miss on that path too. */
+      { "tier-plain-key-fast-path", "{\"service_tier\":\"priority\"}", AI_TIER_PRIORITY,
+        "{\"service_tier\":null      }" },
+      { "tier-plain-key-fast-path-miss", "{\"service_tiers\":\"priority\"}", AI_TIER_NONE, NULL },
+      { "tier-plain-value-fast-path-miss", "{\"service_tier\":\"priorities\"}", AI_TIER_NONE, NULL },
       { "tier-priority-first-key", "{\"service_tier\":\"priority\",\"n\":1}", AI_TIER_PRIORITY,
         "{\"service_tier\":null      ,\"n\":1}" },
       { "tier-fast-whitespace", "{\"service_tier\" :\t \"fast\" ,\"n\":1}", AI_TIER_FAST,
@@ -513,11 +520,30 @@ main(void)
         AI_TIER_FLEX, "{\"service_tier\":null  ,\"n\":{\"service_tier\":\"x\"},\"service_tier\":null  ,\"service_tier\":null  }" },
       { "tier-dup-last-no-hint", "{\"service_tier\":\"priority\",\"service_tier\":\"auto\"}", AI_TIER_NONE, NULL },
       { "tier-dup-last-short", "{\"service_tier\":\"flex\",\"service_tier\":1}", AI_TIER_NONE, NULL },
-      /* An escaped spelling of the key is another key to the gateway: not
-       * read, not nulled (a known limit, in the guide). */
-      { "tier-escaped-key-is-not-read", "{\"service\\u005ftier\":\"priority\"}", AI_TIER_NONE, NULL },
-      { "tier-escaped-key-is-left", "{\"service_tier\":\"flex\",\"service\\u005ftier\":\"priority\"}",
-        AI_TIER_FLEX, "{\"service_tier\":null  ,\"service\\u005ftier\":\"priority\"}" },
+      /* An escaped spelling of the key is the key, as the engine's parser
+       * reads it: read, and nulled with the literal spellings. The last
+       * occurrence decides whichever spelling it has. */
+      { "tier-escaped-key-is-read", "{\"service\\u005ftier\":\"priority\"}", AI_TIER_PRIORITY,
+        "{\"service\\u005ftier\":null      }" },
+      { "tier-escaped-after-literal-decides", "{\"service_tier\":\"flex\",\"service\\u005ftier\":\"priority\"}",
+        AI_TIER_PRIORITY, "{\"service_tier\":null  ,\"service\\u005ftier\":null      }" },
+      { "tier-literal-after-escaped-decides", "{\"service\\u005ftier\":\"priority\",\"service_tier\":\"flex\"}",
+        AI_TIER_FLEX, "{\"service\\u005ftier\":null      ,\"service_tier\":null  }" },
+      { "tier-escaped-every-byte", "{\"\\u0073\\u0065\\u0072\\u0076\\u0069\\u0063\\u0065\\u005f\\u0074\\u0069\\u0065\\u0072\":\"fast\"}",
+        AI_TIER_FAST, "{\"\\u0073\\u0065\\u0072\\u0076\\u0069\\u0063\\u0065\\u005f\\u0074\\u0069\\u0065\\u0072\":null  }" },
+      { "tier-escaped-key-nested-is-not-read", "{\"opts\":{\"service\\u005ftier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      /* Decoded, it is another key; or it decodes to nothing (not JSON). */
+      { "tier-escaped-other-key", "{\"service\\u005ftie\\u0072s\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-key-prefix", "{\"service\\u005ftie\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-bad-hex", "{\"service\\u005gtier\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-cut", "{\"service\\u005\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-lone-surrogate", "{\"service\\ud800tier\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-unknown-letter", "{\"service\\xtier\":\"flex\"}", AI_TIER_NONE, NULL },
+      /* The value is read decoded too: "priorit\u0079" names the tier. */
+      { "tier-escaped-value-is-read", "{\"service_tier\":\"priorit\\u0079\"}", AI_TIER_PRIORITY,
+        "{\"service_tier\":null           }" },
+      { "tier-escaped-value-other", "{\"service_tier\":\"flex\\u0021\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-value-not-json", "{\"service_tier\":\"fle\\q\"}", AI_TIER_NONE, NULL },
       { "tier-garbage", "not json", AI_TIER_NONE, NULL },
     };
     size_t vi;
@@ -549,16 +575,53 @@ main(void)
     }
     /* Every top-level occurrence is overwritten, and only those. */
     {
-      char b[] = "{\"service_tier\":\"flex\",\"service_tier\":\"priority\",\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}]}";
-      const char *want = "{\"service_tier\":null  ,\"service_tier\":null      ,\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}]}";
+      char b[] = "{\"service_tier\":\"flex\",\"service_tier\":\"priority\",\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}],\"service\\u005ftier\":\"fast\"}";
+      const char *want = "{\"service_tier\":null  ,\"service_tier\":null      ,\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}],\"service\\u005ftier\":null  }";
       int n = json_null_top_key(b, strlen(b), "service_tier", 12);
       g_cases++;
-      if (n != 2 || strcmp(b, want)) { printf("FAIL null-top-key-every-occurrence n=%d -> %s\n", n, b); g_fails++; }
+      if (n != 3 || strcmp(b, want)) { printf("FAIL null-top-key-every-occurrence n=%d -> %s\n", n, b); g_fails++; }
       else printf("ok   null-top-key-every-occurrence\n");
       g_cases++;
       if (json_null_top_key(NULL, 4, "service_tier", 12) != 0 || json_null_top_key(b, 0, "service_tier", 12) != 0) {
         printf("FAIL null-top-key-empty\n"); g_fails++;
       } else printf("ok   null-top-key-empty\n");
+    }
+    /* An escaped key spelling reads the same for the jsmn extractor and
+     * the walk: "mod\u0065l" is "model" to every parser downstream, so it
+     * is the model the allowlist binds to. */
+    {
+      const char *b = "{\"mod\\u0065l\":\"m1\",\"n\":1}";
+      char m1[32] = "", m2[32] = "";
+      int r1 = extract_model_field(b, strlen(b), m1, sizeof(m1));
+      int r2 = extract_model_field_prefix(b, strlen(b), m2, sizeof(m2));
+      g_cases++;
+      if (r1 != 0 || strcmp(m1, "m1") || r2 != 0 || strcmp(m2, "m1")) {
+        printf("FAIL model-escaped-key r1=%d m1=%s r2=%d m2=%s\n", r1, m1, r2, m2); g_fails++;
+      } else printf("ok   model-escaped-key\n");
+    }
+    /* An escaped model VALUE reads decoded through both extractors too: the
+     * model the allowlist binds to is the one the engine will serve, and the
+     * one the routing extractor read. */
+    {
+      const char *b = "{\"model\":\"m\\u0031\\u002dx\",\"n\":1}";
+      char m1[32] = "", m2[32] = "";
+      int r1 = extract_model_field(b, strlen(b), m1, sizeof(m1));
+      int r2 = extract_model_field_prefix(b, strlen(b), m2, sizeof(m2));
+      g_cases++;
+      if (r1 != 0 || strcmp(m1, "m1-x") || r2 != 0 || strcmp(m2, "m1-x")) {
+        printf("FAIL model-escaped-value r1=%d m1=%s r2=%d m2=%s\n", r1, m1, r2, m2); g_fails++;
+      } else printf("ok   model-escaped-value\n");
+    }
+    /* The user id (session affinity) reads decoded: one session for both spellings. */
+    {
+      const char *b1 = "{\"user\":\"alice\"}", *b2 = "{\"user\":\"alic\\u0065\"}";
+      char u1[64] = "", u2[64] = "";
+      extract_user_id(b1, strlen(b1), u1, sizeof(u1));
+      extract_user_id(b2, strlen(b2), u2, sizeof(u2));
+      g_cases++;
+      if (strcmp(u1, "alice") || strcmp(u2, "alice")) {
+        printf("FAIL user-escaped-value u1=%s u2=%s\n", u1, u2); g_fails++;
+      } else printf("ok   user-escaped-value\n");
     }
     /* The overwrite refuses what does not fit: nothing is written. */
     {
