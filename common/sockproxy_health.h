@@ -76,5 +76,8 @@ uint32_t cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index,
 
 /* Background thread: periodically checks draining endpoints */
 void *proxy_drain_checker_thread(void *arg);
+/* The capacity-queue deadline thread: asleep on a timer armed to the
+ * earliest pending deadline, one pool-driven pass per firing. */
+void *proxy_fc_deadline_thread(void *arg);
 
 #endif /* __SOCKPROXY_HEALTH_H__ */

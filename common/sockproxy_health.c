@@ -1126,6 +1126,97 @@ sp_fc_park_idle_visit(void *ctx, const fc_queue_ent_t *e)
   }
 }
 
+/* The pools of every rule, for the deadline pass: one atomic read each
+ * (fc_queue_next_deadline); a queue is entered only once its earliest
+ * deadline has passed. PROXY_LOCK held by the caller. */
+static void
+sp_fc_deadline_pools(void *ctx, fc_pool_visit_fn visit, void *vctx)
+{
+  proxy_map_ent_t *node;
+  proxy_epval_t *ep, *tmp;
+
+  (void)ctx;
+  for (node = proxy_struct->head; node; node = node->next) {
+    HASH_ITER(hh, node->val.ephash, ep, tmp) {
+      visit(vctx, &ep->fc);
+    }
+  }
+}
+
+/* A waiting request whose deadline has passed, by its queue entry. The
+ * connection is found by its fd and must still be the one that parked (the
+ * generation the entry carries), still waiting in this pool. Whichever of
+ * the pop, the client's departure and this pass takes the entry out first
+ * owns what happens to the connection: the take fails when its turn or its
+ * cancellation came first, and then nothing is done. The 504 (429 when the
+ * client's own TTL ended the wait on a rule that speaks llm-d) and the
+ * teardown go through pd_reap_respond, written by the socket's owner
+ * worker. PROXY_LOCK held by the caller. */
+static void
+sp_fc_deadline_expire(void *ctx, fc_state_t *fc, const fc_queue_ent_t *e,
+                      uint64_t now_ns)
+{
+  proxy_fd_ent_t *pfe;
+  uint64_t reg_gen = 0;
+  int ttl_end;
+
+  (void)ctx;
+  if (!proxy_struct || !proxy_struct->ns || e->fd <= 0)
+    return;
+  pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
+  if (!pfe || pfe->fd != e->fd ||
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen)
+    return;                      /* the connection that parked is gone */
+  if (pfe->odir != 0 || pfe->fc.state != FC_P_QUEUED || pfe->fc.fc != fc ||
+      pfe->fc.q_deadline_ns == 0 || now_ns < pfe->fc.q_deadline_ns)
+    return;
+  if (!fc_queue_take(fc, &pfe->fc))
+    return;                      /* its turn or its cancellation came first */
+  ttl_end = pfe->fc.q_ttl_cut && fc->cfg.llmd_headers;
+  fc_count_band(fc, FC_R_QUEUE_TIMEOUT, pfe->fc.band);
+  fc_queue_wait_end(fc, &pfe->fc, now_ns);
+  log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
+           "with the pool still full (inflight=%u queued=%u) — %s",
+           pfe->fd,
+           (unsigned long long)((now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL),
+           fc_band_wait_ms(fc, pfe->fc.band), fc_inflight(fc), fc_queued(fc),
+           ttl_end ? "429 (the client's x-llm-d-inference-ttl)" : "504");
+  /* fc_queue_take moved the permit out of QUEUED (FC_P_ENDED) before it
+   * took the entry: a late resume of the owner does nothing. */
+  pfe->pd_phase = PD_PHASE_ERROR;
+  pd_reap_respond(pfe, ttl_end ? SP_REAP_FC_TTL : SP_REAP_FC_QUEUE_TIMEOUT);
+}
+
+/* The deadline thread: asleep on the timer until the earliest pending
+ * queue deadline (FC_DEADLINE_GRAIN_NS granularity), then one pass over the
+ * pools; never woken while nobody waits. The pass re-arms the timer. A
+ * timer that could not be opened leaves the deadlines to the 1 Hz pass
+ * (check_draining_endpoints). */
+void *
+proxy_fc_deadline_thread(void *arg)
+{
+  fc_deadline_t *d = fc_deadline_global();
+
+  (void)arg;
+  g_llb_proxy_worker = 1;
+  if (fc_deadline_init(d) != 0) {
+    log_error("[AIGateway] queue deadline timer: timerfd_create failed (%s); "
+              "deadlines run on the 1 Hz health pass", strerror(errno));
+    return NULL;
+  }
+  log_info("[AIGateway] queue deadline timer on: windows are enforced at %llu ms "
+           "granularity", (unsigned long long)(FC_DEADLINE_GRAIN_NS / 1000000ULL));
+  for (;;) {
+    if (fc_deadline_wait(d, -1) <= 0)
+      continue;
+    PROXY_LOCK();
+    (void)fc_deadline_pass(d, fc_now_ns(), sp_fc_deadline_pools,
+                           sp_fc_deadline_expire, NULL);
+    PROXY_UNLOCK();
+  }
+  return NULL;
+}
+
 static void
 check_draining_endpoints(void)
 {
@@ -1716,52 +1807,13 @@ check_draining_endpoints(void)
     }
   }
 
-  /* Capacity-queue deadlines. A request parked by the capacity gate sits
-   * in its pool's queue with an absolute deadline; nothing else on the
-   * request path times it, since its reads are paused and no backend leg
-   * exists. Whichever of the pop, the client's departure and this pass
-   * takes the entry out first owns what happens to the connection: the
-   * take here fails when its turn or its cancellation came first, and then
-   * nothing is done. The 504 and the teardown go through pd_reap_respond,
-   * written by the socket's owner worker. */
-  {
-    struct timespec _qts;
-    uint64_t q_now_ns;
-    proxy_map_ent_t *q_node = proxy_struct->head;
-
-    clock_gettime(CLOCK_MONOTONIC, &_qts);
-    q_now_ns = (uint64_t)_qts.tv_sec * 1000000000ULL + (uint64_t)_qts.tv_nsec;
-    while (q_node) {
-      proxy_fd_ent_t *pfe = q_node->val.fdlist;
-      while (pfe) {
-        proxy_fd_ent_t *pfe_next = pfe->next;
-
-        if (pfe->odir == 0 && pfe->fc.state == FC_P_QUEUED && pfe->fc.fc &&
-            pfe->fc.q_deadline_ns > 0 && q_now_ns >= pfe->fc.q_deadline_ns &&
-            fc_queue_take(pfe->fc.fc, &pfe->fc)) {
-          /* The client's own TTL ended this wait and the rule speaks the
-           * llm-d convention: 429. A window of the rule's stays 504. */
-          int ttl_end = pfe->fc.q_ttl_cut && pfe->fc.fc->cfg.llmd_headers;
-
-          fc_count_band(pfe->fc.fc, FC_R_QUEUE_TIMEOUT, pfe->fc.band);
-          fc_queue_wait_end(pfe->fc.fc, &pfe->fc, q_now_ns);
-          log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
-                   "with the pool still full (inflight=%u queued=%u) — %s",
-                   pfe->fd,
-                   (unsigned long long)((q_now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL),
-                   fc_band_wait_ms(pfe->fc.fc, pfe->fc.band), fc_inflight(pfe->fc.fc),
-                   fc_queued(pfe->fc.fc),
-                   ttl_end ? "429 (the client's x-llm-d-inference-ttl)" : "504");
-          /* fc_queue_take moved the permit out of QUEUED (FC_P_ENDED) before
-           * it took the entry: a late resume of the owner does nothing. */
-          pfe->pd_phase = PD_PHASE_ERROR;
-          pd_reap_respond(pfe, ttl_end ? SP_REAP_FC_TTL : SP_REAP_FC_QUEUE_TIMEOUT);
-        }
-        pfe = pfe_next;
-      }
-      q_node = q_node->next;
-    }
-  }
+  /* Capacity-queue deadlines are met by the deadline thread
+   * (proxy_fc_deadline_thread), on a timer armed to the earliest pending
+   * deadline: this pass runs them only in a process whose timer could not
+   * be opened, at this pass's cadence, through the same pool-driven read. */
+  if (fc_deadline_global()->tfd <= 0)
+    (void)fc_deadline_pass(NULL, fc_now_ns(), sp_fc_deadline_pools,
+                           sp_fc_deadline_expire, NULL);
 
   /* Capacity-queue turns. A released unit wakes the oldest waiting request
    * at once; this pass gives a turn again when that wake was lost on the

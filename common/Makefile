@@ -432,6 +432,12 @@ test_fc_band_floor: test_fc_band_floor.c sockproxy_fc.c sockproxy_fc.h
 test_fc_band_ttl: test_fc_band_ttl.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_band_ttl.c sockproxy_fc.c -I. -lpthread
 
+# A configured wait window is the enforced window: the deadline timer, the
+# per-pool earliest deadline, the pass that enters only expired queues, no
+# idle wake-ups (real timerfd, real time; ~12 s).
+test_fc_deadline: test_fc_deadline.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_fc_deadline.c sockproxy_fc.c -I. -lpthread
+
 test_fc_band_wrr: test_fc_band_wrr.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_band_wrr.c sockproxy_fc.c -I. -lpthread
 
@@ -452,7 +458,7 @@ test_pd_role_wait: test_pd_role_wait.c test_pd_role_wait.gen.c sockproxy_fc.c so
 	  -o $@ test_pd_role_wait.c sockproxy_fc.c -I. -lpthread
 
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr test_fc_settle test_pd_role_wait
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr test_fc_settle test_pd_role_wait test_fc_deadline
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
@@ -468,6 +474,7 @@ test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose 
 	./test_fc_band_wrr
 	./test_fc_settle
 	./test_pd_role_wait
+	./test_fc_deadline
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.

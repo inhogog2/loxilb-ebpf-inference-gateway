@@ -433,6 +433,11 @@ typedef struct fc_queue {
   uint32_t dead;                 /* the pool's rule is gone: nothing may wait here again */
   fc_evicted_t evicted[FC_EVICT_PENDING]; /* evicted waiters owed their answer, oldest first */
   _Atomic uint32_t n_evicted;    /* written under the lock, read without it */
+  /* The earliest deadline among the live entries, 0 while none waits:
+   * written under the lock by every insertion and removal, read without it
+   * by the deadline pass, which enters a pool's queue only once this has
+   * passed (fc_deadline_pass). */
+  _Atomic uint64_t next_deadline_ns;
   pthread_mutex_t lock;
 } fc_queue_t;
 
@@ -970,6 +975,64 @@ void fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx);
  * this queue. */
 typedef void (*fc_visit_fn)(void *ctx, const fc_queue_ent_t *ent);
 uint32_t fc_queue_visit(fc_state_t *fc, fc_visit_fn fn, void *ctx);
+
+/* ---- queue deadlines ------------------------------------------------------
+ * A configured wait window is the enforced window. A waiting request's
+ * deadline is met by a timer armed to the earliest pending deadline across
+ * the pools (FC_DEADLINE_GRAIN_NS granularity), re-armed on every park and
+ * after every pass; with no waiter anywhere it is not armed and the pass
+ * does not run. The pass reads one atomic per pool (fc_queue_next_deadline)
+ * and enters only the queues whose earliest deadline has passed, where it
+ * copies the entries past theirs (fc_queue_expired) and hands each to the
+ * expire function, which ends the request through the CAS settle
+ * (fc_queue_take) exactly as before: nothing here walks a connection list. */
+
+/* The earliest deadline among a pool's waiting entries, 0 for none. */
+uint64_t fc_queue_next_deadline(const fc_state_t *fc);
+
+/* Copy, oldest first, the live entries whose deadline is at or before
+ * now_ns, up to cap; nothing is taken out (the expire path takes its entry
+ * through fc_queue_take, which may find it gone to its turn or its
+ * cancellation first). Returns how many were copied. */
+uint32_t fc_queue_expired(fc_state_t *fc, uint64_t now_ns,
+                          fc_queue_ent_t *out, uint32_t cap);
+
+#define FC_DEADLINE_GRAIN_NS 25000000ULL   /* the timer fires at most every 25 ms */
+
+typedef struct fc_deadline {
+  int tfd;                       /* the timerfd; <= 0: no timer (nothing arms, nothing fires) */
+  _Atomic uint64_t armed_ns;     /* the absolute time the timer is set for, 0 = disarmed */
+  _Atomic uint64_t last_fire_ns; /* when it last fired, 0 = never */
+  _Atomic uint64_t wakeups;      /* times it fired */
+  _Atomic uint64_t passes;       /* times the pass ran */
+} fc_deadline_t;
+
+/* The process's timer; fc_deadline_init opens its timerfd (the proxy, at
+ * start). Until then (every unit that does not test the timer) arming is a
+ * no-op. */
+fc_deadline_t *fc_deadline_global(void);
+int  fc_deadline_init(fc_deadline_t *d);
+void fc_deadline_close(fc_deadline_t *d);
+
+/* A deadline came into existence (a park, a woken request going back): the
+ * timer is set to it when it is earlier than what it is set for, never
+ * earlier than the last firing plus the grain. */
+void fc_deadline_arm(fc_deadline_t *d, uint64_t deadline_ns, uint64_t now_ns);
+
+/* Block until the timer fires (1) or for at most max_wait_ms (0; -1 = no
+ * bound) or fails (-1). The timer is one-shot: fc_deadline_pass re-arms it. */
+int  fc_deadline_wait(fc_deadline_t *d, int max_wait_ms);
+
+/* The pools: `pools` calls `visit` for every pool; `expire` is handed each
+ * entry whose deadline has passed, with the pool it waits in. The pass
+ * re-arms the timer to the earliest deadline left across the pools (the
+ * grain after now at the earliest) and returns it, 0 for none. */
+typedef void (*fc_pool_visit_fn)(void *vctx, fc_state_t *fc);
+typedef void (*fc_pools_fn)(void *ctx, fc_pool_visit_fn visit, void *vctx);
+typedef void (*fc_expire_fn)(void *ctx, fc_state_t *fc, const fc_queue_ent_t *ent,
+                             uint64_t now_ns);
+uint64_t fc_deadline_pass(fc_deadline_t *d, uint64_t now_ns, fc_pools_fn pools,
+                          fc_expire_fn expire, void *ctx);
 
 /* Process-wide drain for maintenance: while set, the gate refuses new
  * inference requests with FC_DRAINING and pools drain their queues. */
