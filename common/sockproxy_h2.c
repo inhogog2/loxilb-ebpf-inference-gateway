@@ -43,6 +43,8 @@
 #include "sockproxy_l7hdr_guard.h" /* same field guard as the H1 splice */
 #include "notify.h"
 #include "log.h"
+#include "sockproxy_native_prio.h"       /* the body key and its rename */
+#include "sockproxy_native_prio_note.h"  /* after log.h: it logs */
 
 // HTTP/HTTPS Tracing Support (: Error Trace Emission)
 #ifdef HAVE_HTTP_TRACE
@@ -4908,6 +4910,17 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       if (adm.tier_consumed && stream->data_buf)
         (void)json_null_top_key((char *)stream->data_buf, stream->data_len,
                                 "service_tier", 12);
+      /* Where the class stage ran, a client-supplied engine priority is
+       * the gateway's to neutralise (H1 parity, sp_h1_admit_apply): the
+       * top-level `priority` is renamed in place; the header is dropped
+       * when the stream is submitted. */
+      if (adm_req.class_on && stream->data_buf &&
+          json_rename_top_key((char *)stream->data_buf, stream->data_len,
+                              SP_NATIVE_PRIO_BODY_KEY,
+                              sizeof(SP_NATIVE_PRIO_BODY_KEY) - 1,
+                              SP_NATIVE_PRIO_RENAMED,
+                              sizeof(SP_NATIVE_PRIO_RENAMED) - 1) > 0)
+        sp_native_prio_note(&ent_pool0->fc, adm_svc_ident, 0, 1);
       stream->admit_mono_ns = get_timestamp_ns();
     }
   }
@@ -5742,6 +5755,43 @@ h2_have_tepval:
     security_headers_built = 1;
     headers = out;
     nheaders = n;
+  }
+
+  /* A client's x-vllm-priority does not leave an AI-gateway connection while
+   * the class stage is on: the tenant band decides the order (H1 parity,
+   * sp_native_priority_strip; sockproxy_native_prio.h has why). The list is
+   * rebuilt only when the header is there. */
+  if (!pfe->odir && pfe->ai_gw_mode && ai_gw_class_on()) {
+    int dropped = 0;
+
+    for (size_t i = 0; i < nheaders; i++)
+      if (headers[i].namelen == sizeof("x-vllm-priority") - 1 &&
+          strncasecmp((const char *)headers[i].name, "x-vllm-priority",
+                      headers[i].namelen) == 0) {
+        dropped = 1;
+        break;
+      }
+    if (dropped) {
+      nghttp2_nv *out = calloc(nheaders, sizeof(*out));
+      size_t n;
+
+      if (!out) {
+        free(security_headers_nv);
+        if (l7_hdr_built)
+          proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
+        log_error("[AIGateway][HTTP/2] cannot allocate the forwarded-header set");
+        return -1;
+      }
+      n = ai_security_h2_drop_native_priority(headers, nheaders, out, nheaders,
+                                              NULL);
+      free(security_headers_nv);
+      security_headers_nv = out;
+      security_headers_built = 1;
+      headers = out;
+      nheaders = n;
+      if (tepval)
+        sp_native_prio_note(&tepval->fc, stream->svc_ident, 1, 0);
+    }
   }
 
   if (bridge_h1) {

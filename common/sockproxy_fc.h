@@ -481,6 +481,9 @@ typedef struct fc_state {
   _Atomic uint64_t qwait_bucket[FC_QWAIT_BUCKETS];
   _Atomic uint64_t qwait_sum_ms;
   _Atomic uint64_t qwait_count;
+  /* When this service last logged a neutralised client-supplied engine
+   * priority (ai_gw_native_priority_note): one line per service, rate-limited. */
+  _Atomic uint64_t native_prio_note_ns;
   fc_queue_t queue;
   /* The adaptive ceiling in force while cfg.adaptive is set; otherwise
    * unused (the configured ceiling is). Moved by fc_adapt_tick only. */

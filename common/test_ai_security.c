@@ -222,6 +222,44 @@ test_netid_forward_hygiene(void)
   assert(has_header(output, n, "x-auth-tenant", "spoofed-t"));
 }
 
+static void
+test_drop_native_priority(void)
+{
+  nghttp2_nv input[] = {
+    nv(":method", "POST"),
+    nv("x-vllm-priority", "-100"),
+    nv("content-type", "application/json"),
+    nv("X-VLLM-PRIORITY", "7"),
+    nv("x-vllm-priority-hint", "1"),
+  };
+  nghttp2_nv output[5];
+  size_t n;
+  int dropped = -1;
+
+  /* Every spelling goes; a longer name with the same prefix stays; the
+   * order of the rest holds. */
+  n = ai_security_h2_drop_native_priority(input, 5, output, 5, &dropped);
+  assert(n == 3);
+  assert(dropped == 1);
+  assert(!has_header(output, n, "x-vllm-priority", NULL));
+  assert(has_header(output, n, "x-vllm-priority-hint", "1"));
+  assert(output[0].namelen == 7 && memcmp(output[0].name, ":method", 7) == 0);
+  assert(output[1].namelen == 12 && memcmp(output[1].name, "content-type", 12) == 0);
+
+  /* Without the header: a copy, and dropped says so. */
+  {
+    nghttp2_nv plain[] = { nv(":method", "POST"), nv("content-type", "a") };
+    n = ai_security_h2_drop_native_priority(plain, 2, output, 5, &dropped);
+    assert(n == 2 && dropped == 0);
+    assert(has_header(output, n, "content-type", "a"));
+  }
+
+  /* dropped may be NULL; a tight output holds what fits. */
+  n = ai_security_h2_drop_native_priority(input, 5, output, 2, NULL);
+  assert(n == 2);
+  assert(!has_header(output, n, "x-vllm-priority", NULL));
+}
+
 int
 main(void)
 {
@@ -229,6 +267,7 @@ main(void)
   test_header_filter();
   test_upstream_hygiene();
   test_netid_forward_hygiene();
+  test_drop_native_priority();
   puts("PASS: AI credential handling and upstream header hygiene");
   return 0;
 }

@@ -59,6 +59,13 @@ size_t ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len
  * nghttp2_submit_request copies the bytes before either source array is freed.
  * (Thin wrapper over the hygiene filter above with the JWT arms off.)
  */
+/* Copy input to output without any x-vllm-priority header (case-insensitive).
+ * Returns how many were written; *dropped (may be NULL) is 1 when at least
+ * one was left out. The copies are shallow, as ai_security_h2_upstream_hygiene's. */
+size_t ai_security_h2_drop_native_priority(const nghttp2_nv *input, size_t input_len,
+                                           nghttp2_nv *output, size_t output_cap,
+                                           int *dropped);
+
 size_t ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                                      nghttp2_nv *output, size_t output_cap,
                                      uint8_t policy);
