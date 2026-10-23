@@ -116,6 +116,33 @@ ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
 }
 
 size_t
+ai_security_h2_drop_native_priority(const nghttp2_nv *input, size_t input_len,
+                                    nghttp2_nv *output, size_t output_cap,
+                                    int *dropped)
+{
+  size_t written = 0;
+
+  if (dropped)
+    *dropped = 0;
+  if (!input || !output)
+    return 0;
+  for (size_t i = 0; i < input_len; i++) {
+    const nghttp2_nv *nv = &input[i];
+    /* The client's copy of the engine's priority header: the tenant band
+     * decides the order (sockproxy_native_prio.h has why). */
+    if (nv_name_is(nv, "x-vllm-priority", sizeof("x-vllm-priority") - 1)) {
+      if (dropped)
+        *dropped = 1;
+      continue;
+    }
+    if (written >= output_cap)
+      break;
+    output[written++] = *nv;
+  }
+  return written;
+}
+
+size_t
 ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                               nghttp2_nv *output, size_t output_cap,
                               uint8_t policy)

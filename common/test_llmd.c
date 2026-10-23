@@ -19,6 +19,7 @@
 #include "sockproxy_h1_hdr.h"
 #include "sockproxy_obj_hint.h"
 #include "sockproxy_llmd_fwd.h"
+#include "sockproxy_native_prio.h"
 
 static int failures = 0;
 static int checks   = 0;
@@ -217,6 +218,64 @@ test_rewrite(void)
   free(b);
 }
 
+static void
+test_native_prio(void)
+{
+  const char *req =
+    "POST /v1/chat/completions HTTP/1.1\r\n"
+    "Host: gw\r\n"
+    "X-Vllm-Priority: -100\r\n"
+    "Content-Type: application/json\r\n"
+    "x-vllm-priority: 7\r\n"
+    "Content-Length: 2\r\n"
+    "\r\n{}";
+  const char *want =
+    "POST /v1/chat/completions HTTP/1.1\r\n"
+    "Host: gw\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: 2\r\n"
+    "\r\n{}";
+  const char *plain =
+    "POST /v1/chat/completions HTTP/1.1\r\n"
+    "Host: gw\r\n"
+    "X-Vllm-Priority-Hint: 1\r\n"
+    "Content-Length: 20\r\n"
+    "\r\nX-Vllm-Priority: 1\r\n";
+  size_t len, before;
+  uint8_t *b;
+
+  /* Every spelling of the header goes, the rest of the head and the body
+   * stay byte for byte. */
+  b = head(req, strlen(req) + 1, &len);
+  CHECK(sp_native_prio_strip_head(b, &len) == 1, "a head with the header: stripped");
+  CHECK(len == strlen(want) && !memcmp(b, want, len),
+        "both spellings are gone, nothing else moved (got %.*s)", (int)len, b);
+  CHECK(sp_native_prio_strip_head(b, &len) == 0 && len == strlen(want),
+        "stripped again: nothing to do, the head as it was");
+  free(b);
+
+  /* Another name with the same prefix is not the header; a body line that
+   * looks like it is body, not head. */
+  b = head(plain, strlen(plain) + 1, &len);
+  before = len;
+  CHECK(sp_native_prio_strip_head(b, &len) == 0 && len == before &&
+        !memcmp(b, plain, len), "a different name and a body line: untouched");
+  free(b);
+
+  /* No terminator in the buffer: refused, nothing written. */
+  {
+    const char *cut = "POST / HTTP/1.1\r\nX-Vllm-Priority: 1\r\n";
+    b = head(cut, strlen(cut) + 1, &len);
+  }
+  before = len;
+  CHECK(sp_native_prio_strip_head(b, &len) == -1 && len == before,
+        "a head without its terminator is left as it was");
+  free(b);
+
+  CHECK(sizeof(SP_NATIVE_PRIO_RENAMED) == sizeof(SP_NATIVE_PRIO_BODY_KEY),
+        "the renamed body key has the body key's length: the body keeps its size");
+}
+
 int
 main(void)
 {
@@ -224,6 +283,7 @@ main(void)
   test_hint();
   test_reason();
   test_rewrite();
+  test_native_prio();
   printf("test_llmd: %d checks, %d failed\n", checks, failures);
   return failures ? 1 : 0;
 }

@@ -73,6 +73,12 @@ NOT_REACHED(get_conversation_mapping)
 REACHED(get_timestamp_ns)
 NOT_REACHED(is_endpoint_healthy)
 NOT_REACHED(json_null_top_key)
+/* QA-01: where the class stage ran, the H2 submit renames a top-level
+ * priority (0 = no such key, which is what the fixture's bodies have) and,
+ * only when a request carries x-vllm-priority, rebuilds the header set
+ * without it; the fixture's requests carry none. */
+REACHED(json_rename_top_key)
+NOT_REACHED(ai_security_h2_drop_native_priority)
 NOT_REACHED(l7_apply_req_filters)
 NOT_REACHED(l7_cookie_node_match)
 NOT_REACHED(l7_cookie_node_token_for_ep)

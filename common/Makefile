@@ -1018,7 +1018,7 @@ test_obj_hint: test_obj_hint.c sockproxy_obj_hint.h sockproxy_creq_block.h sockp
 test_objhint: test_obj_hint
 	./test_obj_hint
 
-test_llmd: test_llmd.c sockproxy_llmd.h sockproxy_llmd_fwd.h sockproxy_obj_hint.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h
+test_llmd: test_llmd.c sockproxy_llmd.h sockproxy_llmd_fwd.h sockproxy_obj_hint.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h sockproxy_native_prio.h
 	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_llmd.c -I.
 	./test_llmd
 

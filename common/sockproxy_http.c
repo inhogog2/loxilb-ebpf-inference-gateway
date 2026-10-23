@@ -943,6 +943,8 @@ inject_request_id_header(void *msg, size_t *len, size_t bufsize,
  * line) live in sockproxy_h1_hdr.h, where the unit test reaches them. */
 #include "sockproxy_h1_hdr.h"
 #include "sockproxy_llmd_fwd.h"
+#include "sockproxy_native_prio.h"
+#include "sockproxy_native_prio_note.h"
 
 /* Emit-callback context for the H1 path: the mutable request buffer. */
 typedef struct {
@@ -1214,6 +1216,37 @@ sp_llmd_forward_headers(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
                            sp_class_hdr_value_ok(pfe->tenant_id) ? pfe->tenant_id : NULL,
                            at_gate) != 0)
     return buflen;   /* terminator lost: leave the buffer as it was */
+  return cur;
+}
+
+/*
+ * sp_native_priority_strip — on an AI-gateway connection while the class
+ * stage is on, a client's X-Vllm-Priority does not leave the gateway: the
+ * tenant band decides the order (sockproxy_native_prio.h has why; the body's
+ * top-level `priority` is renamed at the gate, sp_h1_admit_apply). Strip
+ * only, never a splice, so a chunked body's framing survives, on every
+ * request head the dispatch and the relay paths hand over, exactly where
+ * the credential strip above runs. One info line per service, rate-limited.
+ */
+static size_t
+sp_native_priority_strip(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen)
+{
+  size_t cur = buflen;
+  proxy_map_ent_t *node;
+  proxy_epval_t *pool0;
+
+  if (!pfe || !buf || pfe->odir || !pfe->ai_gw_mode || !ai_gw_class_on())
+    return buflen;
+  if (sp_native_prio_strip_head(buf, &cur) <= 0)
+    return buflen;   /* none, or the terminator is not here: as it was */
+  node = (proxy_map_ent_t *)pfe->head;
+  pool0 = sp_pool_first(node);
+  if (pool0) {
+    char svc[64];
+
+    ai_gw_svc_ident(node->key.xip, node->key.xport, svc, sizeof(svc));
+    sp_native_prio_note(&pool0->fc, svc, 1, 0);
+  }
   return cur;
 }
 
@@ -10151,11 +10184,25 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   pfe->adm_objective_denied = adm.objective_denied;
   pfe->adm_hint_not_applied = adm.hint_not_applied;
   snprintf(pfe->adm_objective, sizeof(pfe->adm_objective), "%s", adm.objective);
-  if (adm.tier_consumed && req->body &&
+  if (req->body &&
       (const uint8_t *)req->body >= pfe->rcvbuf &&
-      (const uint8_t *)req->body + req->body_len <= pfe->rcvbuf + pfe->rcv_off)
-    (void)json_null_top_key((char *)(uintptr_t)req->body, req->body_len,
-                            "service_tier", 12);
+      (const uint8_t *)req->body + req->body_len <= pfe->rcvbuf + pfe->rcv_off) {
+    if (adm.tier_consumed)
+      (void)json_null_top_key((char *)(uintptr_t)req->body, req->body_len,
+                              "service_tier", 12);
+    /* Where the class stage ran, a client-supplied engine priority is the
+     * gateway's to neutralise: the top-level `priority` is renamed in
+     * place to a key no engine reads (sockproxy_native_prio.h has why it
+     * is not written as 0); a nested one is no engine field and stays. The
+     * header goes at dispatch (sp_native_priority_strip). */
+    if (req->class_on &&
+        json_rename_top_key((char *)(uintptr_t)req->body, req->body_len,
+                            SP_NATIVE_PRIO_BODY_KEY,
+                            sizeof(SP_NATIVE_PRIO_BODY_KEY) - 1,
+                            SP_NATIVE_PRIO_RENAMED,
+                            sizeof(SP_NATIVE_PRIO_RENAMED) - 1) > 0)
+      sp_native_prio_note(pool0 ? &pool0->fc : NULL, adm_svc_ident, 0, 1);
+  }
   return 0;
 }
 
@@ -12811,6 +12858,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                              SP_SOCK_MSG_LEN, 1);
     pfe->rcv_off = sp_llmd_forward_headers(pfe, pfe->rcvbuf, pfe->rcv_off,
                                            SP_SOCK_MSG_LEN, 1);
+    pfe->rcv_off = sp_native_priority_strip(pfe, pfe->rcvbuf, pfe->rcv_off);
 
     /* P/D request-ID override — generate with prefill/decode addresses
  * so vllm-router can route correctly. Must happen BEFORE normal path. */
@@ -14760,6 +14808,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                                 SP_SOCK_MSG_LEN, 0);
         rc = (ssize_t)sp_llmd_forward_headers(pfe, pfe->rcvbuf, (size_t)rc,
                                               SP_SOCK_MSG_LEN, 0);
+        rc = (ssize_t)sp_native_priority_strip(pfe, pfe->rcvbuf, (size_t)rc);
       }
 
       PROXY_ENT_LOCK(pfe);

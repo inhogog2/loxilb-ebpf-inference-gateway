@@ -638,6 +638,65 @@ main(void)
       if (memcmp(b, "012345null", 10)) { printf("FAIL null-value-exact-fit -> %s\n", b); g_fails++; }
       else printf("ok   null-value-exact-fit\n");
     }
+    /* A client-supplied engine priority: the top-level key is renamed in
+     * place, at the same length, whatever its value (a number, a string, a
+     * short one, a negative one); an escaped spelling is renamed too and
+     * the bytes of its escape become underscores; a nested one (inside
+     * messages or tool arguments) is no engine field and is left as sent;
+     * the body keeps its size. */
+    {
+      static const struct { const char *name, *body, *after; int n; } rn[] = {
+        { "prio-number", "{\"model\":\"m\",\"priority\":5}", "{\"model\":\"m\",\"_gw_prio\":5}", 1 },
+        { "prio-negative", "{\"priority\":-5,\"model\":\"m\"}", "{\"_gw_prio\":-5,\"model\":\"m\"}", 1 },
+        { "prio-string", "{\"priority\":\"high\"}", "{\"_gw_prio\":\"high\"}", 1 },
+        { "prio-spaced", "{ \"priority\" : 0 , \"x\":1}", "{ \"_gw_prio\" : 0 , \"x\":1}", 1 },
+        { "prio-escaped-key", "{\"priorit\\u0079\":7}", "{\"_gw_prio_____\":7}", 1 },
+        { "prio-twice", "{\"priority\":1,\"priority\":2}", "{\"_gw_prio\":1,\"_gw_prio\":2}", 2 },
+        { "prio-nested-untouched", "{\"messages\":[{\"priority\":9,\"content\":\"priority\"}],\"tool\":{\"priority\":1}}", NULL, 0 },
+        { "prio-in-string-untouched", "{\"content\":\"\\\"priority\\\":3\"}", NULL, 0 },
+        { "prio-absent", "{\"model\":\"m\",\"max_tokens\":4}", NULL, 0 },
+        { "prio-not-json", "priority", NULL, 0 },
+      };
+      size_t ri;
+      for (ri = 0; ri < sizeof(rn) / sizeof(rn[0]); ri++) {
+        size_t len = strlen(rn[ri].body);
+        char *buf = malloc(len);          /* exact size: the sanitizer sees a step outside */
+        int n, ok;
+        memcpy(buf, rn[ri].body, len);
+        n = json_rename_top_key(buf, len, "priority", 8, "_gw_prio", 8);
+        ok = n == rn[ri].n;
+        if (rn[ri].after)
+          ok = ok && strlen(rn[ri].after) == len && !memcmp(buf, rn[ri].after, len);
+        else
+          ok = ok && !memcmp(buf, rn[ri].body, len);
+        g_cases++;
+        if (!ok) { printf("FAIL %-38s n=%d -> %.*s\n", rn[ri].name, n, (int)len, buf); g_fails++; }
+        else printf("ok   %-38s n=%d\n", rn[ri].name, n);
+        free(buf);
+      }
+      /* A name longer than the key, an empty one, no body: nothing is written. */
+      {
+        char b[] = "{\"priority\":1}";
+        g_cases++;
+        if (json_rename_top_key(b, strlen(b), "priority", 8, "a_longer_name", 13) != 0 ||
+            json_rename_top_key(b, strlen(b), "priority", 8, "", 0) != 0 ||
+            json_rename_top_key(NULL, 14, "priority", 8, "_gw_prio", 8) != 0 ||
+            json_rename_top_key(b, 0, "priority", 8, "_gw_prio", 8) != 0 ||
+            strcmp(b, "{\"priority\":1}")) {
+          printf("FAIL prio-rename-bounds -> %s\n", b); g_fails++;
+        } else printf("ok   prio-rename-bounds\n");
+      }
+      /* The tier null and the rename share one walk: both apply to one body. */
+      {
+        char b[] = "{\"service_tier\":\"flex\",\"priority\":3,\"messages\":[{\"priority\":1}]}";
+        const char *want = "{\"service_tier\":null  ,\"_gw_prio\":3,\"messages\":[{\"priority\":1}]}";
+        int a = json_null_top_key(b, strlen(b), "service_tier", 12);
+        int c = json_rename_top_key(b, strlen(b), "priority", 8, "_gw_prio", 8);
+        g_cases++;
+        if (a != 1 || c != 1 || strcmp(b, want)) { printf("FAIL prio-with-tier a=%d c=%d -> %s\n", a, c, b); g_fails++; }
+        else printf("ok   prio-with-tier\n");
+      }
+    }
   }
 
   printf("\n=== results: %d/%d passed ===\n", g_cases - g_fails, g_cases);
