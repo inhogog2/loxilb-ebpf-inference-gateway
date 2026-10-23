@@ -450,7 +450,25 @@ typedef struct ep_load_tracker {
   // swap-space pressure signal for the SWAP_WEIGHT term (0 when the
   // scraper does not advertise it — the SWAP term then contributes nothing).
   _Atomic uint32_t swap_pressure;
+  // Decode KV-pressure signal (vllm:kv_cache_usage_perc / gpu_cache_usage_perc /
+  // sglang:token_usage), fed by llb_ai_update_ep_kv_usage (same traversal and
+  // locking as the capacity bridge, and like it NEVER stamps last_update_ts).
+  // Encoded so that the zero-filled allocation (sp_pool_alloc memset, no init
+  // site for pd_ep_loads[]) reads as "never reported":
+  //   0      = not reported / unknown
+  //   1..101 = reported percentage + 1 (0..100 %)
+  // Decoded only by pd_kv_usage_dec() in sockproxy_pd.c, consumed only by the
+  // pd_select_decode_excluding score loop when LLB_PD_DECODE_KV_WEIGHT > 0;
+  // freshness rides last_update_ts (the same scraper sample stamps it through
+  // llb_ai_update_ep_queue_depth). An unknown or stale value is neutralized
+  // to the fleet mean, never read as 0 %.
+  _Atomic uint8_t kv_usage_enc;
 } ep_load_tracker_t;
+
+/* cgo contract of llb_ai_update_ep_kv_usage: 0..100 = reported percentage,
+ * PD_KV_USAGE_UNKNOWN = the scraper saw no usage family in this sample. The
+ * bridge maps it onto ep_load_tracker_t.kv_usage_enc (pct + 1, 0 = unknown). */
+#define PD_KV_USAGE_UNKNOWN 0xFF
 
 /* Radix trie for cache-aware prefill EP selection (Tier 1) */
 typedef struct pd_trie pd_trie_t;

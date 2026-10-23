@@ -790,6 +790,28 @@ extern void llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port
                                       int ep_index, uint32_t num_gpu_blocks);
 
 /**
+ * llb_ai_update_ep_kv_usage – update per-EP decode KV-cache pressure from the
+ * Go vLLM scraper (vllm:kv_cache_usage_perc / gpu_cache_usage_perc /
+ * sglang:token_usage, mean across DP children, as a percentage). Same traversal
+ * and locking as llb_ai_update_ep_capacity (PROXY_LOCK + atomic_store,
+ * MAX_PROXY_EP bound, pd_disagg + n_eps guard) and, like it, does NOT stamp
+ * last_update_ts: the queue-depth bridge called from the same scraper sample
+ * owns that stamp, so pd_queued_is_fresh is the freshness guard for this
+ * value too. Consumed by pd_select_decode_excluding when
+ * LLB_PD_DECODE_KV_WEIGHT > 0.
+ *
+ * Parameters:
+ *   service_ip   service VIP (identifies which proxy_epval_t)
+ *   service_port service port
+ *   ep_index     endpoint index within the service
+ *   kv_usage_pct 0..100 = reported percentage; PD_KV_USAGE_UNKNOWN (0xFF) =
+ *                the sample carried no usage family. Stored as pct + 1 so the
+ *                zero-filled pool reads as unknown (any value > 100 is unknown).
+ */
+extern void llb_ai_update_ep_kv_usage(uint32_t service_ip, uint16_t service_port,
+                                      int ep_index, uint32_t kv_usage_pct);
+
+/**
  * llb_ai_ctrl_update_ep –: store the global-AI-controller
  * advisory packed instruction word for one EP. Mirrors
  * llb_ai_update_ep_queue_depth exactly (PROXY_LOCK + atomic_store, MAX_PROXY_EP

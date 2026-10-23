@@ -1373,6 +1373,38 @@ pd_kv_loadguard_on(void)
   return v;
 }
 
+/* Decode KV-pressure weight (cached getenv, read once — same pattern as
+ * pd_kv_loadguard_on above, so a change needs a restart to take effect).
+ *   LLB_PD_DECODE_KV_WEIGHT=W   0 (default) = off: pd_select_decode_excluding's
+ *                              score loop is the shipped conns + queued, and
+ *                              kv_usage_enc is never loaded.
+ *                              1..1000 = "virtual in-flight requests a decode
+ *                              EP at 100 % KV usage carries": the score gains
+ *                              (kv_eff * W) / 100, kv_eff being the EP's own
+ *                              fresh reading or, when unknown/stale, the mean of
+ *                              the fresh readings in the candidate set (neutral).
+ * Values above 1000 clamp to 1000; anything unparsable or negative reads as 0.
+ * Until the REST knob lands (plan §4 PR-4) this is the only switch. */
+#define PD_DECODE_KV_WEIGHT_MAX 1000
+static uint32_t
+pd_decode_kv_weight(void)
+{
+  static int cached = -1;
+  int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+  if (v >= 0) return (uint32_t)v;
+  const char *e = getenv("LLB_PD_DECODE_KV_WEIGHT");
+  v = 0;
+  if (e && *e) {
+    char *end = NULL;
+    errno = 0;
+    long w = strtol(e, &end, 10);
+    if (errno == 0 && end != e && *end == '\0' && w > 0)
+      v = (w > PD_DECODE_KV_WEIGHT_MAX) ? PD_DECODE_KV_WEIGHT_MAX : (int)w;
+  }
+  __atomic_store_n(&cached, v, __ATOMIC_RELEASE);
+  return (uint32_t)v;
+}
+
 /* distinct return for "all prefill EPs at in-flight cap". Normally provided
  * by sockproxy.h, but under the unit-test guards (TEST_PD_CACHE_AWARE) sockproxy.h is
  * not included, so define it here too (idempotent #ifndef). */
@@ -1592,6 +1624,24 @@ pd_queued_or_fill(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_fill,
   if (!pd_queued_is_fresh(ld, now_sec, stale_ms))
     return stale_fill;
   return atomic_load(&ld->queued_requests);
+}
+
+/* Decode KV-pressure reading. kv_usage_enc is pct + 1 with 0 = never reported
+ * (the zero-filled pool), so "reported 0 %" (enc 1) and "unknown" (enc 0) are
+ * distinct. Returns 1 and the percentage when the EP has a FRESH reading —
+ * freshness is the queue-depth stamp, which the same scraper sample writes —
+ * and 0 (pct_out untouched) when it is unknown or stale; the caller then
+ * substitutes the neutral fill. Only called when LLB_PD_DECODE_KV_WEIGHT > 0,
+ * so the W == 0 path never loads kv_usage_enc. */
+static inline int
+pd_kv_usage_fresh(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_ms,
+                  uint32_t *pct_out)
+{
+  uint8_t enc = atomic_load(&ld->kv_usage_enc);
+  if (enc == 0 || enc > 101) return 0;
+  if (!pd_queued_is_fresh(ld, now_sec, stale_ms)) return 0;
+  *pct_out = (uint32_t)enc - 1;
+  return 1;
 }
 
 /* ===========================================================================
@@ -2313,6 +2363,14 @@ pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_o
   uint64_t q_now_sec = pd_now_ns() / 1000000000ULL;
   uint64_t fresh_q_sum = 0;
   int fresh_q_n = 0;
+  /* Decode KV pressure (plan A3): off by default. With kv_w == 0 the two
+   * loops below are the shipped min-load scorer and kv_usage_enc is never
+   * loaded; with kv_w > 0 the fresh-and-reported readings are averaged in the
+   * same pass as the queue fill, and each candidate's score gains
+   * (kv_eff * kv_w) / 100 where kv_eff is its own reading or that mean. */
+  uint32_t kv_w = pd_decode_kv_weight();
+  uint64_t fresh_kv_sum = 0;
+  int fresh_kv_n = 0;
   for (int i = 0; i < tepval->n_eps; i++) {
     if ((excluded & (UINT32_C(1) << i)) ||
         tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
@@ -2321,8 +2379,20 @@ pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_o
     if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec, tepval->fc.cfg.telemetry_stale_ms)) continue;
     fresh_q_sum += atomic_load(&tepval->pd_ep_loads[i].queued_requests);
     fresh_q_n++;
+    if (kv_w) {
+      uint32_t kv_pct;
+      if (pd_kv_usage_fresh(&tepval->pd_ep_loads[i], q_now_sec,
+                            tepval->fc.cfg.telemetry_stale_ms, &kv_pct)) {
+        fresh_kv_sum += kv_pct;
+        fresh_kv_n++;
+      }
+    }
   }
   uint32_t stale_fill = fresh_q_n ? (uint32_t)(fresh_q_sum / (uint64_t)fresh_q_n) : 0;
+  /* Neutral kv term for an unknown/stale candidate: the fleet mean of the
+   * fresh readings, 0 when nobody reports (then the kv term is 0 for every
+   * candidate and the pick is the shipped one, exactly as with kv_w == 0). */
+  uint32_t kv_fill = fresh_kv_n ? (uint32_t)(fresh_kv_sum / (uint64_t)fresh_kv_n) : 0;
   for (int i = 0; i < tepval->n_eps; i++) {
     if ((excluded & (UINT32_C(1) << i)) ||
         tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
@@ -2332,6 +2402,12 @@ pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_o
     uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill,
                                         tepval->fc.cfg.telemetry_stale_ms);
     uint64_t score = (uint64_t)conns + (uint64_t)queued;
+    if (kv_w) {
+      uint32_t kv_eff = kv_fill;
+      pd_kv_usage_fresh(&tepval->pd_ep_loads[i], q_now_sec,
+                        tepval->fc.cfg.telemetry_stale_ms, &kv_eff);
+      score += ((uint64_t)kv_eff * (uint64_t)kv_w) / 100ULL;
+    }
     if (score < best_score) { best_score = score; n_cand = 0; }
     if (score == best_score) candidates[n_cand++] = i;
   }

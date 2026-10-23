@@ -138,6 +138,7 @@ typedef struct {
   int ep_available;
   _Atomic uint32_t num_gpu_blocks;
   _Atomic uint32_t swap_pressure;
+  _Atomic uint8_t  kv_usage_enc;     /* decode KV pressure: 0 = unknown, 1..101 = pct + 1 */
 } ep_load_tracker_t;
 
 typedef struct llm_prefix_key {

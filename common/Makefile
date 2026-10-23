@@ -881,6 +881,7 @@ test_pd_cache_aware: test_pd_cache_aware.c sockproxy_pd.c sockproxy_pd_trie.c
 test_pd_cache: test_pd_cache_aware
 	./test_pd_cache_aware
 	LLB_PD_MAX_INFLIGHT_PER_EP=4 ./test_pd_cache_aware cap
+	LLB_PD_DECODE_KV_WEIGHT=8 ./test_pd_cache_aware kv
 
 # Phase 6: KV-cache exact routing unit tests (CBOR encoding + hash parity)
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
