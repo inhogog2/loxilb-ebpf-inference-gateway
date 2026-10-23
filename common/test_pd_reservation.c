@@ -30,6 +30,12 @@ void llb_ai_pd_tier_selected(char *m, int tier)
   (void)m;
   (void)tier;
 }
+void llb_ai_pd_decode_selected(char *m, int path, int kv_fill)
+{
+  (void)m;
+  (void)path;
+  (void)kv_fill;
+}
 void llb_sockproxy_emit_sync_event(const proxy_sync_event_t *event)
 {
   (void)event;

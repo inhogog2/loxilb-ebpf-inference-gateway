@@ -165,6 +165,7 @@ typedef struct proxy_epval {
   uint8_t  kv_exact_mode;
   _Atomic uint32_t pd_tier2_rr;
   _Atomic uint32_t pd_decode_rr;
+  _Atomic uint8_t  pd_kv_fill_state;  /* plan A4: [PD_DEC] fill transition state (sockproxy.h) */
   uint32_t pd_session_ttl_sec;
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP];
 

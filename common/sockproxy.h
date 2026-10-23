@@ -719,6 +719,12 @@ typedef struct proxy_epval {
   uint8_t  pd_balance_abs_threshold;   // default 3
   _Atomic uint32_t pd_tier2_rr;       // RR tie-breaker for Tier 2 min-load
   _Atomic uint32_t pd_decode_rr;      // RR tie-breaker for decode EP tie-breaking (P2 fix: TB3/TB4)
+  // Decode KV-pressure fill state, for the one-shot [PD_DEC] transition log
+  // only (never read by a selection): 0 = the last scored selection had a
+  // fresh reading on every candidate (or LLB_PD_DECODE_KV_WEIGHT is 0 / no
+  // selection scored yet), 1 = a neutral fill was in effect. Zero-filled at
+  // allocation; written only by pd_select_decode's score path.
+  _Atomic uint8_t  pd_kv_fill_state;
   uint32_t pd_session_ttl_sec;         // P/D sliding idle TTL in seconds; 0=default 300s
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP]; // independent of chwbl_config_t
 
