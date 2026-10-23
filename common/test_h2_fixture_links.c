@@ -24,6 +24,21 @@ void abort(void);
 /* The header guard: every header value of the test requests is valid. */
 int l7_hdr_value_valid(const char *value) { (void)value; return 1; }
 
+/* The response record of one stream (sockproxy_http.c resp_note_write_
+ * through proxy_h2_note_stream_response): kept here for the tests to read —
+ * how many notes, the last status, and whether the last one sampled TTFB
+ * (1 for a backend reply, 0 for an answer the gateway wrote). */
+int h2fx_notes, h2fx_note_status, h2fx_note_ttfb;
+int
+proxy_h2_note_stream_response(void *stream, unsigned short status, int sample_ttfb)
+{
+  (void)stream;
+  h2fx_notes++;
+  h2fx_note_status = status;
+  h2fx_note_ttfb = sample_ttfb;
+  return 1;
+}
+
 /* The lookup host: the authority without its port, as the product does. */
 void
 strip_port_from_hostname(const char *in, char *out, unsigned long size)

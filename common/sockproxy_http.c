@@ -1551,19 +1551,21 @@ proxy_usage_ops(proxy_fd_ent_t *pfe)
   return &pd_dialect_plain;
 }
 
-/* The one writer of the client-visible response record: the status
- * (metric_response_status), the responses-by-status class counter and, when
- * sample_ttfb, the TTFB sample, taken now. Once per request: the latch makes
- * a second call for the same request a no-op (sockproxy_resp_note.h).
- * Returns 1 when it recorded. Reached only through the two wrappers below,
+/* The one writer of the client-visible response record: the
+ * responses-by-status class counter and, when sample_ttfb, the TTFB sample,
+ * taken now from req_start_ns. Once per request, or per HTTP/2 stream: the
+ * latch handed to it makes a second call for the same request a no-op
+ * (sockproxy_resp_note.h). Returns 1 when it recorded. Reached only through
+ * the wrappers below — proxy_note_response_ for an HTTP/1.1 connection,
+ * proxy_h2_note_stream_response for one HTTP/2 stream — and through theirs,
  * whose names say which kind of response a site records. */
 static int
-proxy_note_response_(proxy_fd_ent_t *pfe, uint16_t status, int sample_ttfb)
+resp_note_write_(uint8_t *noted, uint64_t req_start_ns, uint16_t status,
+                 int sample_ttfb)
 {
-  int take = pfe ? resp_note_take(&pfe->metric_resp_noted, sample_ttfb) : 0;
+  int take = resp_note_take(noted, sample_ttfb);
 
   if (!take) return 0;
-  pfe->metric_response_status = status;
   // Every final or interim status counts in the total; 1xx has no class.
   atomic_fetch_add(&global_stats.http_responses_total, 1);
   switch (resp_status_class(status)) {
@@ -1576,11 +1578,37 @@ proxy_note_response_(proxy_fd_ent_t *pfe, uint16_t status, int sample_ttfb)
   // TTFB latency — recorded unconditionally (see request-start capture in
   // handle_on_message_complete); the histogram is a first-class L7 metric,
   // not gated behind the optional HAVE_HTTP_TRACE trace subsystem.
-  if ((take & RESP_NOTE_TTFB) && pfe->metric_req_start_ns > 0) {
-    uint64_t latency_us = (get_timestamp_ns() - pfe->metric_req_start_ns) / 1000;
+  if ((take & RESP_NOTE_TTFB) && req_start_ns > 0) {
+    uint64_t latency_us = (get_timestamp_ns() - req_start_ns) / 1000;
     record_latency_sample(latency_us);
   }
   return 1;
+}
+
+/* The record of an HTTP/1.1 connection's current request: the writer with
+ * the request's latch and start, then the status (metric_response_status). */
+static int
+proxy_note_response_(proxy_fd_ent_t *pfe, uint16_t status, int sample_ttfb)
+{
+  if (!pfe ||
+      !resp_note_write_(&pfe->metric_resp_noted, pfe->metric_req_start_ns,
+                        status, sample_ttfb))
+    return 0;
+  pfe->metric_response_status = status;
+  return 1;
+}
+
+/* The record of one HTTP/2 stream: the writer with the stream's latch and
+ * the time of its request's END_STREAM. The stream's status for its settle
+ * (metric_response_status) is the caller's, as on HTTP/2 it always was. */
+int
+proxy_h2_note_stream_response(proxy_h2_stream_t *stream, uint16_t status,
+                              int sample_ttfb)
+{
+  if (!stream)
+    return 0;
+  return resp_note_write_(&stream->metric_resp_noted,
+                          stream->metric_req_start_ns, status, sample_ttfb);
 }
 
 /* Record a backend reply the client receives, with its TTFB sample. Called

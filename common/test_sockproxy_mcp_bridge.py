@@ -48,6 +48,7 @@ typedef struct {
 static unsigned checks;
 #define CHECK(x) do {checks++;if(!(x)){fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);abort();}} while(0)
 static proxy_h2_stream_t *find_stream(proxy_h2_session_t *s,int id) {(void)id;return &s->stream;}
+static int h2_note_backend_response(proxy_h2_stream_t *s,unsigned short st) {(void)s;(void)st;return 1;}
 static void clear_headers(stream_mapping_t *m) {
  for(size_t i=0;i<m->response_headers_count;i++){free(m->response_headers[i].name);free(m->response_headers[i].value);}
  free(m->response_headers);m->response_headers=NULL;m->response_headers_count=0;

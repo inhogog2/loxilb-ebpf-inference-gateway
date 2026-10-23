@@ -424,5 +424,20 @@ fresh
 mut sockproxy_http.c '  return resp_status_is_answer(status);' '  return status >= 100;'
 expect "1g: the framer decides on its own" "cresp_is_answer must decide by resp_status_is_answer"
 
+# 1c: a wrapper counts a class beside the writer.
+fresh
+mut sockproxy_http.c '  pfe->metric_response_status = status;
+  return 1;
+}' '  pfe->metric_response_status = status;
+  atomic_fetch_add(&global_stats.http_status_5xx, 1);
+  return 1;
+}'
+expect "1c: the HTTP/1.1 wrapper counts around the writer" "a response record outside proxy_note_response_"
+
+# 1c: the HTTP/2 wrapper hands the writer the connection's latch, not the stream's.
+fresh
+mut sockproxy_http.c '  return resp_note_write_(&stream->metric_resp_noted,' '  return resp_note_write_(&((proxy_fd_ent_t *)0)->metric_resp_noted,'
+expect "1c: the HTTP/2 wrapper does not hand the stream's latch" "proxy_h2_note_stream_response must hand the writer its own latch and start"
+
 echo "check_pd_status_sites.sh mutations: $((n - survived)) of $n killed"
 [ "$survived" = "0" ]

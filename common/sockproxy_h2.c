@@ -67,6 +67,23 @@ static int proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 static int h2_send_local_refusal(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream, int stage, int status_code, const char *model, const char *error_code, const char *error_msg);
 static int h2_send_local_outage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream, int status_code, const char *error_code, const char *error_msg);
 
+/* The client-visible response record of one stream (sockproxy_http.c
+ * resp_note_write_, through proxy_h2_note_stream_response): the
+ * responses-by-status class count and, for a backend reply, the TTFB sample
+ * from the request's END_STREAM. Once per stream. The HTTP/2 twins of
+ * proxy_note_client_response and proxy_note_local_answer; check_local_answers.sh
+ * rule 2 holds every note in this file to these two. */
+static int
+h2_note_backend_response(proxy_h2_stream_t *stream, uint16_t status)
+{
+  return proxy_h2_note_stream_response(stream, status, 1);
+}
+static int
+h2_note_local_answer(proxy_h2_stream_t *stream, uint16_t status)
+{
+  return proxy_h2_note_stream_response(stream, status, 0);
+}
+
 // ============================================================================
 // HTTP/2 BACKPRESSURE WATERMARKS (same pattern as HTTP/1.1)
 // ============================================================================
@@ -676,16 +693,20 @@ proxy_h2_on_frame_recv_callback(nghttp2_session *session,
       if (stream) {
         stream->data_complete = 1;
         stream->state = H2_STREAM_HALF_CLOSED;
+        /* The request is whole: the TTFB base, as the HTTP/1.1 capture at
+         * its message end (handle_on_message_complete). */
+        stream->metric_req_start_ns = get_timestamp_ns();
       }
     }
     break;
-    
+
   case NGHTTP2_DATA:
     if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
       proxy_h2_stream_t *stream = find_stream(h2_sess, frame->hd.stream_id);
       if (stream) {
         stream->data_complete = 1;
         stream->state = H2_STREAM_HALF_CLOSED;
+        stream->metric_req_start_ns = get_timestamp_ns();
       }
     }
     break;
@@ -1534,17 +1555,23 @@ proxy_h2_backend_on_header_callback(nghttp2_session *session,
     return 0;
   }
 
-  /* AI settle: capture the backend :status for the request record — the
-   * same role the H1 response status-line capture plays. */
+  /* The backend :status: the client's response record (class count and
+   * TTFB, every stream, as the HTTP/1.1 status-line capture records every
+   * reply) and, for an AI-gateway stream, the status its settle records.
+   * A final status only: an interim 1xx is not the answer. */
   if (namelen == 7 && memcmp(name, ":status", 7) == 0 &&
       backend_session->client_session) {
     proxy_h2_stream_t *ai_stream =
       find_stream(backend_session->client_session, mapping->client_stream_id);
-    if (ai_stream && (ai_stream->ai_admitted || ai_stream->ai_unmetered) &&
-        valuelen > 0 && valuelen < 4) {
+    if (ai_stream && valuelen > 0 && valuelen < 4) {
       char st[4] = {0};
       memcpy(st, value, valuelen);
-      ai_stream->metric_response_status = atoi(st);
+      int status = atoi(st);
+      if (status >= 200) {
+        h2_note_backend_response(ai_stream, (uint16_t)status);
+        if (ai_stream->ai_admitted || ai_stream->ai_unmetered)
+          ai_stream->metric_response_status = status;
+      }
     }
   }
 
@@ -2227,7 +2254,12 @@ static int h2_h1_headers_done(llhttp_t *p)
           (m->response_headers_count-1)*sizeof(*m->response_headers));
   m->response_headers[0]=status_nv;
   proxy_h2_stream_t *stream=find_stream(bs->client_session,m->client_stream_id);
-  if (stream && p->status_code>=200) stream->metric_response_status=p->status_code;
+  if (stream && p->status_code>=200) {
+    /* An HTTP/1.1 backend's reply to an HTTP/2 client: the same record the
+     * HTTP/2 backend's :status takes above. */
+    h2_note_backend_response(stream, (uint16_t)p->status_code);
+    stream->metric_response_status=p->status_code;
+  }
   nghttp2_frame frame;memset(&frame,0,sizeof(frame));
   frame.hd.type=NGHTTP2_HEADERS;frame.hd.stream_id=1;
   return proxy_h2_backend_on_frame_recv_callback(NULL,&frame,bs)?-1:0;
@@ -3231,6 +3263,7 @@ proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
    * free the stream. */
   proxy_h2_stream_t *l7_stream = find_stream(pfe->h2_session, sid);
   if (l7_stream) {
+    h2_note_local_answer(l7_stream, (uint16_t)status_code);
     if (location && location[0])
       l7_stream->metric_response_status = status_code;
     else
@@ -3330,6 +3363,10 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     return -1;
 
   int32_t stream_id = stream->stream_id;
+
+  /* Every refusal and outage frame passes here: the class count of an answer
+   * the gateway wrote, no TTFB sample (rule 2). */
+  h2_note_local_answer(stream, (uint16_t)status_code);
 
   char status_str[8];
   char retry_str[16];

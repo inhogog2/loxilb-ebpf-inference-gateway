@@ -109,16 +109,27 @@ if ! grep -A3 '^cresp_is_answer(' ./sockproxy_http.c | grep -q 'return resp_stat
 fi
 
 # 1c. The writer is the only one of the class counters and the TTFB sample,
-#     so no path can record a response around it (or twice). The product
-#     sources are the paths; a test fixture that links sockproxy_http.c
-#     defines the sample as a no-op boundary (test_pd_retry_lifecycle.c), and
-#     a definition records nothing.
-h_from=$(grep -n '^proxy_note_response_(' ./sockproxy_http.c | head -1 | cut -d: -f1)
+#     so no path can record a response around it (or twice). It takes the
+#     latch it is handed; the HTTP/1.1 wrapper hands the request's, the
+#     HTTP/2 wrapper the stream's. The product sources are the paths; a test
+#     fixture that links sockproxy_http.c defines the sample as a no-op
+#     boundary (test_pd_retry_lifecycle.c), and a definition records nothing.
+h_from=$(grep -n '^resp_note_write_(' ./sockproxy_http.c | head -1 | cut -d: -f1)
 h_to=$(awk -v f="${h_from:-0}" 'NR > f && /^}/ {print NR; exit}' ./sockproxy_http.c)
-if [ -z "$h_from" ] || ! sed -n "${h_from},${h_to}p" ./sockproxy_http.c | grep -q 'resp_note_take(&pfe->metric_resp_noted'; then
-  echo "sockproxy_http.c: proxy_note_response_ must take the once-per-request latch (resp_note_take)"
+if [ -z "$h_from" ] || ! sed -n "${h_from},${h_to}p" ./sockproxy_http.c | grep -q 'resp_note_take(noted, sample_ttfb)'; then
+  echo "sockproxy_http.c: resp_note_write_ must take the once-per-request latch it is handed (resp_note_take)"
   fail=1
 fi
+for w in 'proxy_note_response_:resp_note_write_(&pfe->metric_resp_noted, pfe->metric_req_start_ns' \
+         'proxy_h2_note_stream_response:resp_note_write_(&stream->metric_resp_noted'; do
+  w_fn=${w%%:*}; w_pat=${w#*:}
+  w_from=$(grep -n "^${w_fn}(" ./sockproxy_http.c | head -1 | cut -d: -f1)
+  w_to=$(awk -v f="${w_from:-0}" 'NR > f && /^}/ {print NR; exit}' ./sockproxy_http.c)
+  if [ -z "$w_from" ] || ! sed -n "${w_from},${w_to}p" ./sockproxy_http.c | grep -qF "$w_pat"; then
+    echo "sockproxy_http.c: $w_fn must hand the writer its own latch and start: $w_pat"
+    fail=1
+  fi
+done
 outside=$(grep -nE 'global_stats\.http_(responses_total|status_[1-5]xx)|record_latency_sample\(' ./*.c \
             | grep -v '^\./sockproxy_metrics\.c:' | grep -v '^\./test_' \
             | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(\*|/\*|//)' \

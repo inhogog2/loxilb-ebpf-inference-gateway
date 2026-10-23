@@ -1872,6 +1872,13 @@ int proxy_note_local_answer(struct proxy_fd_ent *pfe, uint16_t status);
 /* proxy_note_local_answer for a refusal: also marks the request recorded, so
  * no completion is owed beside its deny record. */
 int proxy_note_local_refusal(struct proxy_fd_ent *pfe, uint16_t status);
+/* The same record for one HTTP/2 stream: its class count and, when
+ * sample_ttfb (a backend reply), the TTFB sample from the request's
+ * END_STREAM. Once per stream. Reached through sockproxy_h2.c's two wrappers,
+ * h2_note_backend_response and h2_note_local_answer. */
+struct proxy_h2_stream;
+int proxy_h2_note_stream_response(struct proxy_h2_stream *stream, uint16_t status,
+                                  int sample_ttfb);
 
 static inline int
 proxy_status_is_2xx(unsigned int status)

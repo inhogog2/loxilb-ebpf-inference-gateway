@@ -166,6 +166,8 @@ typedef struct proxy_h2_stream {
                                      // (mirrors PROXY_USAGE_TAIL_KEEP)
   uint16_t usage_tail_len;
   uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
+  uint64_t metric_req_start_ns;      // the request's END_STREAM: the TTFB base (sockproxy_http.c resp_note_write_)
+  uint8_t  metric_resp_noted;        // 1 = this stream's client-visible response is recorded (the once-per-stream latch)
   int      metric_response_status;   // :status the client got: the backend's, or a local outage answer's (0 = unseen)
   uint8_t  response_is_sse;           // final response media type, per stream
   uint8_t  fc_first_data_seen;       // the first response DATA chunk was looked at for TTFT
