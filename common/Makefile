@@ -524,6 +524,11 @@ check_local_answers:
 	sh ./check_local_answers.sh
 	sh ./check_local_answers_mutations.sh
 
+.PHONY: check_deadline_init_order
+check_deadline_init_order:
+	sh ./check_deadline_init_order.sh
+	sh ./check_deadline_init_order_mutations.sh
+
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
 # sockproxy_cookie.h primitives, links -lssl -lcrypto (the already-linked HMAC).

@@ -1199,11 +1199,11 @@ proxy_fc_deadline_thread(void *arg)
 
   (void)arg;
   g_llb_proxy_worker = 1;
-  if (fc_deadline_init(d) != 0) {
-    log_error("[AIGateway] queue deadline timer: timerfd_create failed (%s); "
-              "deadlines run on the 1 Hz health pass", strerror(errno));
+  /* The timer was opened by proxy_main before this thread was created (the
+   * open and the drain checker's read of tfd must not race); no timer, no
+   * thread: the 1 Hz pass owes the deadlines then. */
+  if (d->tfd <= 0)
     return NULL;
-  }
   log_info("[AIGateway] queue deadline timer on: windows are enforced at %llu ms "
            "granularity", (unsigned long long)(FC_DEADLINE_GRAIN_NS / 1000000ULL));
   for (;;) {
