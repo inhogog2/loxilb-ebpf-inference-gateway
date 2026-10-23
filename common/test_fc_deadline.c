@@ -186,6 +186,9 @@ test_window_is_enforced_per_pool(fc_deadline_t *d)
     printf("  re-arm: a later park with an earlier deadline fired at %llu ms\n",
            (unsigned long long)((expired[1].at - t1) / 1000000ULL));
     fc_state_destroy(&c);
+    /* c leaves with its block: the pass must not read it again. */
+    pools[2] = NULL;
+    npools = 2;
   }
 
   /* b's wait ends at its window too; then nothing waits anywhere: the
