@@ -640,6 +640,33 @@ extern void llb_ai_pd_session_hit(char *model_name);
 extern void llb_ai_pd_tier_selected(char *model_name, int tier);
 
 /*
+ * llb_ai_pd_decode_selected – record one terminal P/D decode selection.
+ *
+ * C sockproxy calls this exactly once per successful pd_select_decode: at
+ * admission, at the mid-cycle prefill-connect failover and at the SGLang pair
+ * retry. The vLLM connect-time path (pd_connect_decode) re-reads the admission
+ * choice through pd_select_decode_excluding and records nothing: that call is
+ * a confirmation of a selection already counted, not a selection. Admission
+ * outcomes (parked, no-capacity) and a selector that found no decode EP never
+ * call it, so per window: decode selections == sum over the three paths.
+ *
+ * Parameters:
+ *   model_name  effective model name (NUL-terminated; "" for model-less),
+ *               the same fallback as llb_ai_pd_tier_selected
+ *   path        0 = hint: the session-pinned decode EP was kept;
+ *               1 = score: the min-load scorer picked (with
+ *                   LLB_PD_DECODE_KV_WEIGHT unset, every scored pick);
+ *               2 = score_kv: the weight is set and the KV-pressure term
+ *                   changed the set of minimum-score candidates, so the
+ *                   pick is one the shipped scorer would not have made
+ *   kv_fill     1 when the weight is set and at least one scored candidate
+ *               had no fresh KV reading and took the neutral fill (the
+ *               "signal is broken" indicator); 0 otherwise, and always 0 on
+ *               the hint path, which scores nothing
+ */
+extern void llb_ai_pd_decode_selected(char *model_name, int path, int kv_fill);
+
+/*
  * llb_ai_normal_session_hit – record a normal-mode session-stickiness cache hit.
  *
  * C sockproxy calls this when PRIORITY 0 (learned conv_map lookup) succeeds
@@ -788,6 +815,28 @@ extern void llb_ai_update_ep_queue_depth(uint32_t service_ip, uint16_t service_p
  */
 extern void llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port,
                                       int ep_index, uint32_t num_gpu_blocks);
+
+/**
+ * llb_ai_update_ep_kv_usage – update per-EP decode KV-cache pressure from the
+ * Go vLLM scraper (vllm:kv_cache_usage_perc / gpu_cache_usage_perc /
+ * sglang:token_usage, mean across DP children, as a percentage). Same traversal
+ * and locking as llb_ai_update_ep_capacity (PROXY_LOCK + atomic_store,
+ * MAX_PROXY_EP bound, pd_disagg + n_eps guard) and, like it, does NOT stamp
+ * last_update_ts: the queue-depth bridge called from the same scraper sample
+ * owns that stamp, so pd_queued_is_fresh is the freshness guard for this
+ * value too. Consumed by pd_select_decode_excluding when
+ * LLB_PD_DECODE_KV_WEIGHT > 0.
+ *
+ * Parameters:
+ *   service_ip   service VIP (identifies which proxy_epval_t)
+ *   service_port service port
+ *   ep_index     endpoint index within the service
+ *   kv_usage_pct 0..100 = reported percentage; PD_KV_USAGE_UNKNOWN (0xFF) =
+ *                the sample carried no usage family. Stored as pct + 1 so the
+ *                zero-filled pool reads as unknown (any value > 100 is unknown).
+ */
+extern void llb_ai_update_ep_kv_usage(uint32_t service_ip, uint16_t service_port,
+                                      int ep_index, uint32_t kv_usage_pct);
 
 /**
  * llb_ai_ctrl_update_ep –: store the global-AI-controller

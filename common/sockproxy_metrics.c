@@ -421,6 +421,45 @@ llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port,
 }
 
 /*
+ * llb_ai_update_ep_kv_usage - update per-EP decode KV-cache pressure from the
+ * Go vLLM scraper. Same traversal shape as llb_ai_update_ep_capacity above
+ * (PROXY_LOCK + atomic_store, MAX_PROXY_EP bound, pd_disagg + n_eps guard) and
+ * the same deliberate asymmetry: this writer does NOT stamp last_update_ts
+ * (see the capacity bridge's comment for why that would break the staleness
+ * guard). The queue-depth bridge, called from the same scraper sample, owns
+ * the stamp, so a kv value is exactly as fresh as the queue depth beside it.
+ *
+ * Encoding: the cgo contract is 0..100 or PD_KV_USAGE_UNKNOWN (0xFF). The
+ * field stores pct + 1 so that 0 — the value of a zero-filled pool that no
+ * scraper has ever written (sp_pool_alloc memset; pd_ep_loads[] has no init
+ * site) — means "unknown". Any out-of-range input is stored as unknown rather
+ * than clamped: a broken signal must never look like a reading.
+ */
+void
+llb_ai_update_ep_kv_usage(uint32_t service_ip, uint16_t service_port,
+                          int ep_index, uint32_t kv_usage_pct)
+{
+  uint8_t enc = (kv_usage_pct <= 100) ? (uint8_t)(kv_usage_pct + 1) : 0;
+
+  if (!proxy_struct || ep_index < 0 || ep_index >= MAX_PROXY_EP) return;
+
+  PROXY_LOCK();
+  proxy_map_ent_t *node = proxy_struct->head;
+  while (node) {
+    if (node->key.xip == service_ip && node->key.xport == service_port) {
+      proxy_epval_t *tepval = node->val.ephash;
+      if (tepval && tepval->pd_disagg_enabled && ep_index < tepval->n_eps) {
+        atomic_store(&tepval->pd_ep_loads[ep_index].kv_usage_enc, enc);
+      }
+      PROXY_UNLOCK();
+      return;
+    }
+    node = node->next;
+  }
+  PROXY_UNLOCK();
+}
+
+/*
  * llb_ai_ctrl_update_ep -: store the global-controller advisory
  * packed instruction word for one EP (state bits 31-24, weight bits 7-0 — see
  * PD_CTRL_* in sockproxy.h). Byte-for-byte mirror of llb_ai_update_ep_queue_depth

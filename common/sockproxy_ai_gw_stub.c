@@ -342,6 +342,15 @@ llb_ai_pd_tier_selected(char *model_name, int tier)
 }
 
 __attribute__((weak)) void
+llb_ai_pd_decode_selected(char *model_name, int path, int kv_fill)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)model_name;
+    (void)path;
+    (void)kv_fill;
+}
+
+__attribute__((weak)) void
 llb_ai_normal_session_hit(char *model_name)
 {
     AI_GW_STUB_TRIPWIRE(warned);

@@ -112,6 +112,7 @@ typedef struct {
   int ep_available;
   _Atomic uint32_t num_gpu_blocks;
   _Atomic uint32_t swap_pressure;
+  _Atomic uint8_t  kv_usage_enc;     /* decode KV pressure: 0 = unknown, 1..101 = pct + 1 */
 } ep_load_tracker_t;
 
 typedef struct llm_prefix_key {
@@ -164,6 +165,7 @@ typedef struct proxy_epval {
   uint8_t  kv_exact_mode;
   _Atomic uint32_t pd_tier2_rr;
   _Atomic uint32_t pd_decode_rr;
+  _Atomic uint8_t  pd_kv_fill_state;  /* plan A4: [PD_DEC] fill transition state (sockproxy.h) */
   uint32_t pd_session_ttl_sec;
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP];
 
