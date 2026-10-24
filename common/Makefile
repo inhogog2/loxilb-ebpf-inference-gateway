@@ -209,7 +209,7 @@ sockproxy_pd_core.o: sockproxy_pd_core.c sockproxy_pd.h sockproxy.h
 
 # P/D vLLM sequential dialect machine
 sockproxy_pd_vllm.o: sockproxy_pd_vllm.c sockproxy_pd.h sockproxy.h \
-                     sockproxy_internal.h sockproxy_ai_gw.h
+                     sockproxy_internal.h sockproxy_ai_gw.h sockproxy_pd_receipt.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # P/D SGLang dual-dispatch dialect machine
@@ -290,7 +290,7 @@ llhttp.a: llhttp.o llhttpapi.o http.o
 	$(AR) rcs -c $@ $^
 
 # US-501: Request-ID generation and injection unit tests (standalone)
-test_request_id: test_request_id.c
+test_request_id: test_request_id.c sockproxy_pd_receipt.h
 	$(CC) -Wall -Wextra -o $@ $< -I. -DTEST_REQUEST_ID
 
 .PHONY: test_rid
