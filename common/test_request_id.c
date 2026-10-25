@@ -1,5 +1,5 @@
 /*
- * Unit tests for vLLM Request-ID generation and injection 
+ * Unit tests for vLLM Request-ID generation and injection
  * Build: gcc -Wall -Wextra -o test_request_id test_request_id.c -I. -DTEST_REQUEST_ID
  * Run:   ./test_request_id
  */
@@ -459,6 +459,154 @@ static void test_end_to_end(void) {
 
 /* ============ MAIN ============ */
 
+
+/* ---- P/D receipt rewrite (sockproxy_pd_receipt.h) ---- */
+#include "sockproxy_pd_receipt.h"
+
+#define RID_UUID "0123456789abcdef0123456789abcdef"
+#define RID_P    "10.0.1.1:9001"
+#define RID_D    "10.0.1.2:9002"
+#define RID_REQ_FMT "POST /v1/completions HTTP/1.1\r\nHost: vip\r\n" \
+                    "X-Request-Id: ___prefill_addr_%s___decode_addr_%s_" RID_UUID "\r\n" \
+                    "Content-Length: 12\r\n\r\n{\"body\":\"__\"}"
+
+static size_t rid_build(uint8_t *buf, size_t cap, const char *p, const char *d) {
+  int n = snprintf((char *)buf, cap, RID_REQ_FMT, p, d);
+  return n > 0 ? (size_t)n : 0;
+}
+
+/* The pre-F-5 helper, verbatim (loxilb-ebpf f515ab5, sockproxy_pd_vllm.c:56-75):
+ * the prefill retry's call must keep producing these exact bytes. */
+static int
+legacy_prefill_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
+{
+  uint8_t *he = memmem(buf, *len, "\r\n\r\n", 4);
+  size_t hdr_len = he ? (size_t)(he + 4 - buf) : 0;
+  char *tag = hdr_len ? memmem(buf, hdr_len, "___prefill_addr_", 16) : NULL;
+  char *a_start = tag ? tag + 16 : NULL;
+  char *a_end = a_start ? memmem(a_start, (size_t)((char *)buf + hdr_len - a_start),
+                                 "___decode_addr_", 15) : NULL;
+  if (!a_start || !a_end) return -1;
+
+  int n_len = (int)strlen(n_addr);
+  int o_len = (int)(a_end - a_start);
+  int shift = n_len - o_len;
+  if (n_len <= 0 || *len + (size_t)(shift > 0 ? shift : 0) > cap) return -1;
+  if (shift != 0) {
+    memmove(a_end + shift, a_end, *len - (size_t)(a_end - (char *)buf));
+    *len = (size_t)((ssize_t)*len + shift);
+  }
+  memcpy(a_start, n_addr, (size_t)n_len);
+  return 0;
+}
+
+static void test_receipt_decode_half_rewritten(void) {
+  TEST("receipt: decode half re-rendered, prefill half and uuid untouched (longer address)");
+  uint8_t buf[512], want[512];
+  size_t len = rid_build(buf, sizeof(buf), RID_P, RID_D);
+  size_t want_len = rid_build(want, sizeof(want), RID_P, "10.0.1.30:19004");
+  int rc = pd_receipt_rewrite(buf, &len, sizeof(buf), PD_RECEIPT_DECODE, "10.0.1.30:19004");
+  if (rc != 0) { FAIL("rc != 0"); return; }
+  if (len != want_len || memcmp(buf, want, len) != 0) { FAIL("bytes differ from the expected request"); return; }
+  if (!memmem(buf, len, "___prefill_addr_" RID_P "___decode_addr_10.0.1.30:19004_" RID_UUID "\r\n", 16 + 13 + 15 + 15 + 1 + 32 + 2)) { FAIL("receipt not as expected"); return; }
+  { static const char tail[] = "\r\n\r\n{\"body\":\"__\"}";
+    if (len < sizeof(tail) - 1 || memcmp(buf + len - (sizeof(tail) - 1), tail, sizeof(tail) - 1) != 0) { FAIL("body moved or damaged"); return; } }
+  PASS();
+}
+
+static void test_receipt_decode_half_shorter(void) {
+  TEST("receipt: decode half re-rendered with a shorter address (buffer shrinks, body intact)");
+  uint8_t buf[512], want[512];
+  size_t len = rid_build(buf, sizeof(buf), RID_P, "10.0.1.200:19002");
+  size_t want_len = rid_build(want, sizeof(want), RID_P, "10.0.1.3:9003");
+  int rc = pd_receipt_rewrite(buf, &len, sizeof(buf), PD_RECEIPT_DECODE, "10.0.1.3:9003");
+  if (rc != 0 || len != want_len || memcmp(buf, want, len) != 0) { FAIL("shrink rewrite differs"); return; }
+  PASS();
+}
+
+static void test_receipt_prefill_half_untouched_by_decode(void) {
+  TEST("receipt: a decode-half rewrite never moves the prefill half");
+  uint8_t buf[512];
+  size_t len = rid_build(buf, sizeof(buf), "192.168.100.250:65000", RID_D);
+  char *before = memmem(buf, len, "___prefill_addr_192.168.100.250:65000___decode_addr_", 52);
+  if (!before) { FAIL("setup"); return; }
+  size_t p_off = (size_t)((uint8_t *)before - buf);
+  if (pd_receipt_rewrite(buf, &len, sizeof(buf), PD_RECEIPT_DECODE, "1.2.3.4:5") != 0) { FAIL("rc"); return; }
+  if (memcmp(buf + p_off, "___prefill_addr_192.168.100.250:65000___decode_addr_1.2.3.4:5_" RID_UUID, 16 + 21 + 15 + 9 + 1 + 32) != 0) { FAIL("prefill half or uuid changed"); return; }
+  PASS();
+}
+
+static void test_receipt_noop_same_ep(void) {
+  TEST("receipt: no-op (rc 1, not a byte changed) when the decode EP did not change");
+  uint8_t buf[512], copy[512];
+  size_t len = rid_build(buf, sizeof(buf), RID_P, RID_D), len0 = len;
+  memcpy(copy, buf, len);
+  int rc = pd_receipt_rewrite(buf, &len, sizeof(buf), PD_RECEIPT_DECODE, RID_D);
+  if (rc != 1) { FAIL("rc != 1"); return; }
+  if (len != len0 || memcmp(buf, copy, len) != 0) { FAIL("buffer changed on a no-op"); return; }
+  PASS();
+}
+
+static void test_receipt_cap_respected(void) {
+  TEST("receipt: a longer address that would overflow cap is refused (rc -1) and leaves the buffer intact");
+  uint8_t buf[512], copy[512];
+  size_t len = rid_build(buf, sizeof(buf), RID_P, RID_D), len0 = len;
+  memcpy(copy, buf, len);
+  /* cap == len: zero slack, any growth must be refused */
+  int rc = pd_receipt_rewrite(buf, &len, len, PD_RECEIPT_DECODE, "10.0.1.2:19002");
+  if (rc != -1 || len != len0 || memcmp(buf, copy, len) != 0) { FAIL("overflow not refused cleanly"); return; }
+  /* cap == len + growth: exactly enough */
+  rc = pd_receipt_rewrite(buf, &len, len0 + 1, PD_RECEIPT_DECODE, "10.0.1.2:19002");
+  if (rc != 0 || len != len0 + 1) { FAIL("exact-fit growth refused"); return; }
+  PASS();
+}
+
+static void test_receipt_no_receipt(void) {
+  TEST("receipt: a client-supplied plain X-Request-Id has no receipt (rc -1, untouched)");
+  const char *req = "POST / HTTP/1.1\r\nX-Request-Id: client-abc-123\r\n\r\n{}";
+  uint8_t buf[256]; size_t len = strlen(req); memcpy(buf, req, len);
+  int rc = pd_receipt_rewrite(buf, &len, sizeof(buf), PD_RECEIPT_DECODE, "1.2.3.4:5");
+  if (rc != -1 || len != strlen(req) || memcmp(buf, req, len) != 0) { FAIL("plain id was touched"); return; }
+  PASS();
+}
+
+static void test_receipt_bare_id_copies(void) {
+  TEST("receipt: the pfe's bare id copies (vllm_request_id / resp_request_id) are re-rendered and NUL-terminated");
+  char id[256];
+  snprintf(id, sizeof(id), "___prefill_addr_%s___decode_addr_%s_%s", RID_P, RID_D, RID_UUID);
+  int rc = pd_receipt_rewrite_str(id, sizeof(id), PD_RECEIPT_DECODE, "10.0.1.30:19004");
+  if (rc != 0) { FAIL("rc"); return; }
+  if (strcmp(id, "___prefill_addr_" RID_P "___decode_addr_10.0.1.30:19004_" RID_UUID) != 0) { FAIL("bare id wrong"); return; }
+  if (pd_receipt_rewrite_str(id, sizeof(id), PD_RECEIPT_DECODE, "10.0.1.30:19004") != 1) { FAIL("second call not a no-op"); return; }
+  char empty[256] = "";
+  if (pd_receipt_rewrite_str(empty, sizeof(empty), PD_RECEIPT_DECODE, "1.2.3.4:5") != -1) { FAIL("empty id accepted"); return; }
+  PASS();
+}
+
+static void test_receipt_prefill_call_byte_identical(void) {
+  TEST("receipt: the prefill retry's call (PD_RECEIPT_PREFILL) is byte-identical to the pre-F-5 helper");
+  static const char *addrs[] = { "10.0.1.1:9001", "10.0.1.100:19001", "1.1.1.1:1", "172.16.0.9:8100" };
+  static const char *news[]  = { "10.0.1.50:9005", "1.2.3.4:5", "192.168.200.200:65535", "10.0.1.1:9001" };
+  for (size_t i = 0; i < 4; i++) for (size_t j = 0; j < 4; j++) {
+    uint8_t a[512], b[512];
+    size_t la = rid_build(a, sizeof(a), addrs[i], RID_D), lb = la;
+    memcpy(b, a, la);
+    int ra = legacy_prefill_rewrite(a, &la, sizeof(a), news[j]);
+    int rb = pd_receipt_rewrite(b, &lb, sizeof(b), PD_RECEIPT_PREFILL, news[j]);
+    /* rc differs only in the same-address case (legacy 0, new 1): the bytes must not */
+    if ((ra == 0) != (rb == 0 || rb == 1) || la != lb || memcmp(a, b, la) != 0) { FAIL("prefill rewrite diverged from the legacy bytes"); return; }
+    if (strcmp(addrs[i], news[j]) == 0 && rb != 1) { FAIL("same-address prefill call should be rc 1"); return; }
+    /* saved-headers shape: header block only, no body */
+    uint8_t *he = memmem(a, la, "\r\n\r\n", 4); size_t hl = (size_t)(he + 4 - a);
+    uint8_t sa[512], sb[512]; size_t lsa = hl, lsb = hl; memcpy(sa, a, hl); memcpy(sb, a, hl);
+    size_t l0 = rid_build(sa, sizeof(sa), addrs[i], RID_D); he = memmem(sa, l0, "\r\n\r\n", 4); lsa = (size_t)(he + 4 - sa); memcpy(sb, sa, lsa); lsb = lsa;
+    ra = legacy_prefill_rewrite(sa, &lsa, lsa + 80, news[j]);
+    rb = pd_receipt_rewrite(sb, &lsb, lsb + 80, PD_RECEIPT_PREFILL, news[j]);
+    if ((ra == 0) != (rb == 0 || rb == 1) || lsa != lsb || memcmp(sa, sb, lsa) != 0) { FAIL("saved-headers prefill rewrite diverged"); return; }
+  }
+  PASS();
+}
+
 int main(void) {
   printf("===: Request-ID Unit Tests ===\n\n");
 
@@ -483,6 +631,16 @@ int main(void) {
 
   /* End-to-end test */
   test_end_to_end();
+
+  /* P/D receipt rewrite (prefill retry half, connect-time decode fallback half) */
+  test_receipt_decode_half_rewritten();
+  test_receipt_decode_half_shorter();
+  test_receipt_prefill_half_untouched_by_decode();
+  test_receipt_noop_same_ep();
+  test_receipt_cap_respected();
+  test_receipt_no_receipt();
+  test_receipt_bare_id_copies();
+  test_receipt_prefill_call_byte_identical();
 
   printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;

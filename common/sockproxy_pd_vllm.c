@@ -47,33 +47,8 @@
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_pd_receipt.h"
 
-/* Rewrite the prefill address inside a P/D request-id receipt
- * (___prefill_addr_<ep>___decode_addr_<ep>_<uuid>) within an HTTP header
- * block. buf/len describe the full request; the search is bounded to the
- * header region. Returns 0 when a rewrite happened, -1 otherwise. */
-static int
-pd_receipt_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
-{
-  uint8_t *he = memmem(buf, *len, "\r\n\r\n", 4);
-  size_t hdr_len = he ? (size_t)(he + 4 - buf) : 0;
-  char *tag = hdr_len ? memmem(buf, hdr_len, "___prefill_addr_", 16) : NULL;
-  char *a_start = tag ? tag + 16 : NULL;
-  char *a_end = a_start ? memmem(a_start, (size_t)((char *)buf + hdr_len - a_start),
-                                 "___decode_addr_", 15) : NULL;
-  if (!a_start || !a_end) return -1;
-
-  int n_len = (int)strlen(n_addr);
-  int o_len = (int)(a_end - a_start);
-  int shift = n_len - o_len;
-  if (n_len <= 0 || *len + (size_t)(shift > 0 ? shift : 0) > cap) return -1;
-  if (shift != 0) {
-    memmove(a_end + shift, a_end, *len - (size_t)(a_end - (char *)buf));
-    *len = (size_t)((ssize_t)*len + shift);
-  }
-  memcpy(a_start, n_addr, (size_t)n_len);
-  return 0;
-}
 
 /* No backend request has been sent at this boundary. Once sending/streaming
  * starts, callers must use the terminal-error path, never replay the request. */
@@ -450,6 +425,38 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     goto out;
   }
 
+  /* The receipt in the saved headers names the decode EP selected at
+   * admission; pd_connect_decode may just have connected another one (a
+   * refused connect, a saturated candidate). Re-render the ___decode_addr_
+   * half in the request about to be written — the decode engine adopts this
+   * id and echoes it to the client — and in the gateway's own copies, which
+   * the completion and audit records read through proxy_request_id():
+   * vllm_request_id while the request is live, resp_request_id once the
+   * keep-alive reset of pd_setup_and_forward has snapshotted it. Same
+   * nixl_port-else-xport formatting as admission and as the prefill retry.
+   * A no-op when the EP did not change (rc 1) and when the client supplied
+   * its own X-Request-Id (no receipt, rc -1). Tokens, attempt budget and the
+   * CAS handoff are pd_connect_decode's and are not touched here. */
+  {
+    char n_addr[64];
+    struct in_addr n_in = { .s_addr = tepval->eps[d_idx].xip };
+    uint16_t n_port = tepval->eps[d_idx].nixl_port ?
+                      ntohs(tepval->eps[d_idx].nixl_port) :
+                      ntohs(tepval->eps[d_idx].xport);
+    snprintf(n_addr, sizeof(n_addr), "%s:%u", inet_ntoa(n_in), n_port);
+    if (pd_receipt_rewrite(decode_req, &decode_req_len, decode_req_cap,
+                           PD_RECEIPT_DECODE, n_addr) == 0) {
+      pd_receipt_rewrite_str(client_pfe->vllm_request_id,
+                             sizeof(client_pfe->vllm_request_id),
+                             PD_RECEIPT_DECODE, n_addr);
+      pd_receipt_rewrite_str(client_pfe->resp_request_id,
+                             sizeof(client_pfe->resp_request_id),
+                             PD_RECEIPT_DECODE, n_addr);
+      log_info("[PD_DECODE_CONNECT] client_fd=%d receipt decode half "
+               "re-rendered to %s (ep=%d)", client_fd, n_addr, d_idx);
+    }
+  }
+
   /* 5. Create backend pfe for decode connection */
   proxy_fd_ent_t *decode_pfe = pfe_alloc();   /* D2 root fix: pooled pfe shell */
   if (!decode_pfe) {
@@ -705,14 +712,15 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
                         ntohs(tepval->eps[new_idx].nixl_port) :
                         ntohs(tepval->eps[new_idx].xport);
       snprintf(n_addr, sizeof(n_addr), "%s:%u", inet_ntoa(n_in), n_port);
-      pd_receipt_rewrite(req, &req_len, req_cap, n_addr);
+      pd_receipt_rewrite(req, &req_len, req_cap, PD_RECEIPT_PREFILL, n_addr);
 
       size_t sh_cap = hdrs_len + 80;
       uint8_t *sh = malloc(sh_cap);
       if (sh) {
         memcpy(sh, hdrs, hdrs_len);
         size_t sh_len = hdrs_len;
-        if (pd_receipt_rewrite(sh, &sh_len, sh_cap, n_addr) == 0) {
+        if (pd_receipt_rewrite(sh, &sh_len, sh_cap, PD_RECEIPT_PREFILL,
+                               n_addr) == 0) {
           /* Single-owner swap (pd_free_claim discipline): a racing cleanup
            * claims-or-sees-NULL and never double-frees. */
           uint8_t *old_sh = __atomic_exchange_n(&client_pfe->pd_saved_headers,
