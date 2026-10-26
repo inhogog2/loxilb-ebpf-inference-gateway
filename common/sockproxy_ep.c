@@ -864,6 +864,8 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
                        "no endpoint named by the endpoint picker is usable");
     return frc == EPP_STAGE_LADDER ? EPP_PIN_LADDER : EPP_PIN_ERR;
   }
+}
+
 /* The model a request routes by, with or without a Host:
  *   0. the admission gate's body-first resolution. On enforcing services this
  *      is the model authorization was checked against; routing by anything
@@ -941,7 +943,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             "\r\n"
             "{\"error\":\"no_route\","
             "\"detail\":\"no rule on this listener (kept open after its last rule was deleted)\"}\r\n";
-        proxy_send_local_response(pfe, no_rule_resp, sizeof(no_rule_resp) - 1);
+        sp_send_local_outage(pfe, 503, no_rule_resp, sizeof(no_rule_resp) - 1);
         log_info("[PROXY_NO_ROUTE] 503 sent: listener %s:%u has no rule (kept after delete), fd=%d",
                  inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport), pfe->fd);
         pfe->lb_err_body_sent = 1;
