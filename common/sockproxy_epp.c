@@ -274,10 +274,9 @@ epp_send_error(proxy_fd_ent_t *pfe, int status, const char *code, const char *de
                "Connection: close\r\n"
                "\r\n%s", status, epp_reason(status), blen, blen ? body : "");
   if (n > 0 && n < (int)sizeof(resp)) {
-    proxy_record_local_completion(pfe, (uint16_t)status);
-    if (proxy_send_local_response_and_shutdown(pfe, resp, (size_t)n) != 0)
-      log_error("[EPP] fd=%d failed to send %d %s", pfe->fd, status, code);
     pfe->lb_err_body_sent = 1;
+    if (sp_send_local_outage(pfe, (uint16_t)status, resp, (size_t)n) != 0)
+      log_error("[EPP] fd=%d failed to send %d %s", pfe->fd, status, code);
   }
   log_info("[EPP] fd=%d answered %d %s: %s", pfe->fd, status, code, detail ? detail : "");
 }
@@ -300,10 +299,9 @@ epp_send_immediate(proxy_fd_ent_t *pfe, const struct epp_result *r)
       memcpy(resp + n, r->imm_body, (size_t)r->imm_body_len);
       n += r->imm_body_len;
     }
-    proxy_record_local_completion(pfe, (uint16_t)r->imm_code);
-    if (proxy_send_local_response_and_shutdown(pfe, resp, (size_t)n) != 0)
-      log_error("[EPP] fd=%d failed to send the EPP's %d", pfe->fd, r->imm_code);
     pfe->lb_err_body_sent = 1;
+    if (sp_send_local_outage(pfe, (uint16_t)r->imm_code, resp, (size_t)n) != 0)
+      log_error("[EPP] fd=%d failed to send the EPP's %d", pfe->fd, r->imm_code);
   }
   free(resp);
   log_info("[EPP] fd=%d sid=%llu EPP immediate response %d relayed", pfe->fd,

@@ -318,7 +318,7 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Content-Length: 80\r\n"
                    "Connection: close\r\n\r\n"
                    "{\"error\":\"epp_evicted\",\"detail\":\"the endpoint picker shed this request\"}\r\n", 1, 0),
-  [SP_REAP_EPP_EVICT_CUT] = { NULL, 0, 1, 0 },
+  [SP_REAP_EPP_EVICT_CUT] = { "", 0, 1, 0 },
   [SP_REAP_SSE_STALL] =
       SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
   [SP_REAP_FC_SHED] =

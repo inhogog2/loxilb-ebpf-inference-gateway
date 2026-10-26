@@ -98,8 +98,6 @@ sockproxy_h2.c:proxy_h2_send_l7_synthetic:l7_stream->metric_response_status = st
 sockproxy_h2.c:h2_send_local_refusal:h2_record_local_deny(pfe, stream, stage
 sockproxy_h2.c:h2_record_local_deny:ai_gw_record_local_deny(stage
 sockproxy_h2.c:h2_send_local_outage:stream->metric_response_status = status_code
-sockproxy_epp.c:epp_send_error:proxy_record_local_completion(pfe, (uint16_t)status)
-sockproxy_epp.c:epp_send_immediate:proxy_record_local_completion(pfe, (uint16_t)r->imm_code)
 '
 
 # A sender's own body calling the sender below it is its implementation.
