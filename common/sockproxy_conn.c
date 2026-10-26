@@ -54,6 +54,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_epp.h"
 #include "sockproxy_mcp_capture.h"
 #include "sockproxy_fe_limit.h"   /* connectionLimit unit release */
 #include "sockproxy_conn.h"
@@ -1273,6 +1274,14 @@ pfe_alloc_ex(int with_rcvbuf)
   /* -1 = "not parked" (the memset above zeroes it, but 0 is a valid
    * prefill EP index, so a zeroed park_ep_idx would falsely look parked-on-EP0). */
   pfe->park_ep_idx = -1;
+  pfe->epp_sid = 0;
+  pfe->epp_deadline_ns = 0;
+  pfe->epp_decided = 0;
+  pfe->epp_reported = 0;
+  pfe->epp_hdrs_reported = 0;
+  pfe->epp_served[0] = '\0';
+  pfe->epp_resp_head = NULL;
+  pfe->epp_resp_head_len = 0;
 
   return pfe;
 }
@@ -1672,6 +1681,10 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
 {
   proxy_destroy_xmitcache(fd_ent);
   proxy_connect_pending_clear(fd_ent);
+  /* A client that leaves with an EPP stream open: the EPP hears an abort
+   * now, exactly once, and a decision still waiting for it is dropped. */
+  if (fd_ent->odir == 0)
+    epp_request_end(fd_ent);
 
 #ifdef HAVE_DP_GPU_ROUTING
   /* Hand back the CHWBL/WRR_HASH unit this connection took when it routed.
@@ -1682,6 +1695,16 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   if (conn_holds_load_unit(fd_ent)) {
     proxy_epval_t *epv = (proxy_epval_t *)fd_ent->epv;
     chwbl_dec_runtime(epv, fd_ent->ep_num);
+    /* Given back once. This release runs twice for a client whose backend
+     * leg ends first: the leg's teardown releases its peer (the client)
+     * through proxy_release_rfd_ctx, then the client's own teardown comes
+     * here again. With ep_num left as it was the second pass took a unit
+     * the endpoint no longer owed - the "underflow protection" line, or,
+     * with another connection in flight on the same endpoint, that
+     * connection's unit (the cluster report of 2026-10-13, item 3). The
+     * keep-alive park and the parse-phase stale-unit guard already pair
+     * their release with ep_num = -1; so does this one. */
+    fd_ent->ep_num = -1;
   }
 #endif /* HAVE_DP_GPU_ROUTING */
 

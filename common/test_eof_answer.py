@@ -49,6 +49,7 @@ static void fc_permit_release(int *f) { (void)f; }
 static void hc_resp_done(proxy_fd_ent_t *p) { (void)p; }
 static void sp_hold_answer_ended(proxy_fd_ent_t *p) { (void)p; }
 static void sp_answer_msg_done(int *m) { (void)m; }
+static void epp_report_resp_eos(proxy_fd_ent_t *p) { (void)p; }
 ''' + prod + r'''
 static proxy_fd_ent_t client(int unframed) {
   proxy_fd_ent_t c; memset(&c, 0, sizeof(c));

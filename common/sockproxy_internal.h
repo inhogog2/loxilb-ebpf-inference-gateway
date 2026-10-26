@@ -202,6 +202,13 @@ ssize_t sp_raw_status_write(proxy_fd_ent_t *pfe, const void *buf, size_t len,
                             int flags);
 /* The 502 of a request no backend took, framed with its length. */
 int proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail);
+/* Request-header edits on a buffered HTTP/1.1 request (sockproxy_http.c):
+ * set replaces every existing line of `name` with one "name: value" line,
+ * remove strips them. 0 on success; -1 when the header block is not found,
+ * the field is unsafe (CR/LF) or the buffer has no room. */
+int sp_h1_req_header_set(uint8_t *buf, size_t *len, size_t bufsize,
+                         const char *name, const char *value);
+int sp_h1_req_header_remove(uint8_t *buf, size_t *len, const char *name);
 /* Responses the gateway writes itself, recorded as the client receives them
  * (sockproxy_http.c, "responses the gateway writes itself"). */
 int sp_send_local_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
@@ -243,6 +250,9 @@ enum sp_reap_resp {
   SP_REAP_PD_IDLE_TIMEOUT,      /* 504 pd_idle_timeout; teardown */
   SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
   SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
+  SP_REAP_EPP_TIMEOUT,          /* 503 epp_unavailable (no decision); teardown */
+  SP_REAP_EPP_EVICT_429,        /* 429 epp_evicted before any response byte; teardown */
+  SP_REAP_EPP_EVICT_CUT,        /* evicted mid-response: no text, teardown */
   SP_REAP_SSE_STALL,            /* SSE error event: client stopped reading; shutdown */
   SP_REAP_FC_SHED,              /* 429 admission_shed: evicted from the queue; teardown */
   SP_REAP_FC_TTL,               /* 429 admission_ttl_expired: the client's own TTL ended the wait (fc_llmd_headers on); teardown */

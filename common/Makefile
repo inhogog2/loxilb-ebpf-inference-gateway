@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -171,6 +171,9 @@ sockproxy_hc.o: sockproxy_hc.c sockproxy_hc.h sockproxy_hc_core.h sockproxy_metr
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_hold.o: sockproxy_hold.c sockproxy_hold.h sockproxy_hold_core.h sockproxy_metrics.h sockproxy_internal.h notify.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_epp.o: sockproxy_epp.c sockproxy_epp.h sockproxy.h sockproxy_internal.h notify.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h
@@ -891,6 +894,16 @@ test_pd_cache: test_pd_cache_aware
 # Phase 6: KV-cache exact routing unit tests (CBOR encoding + hash parity)
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
 	$(CC) -Wall -Wextra -DTEST_KV_EXACT -o $@ $< -I. -lssl -lcrypto
+
+# Phase 1 M2 (EPP): the Endpoint Picker words ride dp_proxy_tacts -> proxy_arg
+# -> proxy_epval_t. Pins the ABI (types, EPP_MODE_* words shared with Go,
+# alignment, proxy_arg <= 4096) and both copy hops against the real structs.
+test_epp_cfg: test_epp_cfg.c llb_dpapi.h sockproxy.h
+	$(CC) -Wall -Wextra -Wno-unused-function -o $@ $< -I. -I../libbpf/src -I../libbpf/include/uapi $(CFLAGS_MTLS)
+
+.PHONY: test_epp
+test_epp: test_epp_cfg
+	./test_epp_cfg
 
 # A request with no usable Host on a listener whose pools name models: the
 # pool that names its model or a counted route refusal (proxy_setup_ep__),

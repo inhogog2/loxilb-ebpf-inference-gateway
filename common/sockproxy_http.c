@@ -61,6 +61,7 @@
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
+#include "sockproxy_epp.h"
 #define SP_MCP_PROXY_SELECTOR
 #include "sockproxy_mcp_rr.h"
 #include "sockproxy_fe_limit.h"   /* connectionLimit at accept */
@@ -945,6 +946,21 @@ inject_request_id_header(void *msg, size_t *len, size_t bufsize,
 #include "sockproxy_llmd_fwd.h"
 #include "sockproxy_native_prio.h"
 #include "sockproxy_native_prio_note.h"
+
+int
+sp_h1_req_header_set(uint8_t *buf, size_t *len, size_t bufsize,
+                     const char *name, const char *value)
+{
+  if (!l7h1_strip_header(buf, len, name))
+    return -1;
+  return l7h1_splice_header(buf, len, bufsize, name, value);
+}
+
+int
+sp_h1_req_header_remove(uint8_t *buf, size_t *len, const char *name)
+{
+  return l7h1_strip_header(buf, len, name) ? 0 : -1;
+}
 
 /* Emit-callback context for the H1 path: the mutable request buffer. */
 typedef struct {
@@ -2419,6 +2435,9 @@ skip_deferred_masking:
           memmem(window, window_len, PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2)) {
+        /* The EPP hears the end of a stream at its terminator; the framed
+         * completion that may follow reports nothing more (once per sid). */
+        epp_report_resp_eos(rfd_ent);
         /* Step 1: Record stream end timestamp */
         rfd_ent->stream_end_ts = time(NULL);
         /* Step 2: Compute latency from the CLOCK_MONOTONIC activation stamp.
@@ -3749,6 +3768,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * (ca.cidx via llb_conv_nat2proxy), so the stamp just mirrors it into
          * the kv config block. 0 == no identity ⇒ Go keeps the legacy loop. */
         tepval->kv_svc_id = arg->_id;
+        /* Endpoint Picker: mode + deadline from the rule, identity from
+         * arg->_id exactly as kv_svc_id. */
+        tepval->epp_mode = arg->epp_mode;
+        tepval->epp_timeout_ms = arg->epp_timeout_ms;
+        tepval->epp_svc_id = arg->_id;
+        if (tepval->epp_mode != EPP_MODE_OFF) {
+          log_info("[EPP_CONFIG] proxy_add(update): epp_mode=%u epp_timeout_ms=%u epp_svc_id=%u",
+                   tepval->epp_mode, tepval->epp_timeout_ms, tepval->epp_svc_id);
+        }
 
         tepval->pd_session_map = NULL;
         pthread_rwlock_init(&tepval->pd_session_lock, NULL);
@@ -4179,6 +4207,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
            tepval->kv_exact_mode, tepval->kv_hash_algo, tepval->kv_zmq_port,
            tepval->kv_block_size, tepval->kv_warmup_sec,
            tepval->kv_engine_type, tepval->kv_dp_rank_count, tepval->kv_svc_id);
+  /* Endpoint Picker: mode + deadline from the rule, identity from arg->_id
+   * exactly as kv_svc_id. Logged only when set so a rule without an EPP
+   * leaves the log byte-identical. */
+  tepval->epp_mode = arg->epp_mode;
+  tepval->epp_timeout_ms = arg->epp_timeout_ms;
+  tepval->epp_svc_id = arg->_id;
+  if (tepval->epp_mode != EPP_MODE_OFF) {
+    log_info("[EPP_CONFIG] proxy_add(new): epp_mode=%u epp_timeout_ms=%u epp_svc_id=%u",
+             tepval->epp_mode, tepval->epp_timeout_ms, tepval->epp_svc_id);
+  }
 
   tepval->pd_session_map = NULL;
   pthread_rwlock_init(&tepval->pd_session_lock, NULL);
@@ -5672,6 +5710,29 @@ proxy_ct_dump(const char *str, struct dp_ct_key *ctk)
 #endif
 }
 
+int
+proxy_epp_cfg_get(uint32_t svc_id, uint8_t *mode, uint32_t *timeout_ms)
+{
+  proxy_map_ent_t *node;
+  proxy_epval_t *tepval, *tmp_epval;
+  int matched = 0;
+
+  if (!proxy_struct || svc_id == 0) return 0;
+  PROXY_LOCK();
+  for (node = proxy_struct->head; node; node = node->next) {
+    HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
+      if (tepval->epp_svc_id != svc_id) continue;
+      if (matched == 0) {
+        if (mode) *mode = tepval->epp_mode;
+        if (timeout_ms) *timeout_ms = tepval->epp_timeout_ms;
+      }
+      matched++;
+    }
+  }
+  PROXY_UNLOCK();
+  return matched;
+}
+
 void
 proxy_dump_entry(proxy_info_cb_t cb)
 {
@@ -5756,6 +5817,40 @@ proxy_get_entry_stats(uint32_t id, int epid, uint64_t *p, uint64_t *b)
     i++;
   }
   PROXY_UNLOCK();
+}
+
+/* The bounded-load units CHWBL/WRR_HASH record on endpoint `epid` of the
+ * rule `id`: what the selector charged and teardown has not yet given back.
+ * -1 when the rule is unknown or keeps no such units. A diagnostic read for
+ * tests and status readers, never replayed into a rule. */
+int
+proxy_get_chwbl_ep_load(uint32_t id, int epid)
+{
+  proxy_map_ent_t *node;
+  proxy_epval_t *epv;
+  int rc = -1;
+
+  if (epid < 0 || epid >= MAX_PROXY_EP)
+    return -1;
+
+  PROXY_LOCK();
+  for (node = proxy_struct->head; node; node = node->next) {
+    for (epv = node->val.ephash; epv; epv = epv->hh.next) {
+      if (epv->_id != id)
+        continue;
+#ifdef HAVE_DP_GPU_ROUTING
+      pthread_rwlock_rdlock(&epv->chwbl_state_lock);
+      if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) &&
+          epv->chwbl_config)
+        rc = (int)atomic_load(&epv->chwbl_config->ep_loads[epid].active_conns);
+      pthread_rwlock_unlock(&epv->chwbl_state_lock);
+#endif /* HAVE_DP_GPU_ROUTING */
+      PROXY_UNLOCK();
+      return rc;
+    }
+  }
+  PROXY_UNLOCK();
+  return rc;
 }
 
 int
@@ -9591,6 +9686,9 @@ sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
   pfe->lb_err_body_sent = 0;
   pfe->ka_reparse = 0;
   pfe->ka_keep_leg = 0;
+  /* The slot carries the next request: the EPP stream of the previous one
+   * must be over (reported) by now; if not, the abort goes out here. */
+  epp_request_end(pfe);
   llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
 }
 
@@ -11528,6 +11626,7 @@ cresp_on_headers_complete(llhttp_t *parser)
   if (pfe->cresp_sse.is_sse) proxy_sse_activate(pfe);
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
+  epp_report_resp_headers(pfe, parser->status_code);
   /* A response with neither Content-Length nor chunked framing runs until the
    * backend closes, so its completion arrives as that EOF rather than from
    * llhttp. Record it now, while the flags are the ones for this message. */
@@ -11569,6 +11668,7 @@ cresp_on_message_complete(llhttp_t *parser)
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     hc_resp_done(pfe);
     sp_hold_answer_ended(pfe);
+    epp_report_resp_eos(pfe);
   }
   return 0;
 }
@@ -11627,6 +11727,7 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   if (!client->cresp_parser_inited) {
     cresp_parser_init(client);
   }
+  epp_resp_head_feed(client, msg, len);
   /* Where this read stands in its response, for the one edit made to a
    * backend's header block (sp_resp_strip_api_key). */
   creq_block_read_begin(&client->cresp_blk);
@@ -11705,6 +11806,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
     atomic_store_explicit(&client->cresp_eof_ended, 1, memory_order_relaxed);
     hc_resp_done(client);
     sp_hold_answer_ended(client);
+    epp_report_resp_eos(client);
     sp_answer_msg_done(&client->cresp_in_msg);
   }
 }
@@ -12607,6 +12709,20 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                     pfe->rfd_ent[0] != NULL;
   pfe->ka_reparse = 0;
   pfe->ka_keep_leg = 0;
+
+  /* An EPP rule decides every request: the kept backend leg of the previous
+   * request would carry this one to the same endpoint behind the EPP's
+   * back. Give the leg up and take the setup path, where the EPP stage is.
+   * Only for a NEXT request (the previous one's EPP phase is reported):
+   * a leg whose connect just completed re-enters here for the SAME request
+   * (proxy_backend_connect_event) and must ride on. */
+  if (ka_keep_leg && pfe->epv &&
+      ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF &&
+      (pfe->epp_sid == 0 || pfe->epp_reported)) {
+    log_debug("[EPP] fd=%d keep-alive request on an EPP rule: releasing the kept leg", pfe->fd);
+    proxy_release_rfd_ctx(pfe);
+    ka_keep_leg = 0;
+  }
 
   if (ka_keep_leg) {
 #ifdef HAVE_HTTP_TRACE
@@ -13853,6 +13969,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           log_debug("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
                    "request (n_rfd=%d rfd0=%d) — reframe",
                    pfe->fd, pfe->n_rfd, pfe->rfd[0]);
+          proxy_release_rfd_ctx(pfe);
+        } else if (pfe->epv && ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF &&
+                   (pfe->epp_sid == 0 || pfe->epp_reported)) {
+          /* EPP arm: the Endpoint Picker decides every request, so the next
+           * one must be framed and dispatched afresh — the leg to the last
+           * decision's endpoint is given up (one backend connect per request;
+           * the P/D arm's trade). Only once the previous request's EPP phase
+           * is over (reported): never under a response still in flight. */
+          log_debug("[EPP] fd=%d keep-alive boundary on an EPP rule: releasing the backend leg "
+                    "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
           proxy_release_rfd_ctx(pfe);
         } else if (mcp_boundary || ai_gw_boundary ||
                    (!ai_gw_conn &&

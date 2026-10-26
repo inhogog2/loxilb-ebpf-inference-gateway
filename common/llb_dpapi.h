@@ -1171,6 +1171,18 @@ struct dp_proxy_tacts {
   // sends 1 for a rule that cannot take hold. The next byte of the same
   // padding.
   uint8_t  half_close_mode;
+  // Endpoint Picker (EPP, Gateway API Inference Extension) of the rule:
+  // 0 off, 1 FailOpen, 2 FailClose (EPP_MODE_* in sockproxy.h). Takes the
+  // last byte of the former fc_pad3[1]: no size change by itself.
+  uint8_t  epp_mode;
+  // The EPP request-phase decision deadline in ms (resolved by the Go
+  // control plane, never 0 when epp_mode != 0) + explicit tail padding so
+  // the struct stays 8-aligned. +8 bytes: all FOUR _Static_asserts bumped.
+  // epp_svc_id is NOT carried here — proxy_add_entry stamps it from
+  // arg->_id exactly as kv_svc_id. Copied verbatim into proxy_arg by
+  // llb_conv_nat2proxy; no Go mirror (cgo direct).
+  uint32_t epp_timeout_ms;
+  uint32_t epp_pad;
   // A request that names an objective it may not use: 0 falls to its
   // default objective, 1 is refused 403. The last byte of the same padding.
   uint8_t  ai_objective_strict;
@@ -1264,36 +1276,34 @@ struct dp_proxy_tacts {
 // fc_tenant_share_pct(1)+fc_pad3[3] replace the u32 fc_pad3: no size change.
 // fc_expose_headers(1)+fc_pad3[2] replace fc_pad3[3]: no size change.
 // half_close_mode(1)+fc_pad3[1] replace fc_pad3[2]: no size change.
-// ai_objective_strict(1) replaces fc_pad3[1]: no size change.
-// ABI guard updated for: +ai_default_tokens(4)+ai_pad(4) = +8 (8-aligned
-//   region; one padding byte was left, a u32 does not fit): all four asserts
-//   shift by +8 (2960→2968, 2952→2960, 3992→4000, 3984→3992). Set from Go
-//   through cgo (dpebpf_linux.go DpLBRuleMod), copied verbatim into proxy_arg
-//   by llb_conv_nat2proxy.
-// ABI guard updated for the priority bands: the four switches replace
-//   ai_pad(4) (no size change), then +fc_band_weight(3)+fc_band_min_share_pct(3)
-//   +fc_critical_reserve_pct(1)+fc_band_queue_pct(3)+fc_band_pad(2)
-//   +fc_band_wait_ms(12) = +24 (8-aligned region): all four asserts shift by
-//   +24 (2968→2992, 2960→2984, 4000→4024, 3992→4016). Set from Go through
-//   cgo (dpebpf_linux.go DpLBRuleMod), copied verbatim into proxy_arg by
-//   llb_conv_nat2proxy.
+// epp_mode(1) takes one byte of the former fc_pad3[1] padding and
+//   ai_objective_strict(1) the next; epp_timeout_ms(4)+epp_pad(4),
+//   ai_default_tokens(4) and the priority bands follow. The merged struct
+//   carries BOTH the EPP field set (fork) and the ai/priority-band field
+//   set (main). Sizes are MEASURED on the merged struct, not summed: fork's
+//   +8 and main's +32 over the shared base, plus 8 bytes of realignment
+//   where the two reclaimed-padding u8 fields meet. Compile-checked for all
+//   four variants with the _dpapi_meas harness (clang), cross-validated
+//   against the pre-merge fork (2968/4000) and main (2992/4024) sizes.
+//   Set from Go through cgo (dpebpf_linux.go); copied verbatim into
+//   proxy_arg by llb_conv_nat2proxy; no Go mirror (cgo direct).
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2992,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3008,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2984,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3000,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2992→4024 bytes, DPU slim 2984→4016 bytes
-// (mtls_backend_server_name(256): 3736→3992, 3728→3984; mtls_backend_verify
-// replaced one byte of mtls_pad: no size change).
+// mTLS-enabled layout: 3008->4040 bytes, DPU slim 3000->4032 bytes
+// (the mtls cert-path fields add 1032 as before; the EPP +8 and the
+//  ai/priority-band +32 ride into the mTLS layout too).
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 4024,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 4040,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 4016,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 4032,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */
