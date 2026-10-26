@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* The header defines pd_teardown_legs() as a static inline that dereferences
@@ -37,6 +38,8 @@ struct proxy_fd_ent {
 };
 
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_resp_note.h"
+#include <pthread.h>
 
 /* A per-"connection" sliding-tail fixture, mirroring the proxy_fd_ent.sse_tail /
  * .sse_tail_len fields the production call site rides on. Zero-initialised =
@@ -51,6 +54,133 @@ scan(struct tail_state *ts, const char *pkt)
 {
   return pd_scan_msg_end_window(ts->tail, &ts->tail_len,
                                 (const uint8_t *)pkt, strlen(pkt));
+}
+
+/* The response-record latch (proxy_note_client_response): one record per
+ * request whichever site reaches it first (the decode capture or a prefill-leg
+ * answer); every later call for that request is a no-op; the next request on
+ * the connection records again. */
+static uint8_t race_latch;
+static int race_wins;
+
+static void *
+race_claim(void *arg)
+{
+  (void)arg;
+  if (resp_note_claim(&race_latch)) __atomic_fetch_add(&race_wins, 1, __ATOMIC_RELAXED);
+  return NULL;
+}
+
+static void
+test_resp_note_latch(void)
+{
+  uint8_t noted = 0;   /* pfe_alloc zeroes the field: the latch starts open */
+
+  assert(resp_note_claim(&noted) == 1 && "first site records");
+  assert(resp_note_claim(&noted) == 0 && "second site for the same request is a no-op");
+  assert(resp_note_claim(&noted) == 0);
+  resp_note_rearm(&noted);   /* next request on the kept-alive connection */
+  assert(resp_note_claim(&noted) == 1 && "re-armed per request");
+  assert(resp_note_claim(&noted) == 0);
+
+  /* the two sites run on different workers: exactly one wins a race */
+  for (int round = 0; round < 200; round++) {
+    pthread_t th[8];
+    race_latch = 0;
+    race_wins = 0;
+    for (int i = 0; i < 8; i++) assert(pthread_create(&th[i], NULL, race_claim, NULL) == 0);
+    for (int i = 0; i < 8; i++) pthread_join(th[i], NULL);
+    assert(race_wins == 1 && "exactly one record per request under a race");
+  }
+
+  assert(resp_status_class(0) == 0 && resp_status_class(100) == 0 && resp_status_class(199) == 0);
+  assert(resp_status_class(200) == 2 && resp_status_class(299) == 2);
+  assert(resp_status_class(302) == 3 && resp_status_class(404) == 4 && resp_status_class(429) == 4);
+  assert(resp_status_class(500) == 5 && resp_status_class(599) == 5 && resp_status_class(600) == 0);
+  printf("  [PASS] resp_note latch: once per request, no-op after, re-armed, one winner in a race\n");
+}
+
+/* The two wrappers over the one writer (proxy_note_client_response = take
+ * with a TTFB sample, proxy_note_local_answer = take without) share the
+ * latch: whichever answer the client got first is the request's record. */
+static void
+test_resp_note_take_local_and_backend(void)
+{
+  uint8_t noted = 0;
+
+  /* a refusal: status and class, no TTFB sample */
+  assert(resp_note_take(&noted, 0) == RESP_NOTE_COUNT);
+  /* a backend reply racing it for the same request records nothing */
+  assert(resp_note_take(&noted, 1) == 0 && "a local answer then a backend reply records once");
+  assert(resp_note_take(&noted, 0) == 0);
+
+  /* next request: a backend reply samples TTFB, a late local answer is a no-op */
+  resp_note_rearm(&noted);
+  assert(resp_note_take(&noted, 1) == (RESP_NOTE_COUNT | RESP_NOTE_TTFB));
+  assert(resp_note_take(&noted, 0) == 0 && "a backend reply then a local answer records once");
+
+  /* the streamed gate's re-arm while the previous record is still owed
+   * changes nothing: the latch already reads open */
+  noted = 0;
+  resp_note_rearm(&noted);
+  assert(resp_note_take(&noted, 0) == RESP_NOTE_COUNT);
+  printf("  [PASS] resp_note take: a local answer and a backend reply share one record; TTFB only for the backend reply\n");
+}
+
+/* The status-line sniff of the backend capture records an answer only. A
+ * backend's own interim "100 Continue" (the gateway forwarded Expect) used to
+ * take the latch: no class (1xx has none), the TTFB sample at the 100, and the
+ * 200 or 5xx behind it a latched no-op, so the answer was never counted
+ * (F-21). The framer decides by the same predicate. */
+static void
+test_resp_sniff_status_line(void)
+{
+  uint16_t st = 0;
+  uint8_t noted = 0;
+  const char ok200[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+  const char cont100[] = "HTTP/1.1 100 Continue\r\n\r\n";
+  const char sw101[] = "HTTP/1.1 101 Switching Protocols\r\n\r\n";
+  const char hints103[] = "HTTP/1.1 103 Early Hints\r\nLink: </s>\r\n\r\n";
+  const char err500[] = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
+  const char short200[] = "HTTP/1.1 200";                 /* 12 bytes: a cut */
+  const char bad6[] = "HTTP/1.1 6ab Nope\r\n\r\n";
+  const char bad0[] = "HTTP/1.1 099 Nope\r\n\r\n";
+  const char badalpha[] = "HTTP/1.1 2x0 Nope\r\n\r\n";
+  const char notresp[] = "GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+
+  assert(resp_status_is_answer(200) && resp_status_is_answer(299) && resp_status_is_answer(500));
+  assert(resp_status_is_answer(101) && "101 ends HTTP on the connection: it answers");
+  assert(!resp_status_is_answer(100) && !resp_status_is_answer(102) && !resp_status_is_answer(103));
+  assert(!resp_status_is_answer(0) && !resp_status_is_answer(199));
+
+  assert(resp_sniff_status_line(ok200, sizeof(ok200) - 1, &st) == 1 && st == 200);
+  st = 0;
+  assert(resp_sniff_status_line(err500, sizeof(err500) - 1, &st) == 1 && st == 500);
+  st = 0;
+  assert(resp_sniff_status_line(sw101, sizeof(sw101) - 1, &st) == 1 && st == 101);
+  st = 0;
+  assert(resp_sniff_status_line(cont100, sizeof(cont100) - 1, &st) == 0 && st == 0 &&
+         "a backend's 100 Continue is not the answer");
+  assert(resp_sniff_status_line(hints103, sizeof(hints103) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(short200, sizeof(short200) - 1, &st) == 0 && st == 0 &&
+         "12 bytes is a cut status line: the framer records it");
+  assert(resp_sniff_status_line(ok200, 13, &st) == 1 && st == 200 && "13 bytes carry the three digits");
+  st = 0;
+  assert(resp_sniff_status_line(bad6, sizeof(bad6) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(bad0, sizeof(bad0) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(badalpha, sizeof(badalpha) - 1, &st) == 0 && st == 0);
+  assert(resp_sniff_status_line(notresp, sizeof(notresp) - 1, &st) == 0 && st == 0);
+
+  /* the sequence the bug was: the backend's 100, then its 200, against one
+   * latch. The 100 is skipped, the latch stays open, the 200 takes it with a
+   * TTFB sample; a second record for the request is a no-op. */
+  assert(resp_sniff_status_line(cont100, sizeof(cont100) - 1, &st) == 0);
+  assert(resp_sniff_status_line(ok200, sizeof(ok200) - 1, &st) == 1 && st == 200);
+  assert(resp_note_take(&noted, 1) == (RESP_NOTE_COUNT | RESP_NOTE_TTFB) &&
+         "the answer behind a backend 100 takes the record");
+  assert(resp_status_class(st) == 2);
+  assert(resp_note_take(&noted, 1) == 0);
+  printf("  [PASS] resp_sniff_status_line: an answer only; a backend 100 Continue leaves the latch to the answer\n");
 }
 
 /* ---- Case 1: terminator wholly inside one packet still completes ---- */
@@ -238,10 +368,185 @@ test_http_resp_status(void)
   printf("  [PASS] pd_http_resp_status: codes parsed, malformed -> unknown\n");
 }
 
+/* pd_resp_error_excerpt: the engine's error string for the relay's log line,
+ * from either vLLM error shape, else the body's leading bytes; bounded, and
+ * one log line whatever the body holds. */
+static void
+test_resp_error_excerpt(void)
+{
+  char out[64];
+  static const char flat[] =
+      "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\r\n"
+      "{\"object\":\"error\",\"message\":\"The model `mon03-alias` does not exist.\","
+      "\"type\":\"NotFoundError\",\"param\":null,\"code\":404}";
+  static const char nested[] =
+      "HTTP/1.1 400 Bad Request\r\n\r\n"
+      "{\"error\": {\"message\" : \"max_tokens \\\"1\\\" invalid\", \"code\": 400}}";
+  static const char plain[] = "HTTP/1.1 413 Payload Too Large\r\n\r\ntoo\r\nlarge";
+  static const char nobody[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 0";
+
+  assert(pd_resp_error_excerpt((const uint8_t *)flat, sizeof(flat) - 1, out, sizeof(out)) > 0);
+  assert(strcmp(out, "The model `mon03-alias` does not exist.") == 0);
+  pd_resp_error_excerpt((const uint8_t *)nested, sizeof(nested) - 1, out, sizeof(out));
+  assert(strcmp(out, "max_tokens \\\"1\\\" invalid") == 0 && "an escaped quote does not end it");
+  pd_resp_error_excerpt((const uint8_t *)plain, sizeof(plain) - 1, out, sizeof(out));
+  assert(strcmp(out, "too..large") == 0 && "no message key: the body, control bytes masked");
+  assert(pd_resp_error_excerpt((const uint8_t *)nobody, sizeof(nobody) - 1, out, sizeof(out)) == 0 &&
+         out[0] == '\0');
+  assert(pd_resp_error_excerpt(NULL, 0, out, sizeof(out)) == 0 && out[0] == '\0');
+  {
+    char small[8];
+    assert(pd_resp_error_excerpt((const uint8_t *)flat, sizeof(flat) - 1, small, sizeof(small)) == 7);
+    assert(strcmp(small, "The mod") == 0 && "bounded by cap");
+    /* bounded by len: the message is cut where the buffer ends */
+    size_t cut = (size_t)(strstr(flat, "does") - flat);
+    pd_resp_error_excerpt((const uint8_t *)flat, cut, out, sizeof(out));
+    assert(strcmp(out, "The model `mon03-alias` ") == 0);
+  }
+  printf("  [PASS] pd_resp_error_excerpt: message of either shape, else body; bounded\n");
+}
+
+/* pd_prefill_status_verdict: an origin 4xx prefill reply is relayed and
+ * decode is not called, cut at the buffer cap or not (F-12); a 5xx, a 408
+ * and a 429 keep the decode-recompute degradation; an unknown status is
+ * neither. pd_prefill_cut_reject is what a cut 4xx is relayed as. */
+static void
+test_prefill_status_verdict(void)
+{
+  assert(pd_prefill_status_verdict(0)   == PD_PR_DECODE && "unknown -> decode");
+  assert(pd_prefill_status_verdict(200) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(204) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(301) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(399) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(400) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(404) == PD_PR_RELAY && "unknown model is a reject");
+  assert(pd_prefill_status_verdict(408) == PD_PR_DECODE && "engine timeout is transient");
+  assert(pd_prefill_status_verdict(409) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(413) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(422) == PD_PR_RELAY);
+  assert(pd_prefill_status_verdict(429) == PD_PR_DECODE && "engine backpressure is transient");
+  assert(pd_prefill_status_verdict(499) == PD_PR_RELAY);
+  {
+    /* a cut 4xx: the engine's status, the gateway's body, framed by length */
+    char out[384];
+    size_t n = pd_prefill_cut_reject(404, out, sizeof(out));
+    const char *body;
+    assert(n > 0 && n == strlen(out));
+    assert(strncmp(out, "HTTP/1.1 404 Not Found\r\n", 24) == 0);
+    body = strstr(out, "\r\n\r\n");
+    assert(body && strstr(out, "Content-Length: ") &&
+           (size_t)atoi(strstr(out, "Content-Length: ") + 16) == strlen(body + 4));
+    assert(strstr(body, "\"error\":\"prefill_rejected\",\"status\":404"));
+    assert(pd_prefill_cut_reject(499, out, sizeof(out)) > 0 &&
+           strncmp(out, "HTTP/1.1 499 Client Error\r\n", 27) == 0);
+    assert(pd_prefill_cut_reject(404, out, 40) == 0 && "no room: nothing");
+  }
+  assert(pd_prefill_status_verdict(500) == PD_PR_DECODE && "5xx keeps decode recompute");
+  assert(pd_prefill_status_verdict(503) == PD_PR_DECODE);
+  assert(pd_prefill_status_verdict(599) == PD_PR_DECODE);
+  /* composed with the parser, as pd_initiate_decode uses them */
+  {
+    static const char nf404[] = "HTTP/1.1 404 Not Found\r\ncontent-length: 2\r\n\r\n{}";
+    static const char ok200[] = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}";
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)nf404, sizeof(nf404) - 1)) == PD_PR_RELAY);
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)ok200, sizeof(ok200) - 1)) == PD_PR_DECODE);
+    assert(pd_prefill_status_verdict(
+               pd_http_resp_status((const uint8_t *)"HTTP/1.1 40", 11)) == PD_PR_DECODE &&
+           "an unparsable status line is unknown, not a reject");
+  }
+  printf("  [PASS] pd_prefill_status_verdict: 4xx relay (cut: by status, gateway body), 5xx/408/429/unknown decode\n");
+}
+
+/* pd_decode_error_phase: a completed decode leg is recorded by the status its
+ * client received. An unread status is its own outcome (7), never a success. */
+static void
+test_decode_error_phase(void)
+{
+  static const struct { int status, phase; } cases[] = {
+    {   0, 7 }, { 100, 7 }, { 199, 7 },            /* no final status line read */
+    { 200, 0 }, { 204, 0 }, { 301, 0 }, { 399, 0 }, /* complete / success */
+    { 400, 6 }, { 404, 6 }, { 429, 6 }, { 499, 6 }, /* decode / rejected */
+    { 500, 2 }, { 502, 2 }, { 503, 2 }, { 599, 2 }, /* decode / error */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    if (pd_decode_error_phase(cases[i].status) != cases[i].phase) {
+      fprintf(stderr, "pd_decode_error_phase(%d) = %d, want %d\n", cases[i].status,
+              pd_decode_error_phase(cases[i].status), cases[i].phase);
+      assert(0);
+    }
+  }
+  /* composed with the parser: a status line too short to read is unknown */
+  assert(pd_decode_error_phase(pd_http_resp_status((const uint8_t *)"HTTP/1.1 5", 10)) == 7);
+  printf("  [PASS] pd_decode_error_phase: 2xx/3xx 0, 4xx 6, 5xx 2, unread 7\n");
+}
+
+/* pd_prefill_fallback_reason: the condition that forced the fallback, in
+ * verdict order. The status is the reason when it alone forces decode, cut or
+ * not; a reply that would have been used is truncated only because it was
+ * cut (a cut 4xx is relayed, never a fallback); a reply that is no status at all is no_status; 1xx/3xx other. */
+static void
+test_prefill_fallback_reason(void)
+{
+  static const struct { int status, cut, reason; } cases[] = {
+    { 500, 0, PD_FB_ORIGIN_5XX }, { 503, 1, PD_FB_ORIGIN_5XX }, { 599, 0, PD_FB_ORIGIN_5XX },
+    { 408, 0, PD_FB_ORIGIN_408 }, { 408, 1, PD_FB_ORIGIN_408 },
+    { 429, 0, PD_FB_ORIGIN_429 }, { 429, 1, PD_FB_ORIGIN_429 },
+    {   0, 0, PD_FB_NO_STATUS },  {   0, 1, PD_FB_NO_STATUS },
+    { 100, 0, PD_FB_OTHER },      { 301, 0, PD_FB_OTHER },      { 304, 1, PD_FB_OTHER },
+    { 200, 1, PD_FB_TRUNCATED },  { 204, 1, PD_FB_TRUNCATED },
+    { 200, 0, PD_FB_NONE },       { 204, 0, PD_FB_NONE },
+    { 404, 0, PD_FB_NONE },       /* relayed: never reaches the decode leg */
+    { 404, 1, PD_FB_NONE },       { 422, 1, PD_FB_NONE },  /* relayed by status (F-12) */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    int got = pd_prefill_fallback_reason(cases[i].status, cases[i].cut);
+    if (got != cases[i].reason) {
+      fprintf(stderr, "pd_prefill_fallback_reason(%d, cut=%d) = %d, want %d\n",
+              cases[i].status, cases[i].cut, got, cases[i].reason);
+      assert(0);
+    }
+    /* a reason exactly when the verdict sends the reply to decode and the
+     * reply was not a clean 2xx */
+    int to_decode = pd_prefill_status_verdict(cases[i].status) == PD_PR_DECODE;
+    int clean = cases[i].status >= 200 && cases[i].status < 300 && !cases[i].cut;
+    assert((got != PD_FB_NONE) == (to_decode && !clean));
+  }
+  printf("  [PASS] pd_prefill_fallback_reason: status first (5xx/408/429/none/other), truncated only for a cut 2xx\n");
+}
+
+/* pd_reap_error_phase: a request a reaper ends is named by the phase it was
+ * in; a begun answer the gateway ended is decode/truncated, never the engine's
+ * death (2); anything not in flight has no record to make, which is what keeps
+ * the record to one once the reaper moves the request to ERROR. */
+static void
+test_reap_error_phase(void)
+{
+  static const struct { int pd_phase, phase; } cases[] = {
+    { 0, -1 },                         /* NONE: not a P/D request */
+    { 1, 1 }, { 2, 1 }, { 3, 1 },      /* prefill legs: prefill / timeout */
+    { 4, 3 },                          /* decode dispatched, no byte: decode / timeout */
+    { 5, 8 },                          /* the answer began: decode / truncated */
+    { 6, -1 }, { 7, -1 }, { 8, -1 },   /* COMPLETE, ERROR, PARKED */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    if (pd_reap_error_phase(cases[i].pd_phase) != cases[i].phase) {
+      fprintf(stderr, "pd_reap_error_phase(%d) = %d, want %d\n", cases[i].pd_phase,
+              pd_reap_error_phase(cases[i].pd_phase), cases[i].phase);
+      assert(0);
+    }
+  }
+  printf("  [PASS] pd_reap_error_phase: prefill 1, decode-sending 3, streaming 8, else none\n");
+}
+
 int
 main(void)
 {
   printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
+  test_resp_note_latch();
+  test_resp_note_take_local_and_backend();
+  test_resp_sniff_status_line();
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();
@@ -251,6 +556,11 @@ main(void)
   test_graceful_slow_stream_not_reaped();
   test_graceful_guards();
   test_http_resp_status();
+  test_resp_error_excerpt();
+  test_prefill_status_verdict();
+  test_decode_error_phase();
+  test_reap_error_phase();
+  test_prefill_fallback_reason();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }

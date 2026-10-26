@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <assert.h>
 
@@ -323,6 +324,49 @@ main(void)
 
   nghttp2_session_del(client);
   nghttp2_session_del(server);
+
+  /* ---- The response-head drop: every field of one name goes, in any case
+   *      of the name; a longer or shorter name stays; nothing else moves. ---- */
+  {
+    static const char *add[][2] = {
+      { "x-api-key", "sk-one" }, { "content-type", "application/json" },
+      { "X-Api-Key", "sk-two" }, { "x-api-key-id", "keep" },
+      { "x-api-ke", "keep" }, { "x-auth-tenant", "t9" },
+    };
+    size_t before = mapping.response_headers_count, i, left = 0, kept = 0;
+    for (i = 0; i < sizeof(add) / sizeof(add[0]); i++) {
+      nghttp2_nv nv = { (uint8_t *)add[i][0], (uint8_t *)add[i][1],
+                        strlen(add[i][0]), strlen(add[i][1]), NGHTTP2_NV_FLAG_NONE };
+      proxy_h2_inject_resp_headers(&mapping, &nv, 1);
+    }
+    size_t dropped = proxy_h2_drop_resp_header(&mapping, "x-api-key", 9);
+    for (i = 0; i < mapping.response_headers_count; i++) {
+      nghttp2_nv *nv = &mapping.response_headers[i];
+      if (nv->namelen == 9 && !strncasecmp((char *)nv->name, "x-api-key", 9)) left++;
+      if ((nv->namelen == 12 && !memcmp(nv->name, "x-api-key-id", 12)) ||
+          (nv->namelen == 8 && !memcmp(nv->name, "x-api-ke", 8)) ||
+          (nv->namelen == 13 && !memcmp(nv->name, "x-auth-tenant", 13)) ||
+          (nv->namelen == 12 && !memcmp(nv->name, "content-type", 12))) kept++;
+    }
+    if (dropped == 2 && left == 0 && kept == 4 &&
+        mapping.response_headers_count == before + 4 &&
+        mapping.response_headers[0].namelen == 7 &&
+        !memcmp(mapping.response_headers[0].name, ":status", 7) &&
+        mapping.data_source == data_source_before) {
+      printf("[PASS] assert(4) x-api-key dropped from the response head in any case; other fields, order and the body provider unchanged\n");
+    } else {
+      printf("[FAIL] assert(4) drop: dropped=%zu left=%zu kept=%zu count %zu->%zu\n",
+             dropped, left, kept, before, mapping.response_headers_count);
+      failures++;
+    }
+    if (proxy_h2_drop_resp_header(&mapping, "x-api-key", 9) == 0 &&
+        proxy_h2_drop_resp_header(NULL, "x-api-key", 9) == 0) {
+      printf("[PASS] assert(5) nothing to drop, and no mapping: no change\n");
+    } else {
+      printf("[FAIL] assert(5) a second drop changed the set\n");
+      failures++;
+    }
+  }
 
   /* cleanup mapping (free deep-copied headers like the production cleanup). */
   for (size_t i = 0; i < mapping.response_headers_count; i++) {

@@ -21,6 +21,7 @@
  * llb_ai_ratelimit_update, llb_ai_record_request, llb_ai_record_deny,
  * llb_ai_stream_start, llb_ai_stream_end, llb_ai_token_quota_consume and
  * llb_ai_pd_record
+ * llb_ai_pd_record_extra
  * live in pkg/loxinet/ai_gateway_dp.go, llb_ai_audit_emit_only lives in
  * pkg/loxinet/ai_gateway_bench.go, and all of them are only
  * available when the binary is linked with the Go CGO runtime.
@@ -42,6 +43,7 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 #include "log.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_ai_bench.h"
@@ -121,9 +123,16 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       int stream_start, int stream_end, char *error_code,
                       char *request_id, char *user_id, char *key_id,
                       char *svc_ident, int is_stream, int producer_id,
-                      char *client_ip, char *origin_ip, int trusted_hops)
+                      char *client_ip, char *origin_ip, int trusted_hops,
+                      int auth_src, char *net_identity,
+                      int priority, int class_info, char *objective)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)auth_src;
+    (void)net_identity;
+    (void)priority;
+    (void)class_info;
+    (void)objective;
     (void)tenant_id;
     (void)model_name;
     (void)status_code;
@@ -172,9 +181,16 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    char *svc_ident, char *model_name,
                    char *tenant_id, char *key_id, char *user_id,
                    int stage, int http_status, char *error_code,
-                   char *client_ip, char *origin_ip, int trusted_hops)
+                   char *client_ip, char *origin_ip, int trusted_hops,
+                   int auth_src, char *net_identity,
+                   int priority, int class_info, char *objective)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)auth_src;
+    (void)net_identity;
+    (void)priority;
+    (void)class_info;
+    (void)objective;
     (void)request_id;
     (void)producer_id;
     (void)svc_ident;
@@ -214,9 +230,12 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                            int prompt_tokens, int complet_tokens,
                            int estimated, int reserved_toks,
                            int64_t res_epoch, char *request_id,
-                           int producer_id, ai_gw_decision_t *result)
+                           int producer_id, int auth_src, char *net_identity,
+                           ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)auth_src;
+    (void)net_identity;
     (void)tenant_id;
     (void)model_name;
     (void)user_id;
@@ -237,7 +256,9 @@ __attribute__((weak)) int
 llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                            char *user_id, char *key_id, char *svc_ident,
                            int prompt_est, int max_tokens,
-                           int64_t *res_epoch, ai_gw_decision_t *result)
+                           int default_tokens,
+                           int64_t *res_epoch, int *granted,
+                           ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
@@ -247,10 +268,45 @@ llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
     (void)svc_ident;
     (void)prompt_est;
     (void)max_tokens;
+    (void)default_tokens;
     (void)result;
     if (res_epoch)
         *res_epoch = 0;
+    if (granted)
+        *granted = 0;
     return 0;  /* allow — no quota enforcement in C-only debug builds */
+}
+
+__attribute__((weak)) int
+llb_ai_netid_resolve(char *client_ip, int in_ifindex,
+                     char *svc_ident, char *model, ai_gw_netid_t *out)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)client_ip;
+    (void)in_ifindex;
+    (void)svc_ident;
+    (void)model;
+    if (out)
+        out->matched = 0;
+    return 0;  /* no binding: the request is decided as if none existed */
+}
+
+__attribute__((weak)) int
+llb_ai_class_resolve(char *tenant, char *key_id, char *binding, char *profile,
+                     char *svc_ident, char *objective_hint, int tier_hint,
+                     ai_gw_class_t *out)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)tenant;
+    (void)key_id;
+    (void)binding;
+    (void)profile;
+    (void)svc_ident;
+    (void)objective_hint;
+    (void)tier_hint;
+    if (out)
+        memset(out, 0, sizeof(*out));
+    return 0;  /* nothing configured: standard */
 }
 
 __attribute__((weak)) void
@@ -264,6 +320,16 @@ llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
     (void)decode_latency_ms;
     (void)kv_params_found;
     (void)error_phase;
+}
+
+__attribute__((weak)) void
+llb_ai_pd_record_extra(char *model_name, int64_t decode_ttft_us,
+                       int fallback_reason)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)model_name;
+    (void)decode_ttft_us;
+    (void)fallback_reason;
 }
 
 __attribute__((weak)) void
@@ -282,6 +348,15 @@ llb_ai_pd_tier_selected(char *model_name, int tier)
 }
 
 __attribute__((weak)) void
+llb_ai_pd_decode_selected(char *model_name, int path, int kv_fill)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)model_name;
+    (void)path;
+    (void)kv_fill;
+}
+
+__attribute__((weak)) void
 llb_ai_normal_session_hit(char *model_name)
 {
     AI_GW_STUB_TRIPWIRE(warned);
@@ -293,6 +368,13 @@ llb_ai_record_unmetered(char *vip)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)vip;
+}
+
+__attribute__((weak)) void
+llb_ai_record_stream_early_close(char *svc_ident)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)svc_ident;
 }
 
 __attribute__((weak)) void

@@ -36,7 +36,11 @@ int ai_security_should_strip_api_key(uint8_t policy);
  *   - on JWT-capable rules (jwt_capable), CLIENT-sent X-Auth-Tenant/User are
  *     stripped ALWAYS (verified-identity spoof), and Authorization is
  *     stripped when the deciding profile said so (strip_authz);
- *   - when the profile forwards identity (fwd_identity), the VERIFIED
+ *   - on a service with a network-identity binding that forwards identity
+ *     (strip_xauth_all), every CLIENT-sent header whose name starts with
+ *     X-Auth- is stripped, whatever the rule's auth type;
+ *   - when the profile or the matched binding forwards identity
+ *     (fwd_identity, with jwt_capable or strip_xauth_all), the VERIFIED
  *     tenant/user are appended as X-Auth-Tenant/X-Auth-User. The injected
  *     values point at CALLER-owned storage (the stream identity fields);
  *     nghttp2_submit_request copies the bytes before they can go stale.
@@ -45,6 +49,7 @@ int ai_security_should_strip_api_key(uint8_t policy);
 size_t ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
                                        nghttp2_nv *output, size_t output_cap,
                                        uint8_t policy, int jwt_capable,
+                                       int strip_xauth_all,
                                        int strip_authz, int fwd_identity,
                                        const char *tenant, const char *user);
 
@@ -54,6 +59,13 @@ size_t ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len
  * nghttp2_submit_request copies the bytes before either source array is freed.
  * (Thin wrapper over the hygiene filter above with the JWT arms off.)
  */
+/* Copy input to output without any x-vllm-priority header (case-insensitive).
+ * Returns how many were written; *dropped (may be NULL) is 1 when at least
+ * one was left out. The copies are shallow, as ai_security_h2_upstream_hygiene's. */
+size_t ai_security_h2_drop_native_priority(const nghttp2_nv *input, size_t input_len,
+                                           nghttp2_nv *output, size_t output_cap,
+                                           int *dropped);
+
 size_t ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                                      nghttp2_nv *output, size_t output_cap,
                                      uint8_t policy);

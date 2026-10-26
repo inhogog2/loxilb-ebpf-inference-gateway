@@ -43,54 +43,157 @@
 #include "llhttp.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy.h"
+#include "sockproxy_pd_reservation.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_pd_receipt.h"
 
-/* Rewrite the prefill address inside a P/D request-id receipt
- * (___prefill_addr_<ep>___decode_addr_<ep>_<uuid>) within an HTTP header
- * block. buf/len describe the full request; the search is bounded to the
- * header region. Returns 0 when a rewrite happened, -1 otherwise. */
+
+/* No backend request has been sent at this boundary. Once sending/streaming
+ * starts, callers must use the terminal-error path, never replay the request. */
 static int
-pd_receipt_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
+pd_decode_connect_valid(proxy_fd_ent_t *c, int fd, uint64_t gen)
 {
-  uint8_t *he = memmem(buf, *len, "\r\n\r\n", 4);
-  size_t hdr_len = he ? (size_t)(he + 4 - buf) : 0;
-  char *tag = hdr_len ? memmem(buf, hdr_len, "___prefill_addr_", 16) : NULL;
-  char *a_start = tag ? tag + 16 : NULL;
-  char *a_end = a_start ? memmem(a_start, (size_t)((char *)buf + hdr_len - a_start),
-                                 "___decode_addr_", 15) : NULL;
-  if (!a_start || !a_end) return -1;
+  return c->fd == fd && atomic_load(&c->gen) == gen && !c->reap_resp &&
+         c->pd_phase == PD_PHASE_PREFILL_DONE && !c->pd_last_decode_ts &&
+         !c->pd_decode_bytes_received && !c->pd_decode_content_length;
+}
 
-  int n_len = (int)strlen(n_addr);
-  int o_len = (int)(a_end - a_start);
-  int shift = n_len - o_len;
-  if (n_len <= 0 || *len + (size_t)(shift > 0 ? shift : 0) > cap) return -1;
-  if (shift != 0) {
-    memmove(a_end + shift, a_end, *len - (size_t)(a_end - (char *)buf));
-    *len = (size_t)((ssize_t)*len + shift);
+/* At most two TCP connects, excluding failed endpoints for THIS request even
+ * before health polling notices the failure. Hold an alternate reservation
+ * privately until connect succeeds; cleanup cannot return it prematurely or
+ * resurrect a canceled request's token. The old reservation stays owned until
+ * the atomic handoff succeeds. No retry is allowed after a request write. */
+static int
+pd_connect_decode(proxy_fd_ent_t *c, int fd, uint64_t gen, int *selected,
+                  const void *pp2, int pp2len)
+{
+  proxy_epval_t *t = c->epv;
+  int original = *selected;
+  uint32_t owned = __atomic_load_n(&c->pd_decode_load_token, __ATOMIC_ACQUIRE);
+  /* The endpoint the request's own unit is on (the token), not the routing
+   * hint: a candidate is provisional unless the unit is already there. */
+  int owned_ep = owned ? (int)owned - 1 : -1;
+  uint32_t excluded = 0;
+  int attempts = 0;
+  while (attempts < 2 && pd_decode_connect_valid(c, fd, gen)) {
+    int ep = -1;
+    if (pd_select_decode_excluding(t, c, &ep, excluded) < 0)
+      break;
+    c->pd_decode_ep_idx = original; /* Selection is not ownership publication. */
+    int provisional = ep != owned_ep;
+    if (provisional && !pd_load_try_reserve(t, ep, 0)) {
+      excluded |= UINT32_C(1) << ep;
+      continue; /* Saturated candidates do not consume a dial attempt. */
+    }
+    attempts++;
+    int connected = proxy_setup_ep_connect(t->eps[ep].xip, t->eps[ep].xport,
+                                            IPPROTO_TCP, NULL, NULL, c, pp2, pp2len);
+    int valid = pd_decode_connect_valid(c, fd, gen);
+    if (connected < 0 || !valid) {
+      if (provisional) pd_load_put(t, ep);
+      if (connected >= 0) close(connected);
+      if (!valid) return -1;
+      /* A refused connect is the endpoint's failure, not only this
+       * request's: the breaker counts it, as the prefill retries do. */
+      circuit_breaker_record_failure(t, ep);
+      excluded |= UINT32_C(1) << ep;
+      log_warn("[PD_DECODE_CONNECT] client_fd=%d failed_ep=%d attempt=%d/2",
+               fd, ep, attempts);
+      continue;
+    }
+    uint32_t expected = owned;
+    if (provisional &&
+        !__atomic_compare_exchange_n(&c->pd_decode_load_token, &expected,
+                                     (uint32_t)ep + 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      pd_load_put(t, ep);
+      close(connected);
+      return -1;
+    }
+    if (provisional && owned) pd_load_put(t, (int)owned - 1);
+    c->pd_decode_ep_idx = *selected = ep;
+    if (attempts > 1 || ep != original)
+      log_info("[PD_DECODE_CONNECT] client_fd=%d selected_ep=%d attempts=%d/2",
+               fd, ep, attempts);
+    return connected;
   }
-  memcpy(a_start, n_addr, (size_t)n_len);
-  return 0;
+  return -1;
 }
 
 /* Initiate decode phase after prefill completes.
  * Creates a new backend connection to the decode EP, builds the decode request
  * (original body + kv_params), and sends it. The decode response will flow to
  * the client via normal proxy path (including SSE streaming). */
+/* Hand an origin 4xx prefill reply to the client verbatim and end the P/D
+ * flow without a decode leg. The response is recorded here because the
+ * response path does not capture the prefill leg's; the caller writes the
+ * completion record (PD_DECODE_ANSWERED). Runs with no proxy locks held, as
+ * the TensorRT-LLM early exit does.
+ *
+ * The engine answered a request the gateway rewrote, so the log line names
+ * the rewrite (the dialect's prefill rewriter, the failover's receipt rewrite,
+ * the body before and after) beside the engine's own error string: a reject
+ * of the client's request reads apart from a reject of the rewrite. */
+static void
+pd_prefill_reject_relay(proxy_fd_ent_t *client_pfe, const uint8_t *resp,
+                        size_t resp_len, int status, int is_trt,
+                        size_t orig_body_len, int truncated)
+{
+  char engine_err[160];
+  char cut[384];
+
+  pd_resp_error_excerpt(resp, resp_len, engine_err, sizeof(engine_err));
+  /* A reply cut at the buffer cap is not the engine's whole response: the
+   * client gets its status and a short gateway body instead of the cut one. */
+  if (truncated) {
+    size_t cl = pd_prefill_cut_reject(status, cut, sizeof(cut));
+
+    resp = cl ? (const uint8_t *)cut : NULL;
+    resp_len = cl;
+  }
+  proxy_note_client_response(client_pfe, (uint16_t)status);
+  if (client_pfe->fd > 0 && resp && resp_len > 0) {
+    if (client_pfe->ssl) {
+      SSL_write(client_pfe->ssl, resp, (int)resp_len);
+    } else {
+      send(client_pfe->fd, resp, resp_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+  }
+  log_warn("prefill EP%d answered origin %d — relaying it %s, no decode "
+           "leg (client_fd=%d rewrite=%s failover=%u body=%zu->%zu "
+           "engine=\"%s\")", client_pfe->pd_prefill_ep_idx, status,
+           truncated ? "by its status (reply cut at the buffer cap)" : "verbatim",
+           client_pfe->fd,
+           is_trt ? "trtllm-context-splice"
+                  : "vllm-probe(max_tokens=1,stream=false,+kv_transfer_params)",
+           (unsigned)client_pfe->pd_prefill_retries, orig_body_len,
+           client_pfe->pd_prefill_body_len, engine_err);
+  {
+    /* Nothing in the gateway failed and nothing timed out: the request was
+     * rejected upstream (the SGLang dialect records the same reject). */
+    const char *pd_model = proxy_effective_model(client_pfe);
+    sp_pd_record(client_pfe, pd_model, 0, 0, 0, 5 /*prefill rejected*/);
+  }
+  client_pfe->pd_phase = PD_PHASE_COMPLETE;
+  pd_cleanup(client_pfe);
+}
+
 int
 pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 {
   proxy_epval_t *tepval;
   int d_idx;
-  uint32_t epip;
-  uint16_t epport;
   int ep_cfd;
   int ret = -1;
   uint8_t *decode_body = NULL;
   uint8_t *decode_req = NULL;
 
   if (!client_pfe || !client_pfe->epv) return -1;
+  int client_fd = client_pfe->fd;
+  uint64_t client_gen = atomic_load(&client_pfe->gen);
+  if (!pd_decode_connect_valid(client_pfe, client_fd, client_gen)) return -1;
 
   tepval = (proxy_epval_t *)client_pfe->epv;
   d_idx = client_pfe->pd_decode_ep_idx;
@@ -98,42 +201,6 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   if (d_idx < 0 || d_idx >= tepval->n_eps) {
     log_error("Invalid decode EP index %d", d_idx);
     return -1;
-  }
-
-  /* the decode EP was picked at ADMISSION but is only connected NOW,
-   * after prefill completed — a seconds-wide window under long-context
-   * prefill during which the EP can die. Until this check, only index
-   * bounds were re-validated, so a decode node dying during prefill meant a
-   * connect to a known-dead EP (sync 503, or async zero-byte EOF =).
-   * Re-check inv/CB and re-select via pd_select_decode (min-load among
-   * healthy decode EPs — the admission scorer) with the stale hint cleared.
-   * On re-selection, MOVE the admission-time active_conns unit so
-   * pd_cleanup's decrement of the final pd_decode_ep_idx stays balanced.
-   * Runs BEFORE the buffer claims below, so the -1 path (no healthy decode
-   * EP) leaves saved body/headers for the caller's 503+cleanup. */
-  if (tepval->eps[d_idx].inv ||
-      (tepval->cb_enabled &&
-       tepval->circuit_breakers[d_idx].state == CB_STATE_OPEN)) {
-    int stale_idx = d_idx;
-    int re_idx = -1;
-    client_pfe->pd_decode_ep_idx = -1;  /* clear hint: force fresh min-load pick */
-    if (pd_select_decode(tepval, client_pfe, &re_idx) == 0) {
-      log_error("decode EP%d went unhealthy during prefill — "
-                "re-selected healthy decode EP%d (client_fd=%d)",
-                stale_idx, re_idx, client_pfe->fd);
-      uint32_t cur_stale =
-          atomic_load(&tepval->pd_ep_loads[stale_idx].active_conns);
-      if (cur_stale > 0)
-        atomic_fetch_sub(&tepval->pd_ep_loads[stale_idx].active_conns, 1);
-      atomic_fetch_add(&tepval->pd_ep_loads[re_idx].active_conns, 1);
-      d_idx = re_idx;  /* pd_select_decode already stored it in the pfe */
-    } else {
-      client_pfe->pd_decode_ep_idx = stale_idx;  /* restore for cleanup/logs */
-      log_error("decode EP%d unhealthy after prefill and NO healthy "
-                "replacement — failing decode init (client_fd=%d)",
-                stale_idx, client_pfe->fd);
-      return -1;
-    }
   }
 
   /* (conc=128 UAF fix): pd_initiate_decode runs on the PREFILL worker
@@ -191,6 +258,17 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 
   int is_trt = (tepval->pd_engine == PD_ENGINE_TRTLLM);
 
+  /* An origin 4xx answers the request: relay it, verbatim or (cut at the
+   * buffer cap) by its status, and do not call the decode leg
+   * (pd_prefill_status_verdict). A 5xx, a 408 or 429 and an unknown status
+   * keep the decode-recompute degradation below. */
+  if (pd_prefill_status_verdict(pr_status) == PD_PR_RELAY) {
+    pd_prefill_reject_relay(client_pfe, l_prefill, l_prefill_len, pr_status,
+                            is_trt, l_body_len, l_prefill_truncated);
+    ret = PD_DECODE_ANSWERED;
+    goto out;
+  }
+
   /* TRT-LLM early exit: a 200 context response whose finish_reason is
    * neither "length" nor "not_finished" already finished the request in
    * the context step — relay it and skip the decode leg entirely. Gated on
@@ -198,11 +276,20 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
    * recompute + the origin-streak feed above). */
   if (is_trt && pr_status == 200 &&
       pd_trt_ctx_early_exit_check(l_prefill, l_prefill_len)) {
+    /* The client is answered from the prefill leg, whose reply the response
+     * capture skips: record the response here, before the relay. */
+    proxy_note_client_response(client_pfe, (uint16_t)pr_status);
     pd_trt_early_exit_relay(client_pfe, l_prefill, l_prefill_len,
                             pd_trt_stream_requested(l_body, l_body_len));
-    ret = 0;
+    ret = PD_DECODE_ANSWERED;
     goto out;
   }
+
+  /* Every path from here goes to the decode leg. If the prefill reply was not
+   * usable, decode recomputes it: say why, on the request's lifecycle record
+   * (loxilb_ai_pd_prefill_fallback_total). */
+  client_pfe->pd_fallback_reason =
+      (uint8_t)pd_prefill_fallback_reason(pr_status, l_prefill_truncated);
 
   /* 1. Extract the transfer params from the prefill response (dialect
    *    surgery: kv_transfer_params for vLLM, choices[0].disaggregated_params
@@ -311,8 +398,6 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
                         "cl_rewrite_decode");
 
   /* 4. Connect to decode EP */
-  epip = tepval->eps[d_idx].xip;
-  epport = tepval->eps[d_idx].xport;
 
   /* PROXY protocol v2 (L7 fullproxy, P/D decode leg): prepend the client 4-tuple
    * when the rule enables ppv2, consistent with the prefill/HTTP1/HTTP2 backend
@@ -333,11 +418,43 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       }
     }
   }
-  ep_cfd = proxy_setup_ep_connect(epip, epport, IPPROTO_TCP, NULL, NULL, client_pfe,
-                                  (dpp2len ? dpp2buf : NULL), dpp2len);
+  ep_cfd = pd_connect_decode(client_pfe, client_fd, client_gen, &d_idx,
+                               (dpp2len ? dpp2buf : NULL), dpp2len);
   if (ep_cfd < 0) {
     log_error("Failed to connect to decode EP%d", d_idx);
     goto out;
+  }
+
+  /* The receipt in the saved headers names the decode EP selected at
+   * admission; pd_connect_decode may just have connected another one (a
+   * refused connect, a saturated candidate). Re-render the ___decode_addr_
+   * half in the request about to be written — the decode engine adopts this
+   * id and echoes it to the client — and in the gateway's own copies, which
+   * the completion and audit records read through proxy_request_id():
+   * vllm_request_id while the request is live, resp_request_id once the
+   * keep-alive reset of pd_setup_and_forward has snapshotted it. Same
+   * nixl_port-else-xport formatting as admission and as the prefill retry.
+   * A no-op when the EP did not change (rc 1) and when the client supplied
+   * its own X-Request-Id (no receipt, rc -1). Tokens, attempt budget and the
+   * CAS handoff are pd_connect_decode's and are not touched here. */
+  {
+    char n_addr[64];
+    struct in_addr n_in = { .s_addr = tepval->eps[d_idx].xip };
+    uint16_t n_port = tepval->eps[d_idx].nixl_port ?
+                      ntohs(tepval->eps[d_idx].nixl_port) :
+                      ntohs(tepval->eps[d_idx].xport);
+    snprintf(n_addr, sizeof(n_addr), "%s:%u", inet_ntoa(n_in), n_port);
+    if (pd_receipt_rewrite(decode_req, &decode_req_len, decode_req_cap,
+                           PD_RECEIPT_DECODE, n_addr) == 0) {
+      pd_receipt_rewrite_str(client_pfe->vllm_request_id,
+                             sizeof(client_pfe->vllm_request_id),
+                             PD_RECEIPT_DECODE, n_addr);
+      pd_receipt_rewrite_str(client_pfe->resp_request_id,
+                             sizeof(client_pfe->resp_request_id),
+                             PD_RECEIPT_DECODE, n_addr);
+      log_info("[PD_DECODE_CONNECT] client_fd=%d receipt decode half "
+               "re-rendered to %s (ep=%d)", client_fd, n_addr, d_idx);
+    }
   }
 
   /* 5. Create backend pfe for decode connection */
@@ -498,6 +615,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
   size_t req_len = 0;
   int new_idx = -1;
   int ep_cfd = -1;
+  uint32_t reserved = 0;
 
   if (!client_pfe || !client_pfe->epv) goto fail;
   tepval = (proxy_epval_t *)client_pfe->epv;
@@ -512,7 +630,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
 
     for (int attempt = 0; attempt < tepval->n_prefill_eps; attempt++) {
       int cand = -1;
-      int rc = pd_select_prefill(tepval, client_pfe, &cand, excluded);
+      int rc = pd_reserve_prefill(tepval, client_pfe, &cand, excluded, 0);
       /* A Tier-0 session hit inside pd_select_prefill may overwrite the
        * decode hint; the decode EP for THIS request was already chosen at
        * admission and its selection must stand — always restore it. */
@@ -520,6 +638,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
       if (rc != 0 || cand < 0)
         break;  /* no healthy candidates (park/shed count as none mid-request) */
 
+      reserved = (uint32_t)cand + 1;
       /* PROXY protocol v2 parity with the admission-time prefill leg. */
       uint8_t pp2buf[28];
       int pp2len = 0;
@@ -542,6 +661,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
                                       IPPROTO_TCP, NULL, NULL, client_pfe,
                                       (pp2len ? pp2buf : NULL), pp2len);
       if (ep_cfd >= 0) { new_idx = cand; break; }
+      pd_load_release(tepval, &reserved);
       /* Sync connect failure — condemn and try the next candidate. */
       circuit_breaker_record_failure(tepval, cand);
       if (cand >= 0 && cand < 32) excluded |= 1u << (unsigned)cand;
@@ -592,14 +712,15 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
                         ntohs(tepval->eps[new_idx].nixl_port) :
                         ntohs(tepval->eps[new_idx].xport);
       snprintf(n_addr, sizeof(n_addr), "%s:%u", inet_ntoa(n_in), n_port);
-      pd_receipt_rewrite(req, &req_len, req_cap, n_addr);
+      pd_receipt_rewrite(req, &req_len, req_cap, PD_RECEIPT_PREFILL, n_addr);
 
       size_t sh_cap = hdrs_len + 80;
       uint8_t *sh = malloc(sh_cap);
       if (sh) {
         memcpy(sh, hdrs, hdrs_len);
         size_t sh_len = hdrs_len;
-        if (pd_receipt_rewrite(sh, &sh_len, sh_cap, n_addr) == 0) {
+        if (pd_receipt_rewrite(sh, &sh_len, sh_cap, PD_RECEIPT_PREFILL,
+                               n_addr) == 0) {
           /* Single-owner swap (pd_free_claim discipline): a racing cleanup
            * claims-or-sees-NULL and never double-frees. */
           uint8_t *old_sh = __atomic_exchange_n(&client_pfe->pd_saved_headers,
@@ -639,14 +760,8 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
       bpfe->settings.uarg = bpfe;
     }
 
-    /* Move the admission active_conns unit dead -> replacement so
-     * pd_cleanup's decrement of the final pd_prefill_ep_idx stays balanced. */
-    if (dead_idx >= 0 && dead_idx < tepval->n_eps) {
-      uint32_t cur = atomic_load(&tepval->pd_ep_loads[dead_idx].active_conns);
-      if (cur > 0)
-        atomic_fetch_sub(&tepval->pd_ep_loads[dead_idx].active_conns, 1);
-    }
-    atomic_fetch_add(&tepval->pd_ep_loads[new_idx].active_conns, 1);
+    pd_load_commit(tepval, &client_pfe->pd_prefill_load_token, new_idx);
+    reserved = 0; /* ownership moved to the client */
     client_pfe->pd_prefill_ep_idx = new_idx;
 
     /* Link the replacement leg (the dead leg's slot was detached in
@@ -718,6 +833,8 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
   goto done;
 
 fail:
+  if (reserved)
+    pd_load_release(tepval, &reserved);
   if (client_pfe) {
     static const char pd_prefill_err[] =
         "HTTP/1.1 503 Service Unavailable\r\n"
@@ -730,15 +847,13 @@ fail:
     {
       const char *pd_model = proxy_effective_model(client_pfe);
       int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-      llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 4 /*prefill error*/);
+      sp_pd_record(client_pfe, pd_model, 0, 0, pd_kv, 4 /*prefill error*/);
     }
+    /* The client's answer: completed with the status written. */
+    proxy_record_local_completion(client_pfe, 503);
     if (client_pfe->fd > 0) {
-      if (client_pfe->ssl) {
-        SSL_write(client_pfe->ssl, pd_prefill_err, sizeof(pd_prefill_err) - 1);
-      } else {
-        send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
-             MSG_DONTWAIT | MSG_NOSIGNAL);
-      }
+      sp_raw_status_write(client_pfe, pd_prefill_err, sizeof(pd_prefill_err) - 1,
+                          MSG_DONTWAIT | MSG_NOSIGNAL);
     }
     pd_cleanup(client_pfe);
     client_pfe->pd_phase = PD_PHASE_ERROR;

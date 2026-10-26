@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Toolchain and unit dependencies
         run: |
@@ -42,8 +44,47 @@ jobs:
           ./common/test_model_routing
           gcc -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer \
             -o /tmp/test_model_routing_sanitized common/test_model_routing.c \
-            common/sockproxy_routing.c -Icommon
+            common/sockproxy_routing.c common/sockproxy_pool.c common/sockproxy_qsbr.c \
+            common/sockproxy_fc.c common/log.c -Icommon -lpthread
           ASAN_OPTIONS=detect_leaks=1 /tmp/test_model_routing_sanitized
+          make -C common test_route_hostless
+
+      # The runner kernel's 32-bit mmap randomisation leaves no room for
+      # ThreadSanitizer's shadow layout ("unexpected memory mapping").
+      - name: Pool lifetime (holders, grace period, index, permits; ASan + UBSan and TSan)
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          make -C common test_poolref
+
+      - name: An HTTP/2 stream gives its pool back on the real stream free (ASan + UBSan)
+        run: make -C common test_h2rref
+
+      - name: An HTTP/2 client connection's end records and logs why (ASan + UBSan)
+        run: make -C common test_h2end
+
+      - name: The header deadline charges only the block of the connection that armed it (ASan + UBSan and TSan)
+        run: make -C common test_hdrdl
+
+      - name: Parser settings shared by every connection are filled once (ASan + UBSan and TSan)
+        run: make -C common test_ponce
+
+      - name: One HTTP/2 backend leg ending answers only its own streams (ASan + UBSan)
+        run: make -C common test_h2leg
+
+      - name: Nothing reads an HTTP/2 stream after an answer that may have freed it (ASan + UBSan, gateway object included)
+        run: make -C common test_h2deny
+
+      - name: HTTP/2 request body outlives its client stream (ASan)
+        run: make -C common test_h2body
+
+      - name: A half-closed HTTP/2 client is never held (ASan + UBSan)
+        run: make -C common test_h2hold
+
+      - name: An endpoint force-close hands HTTP/2 connections to their worker (ASan + UBSan)
+        run: make -C common test_forceclose
+
+      - name: An L7 FORWARD route selects within the listener's pool (ASan + UBSan and TSan)
+        run: make -C common test_l7route
 
       - name: Modern MCP validation, framing, relay and selection (sanitizers)
         run: make -C common test_mcp
@@ -60,9 +101,23 @@ jobs:
       - name: Admission-gate identity transport and the keyless shared bucket
         run: make -C common test_aiident
 
-      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off) and its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize)
+      - name: Operational log (per-thread rings, one writer thread; a full ring never blocks the caller)
+        run: make -C common test_log
+
+      - name: A request's header block is edited once and a body read never (request framer state, header edits; ASan + UBSan)
+        run: make -C common test_creq
+
+      - name: The objective header's capture, the class headers of an admitted response, and a backend's X-Api-Key in its response head (real framers, ASan + UBSan)
+        run: make -C common test_objhint
+
+      - name: The llm-d request headers (TTL parse and capture, dropped-reason mapping, the forwarded objective and fairness rewrite) and the X-Vllm-Priority strip of the request head (ASan + UBSan)
+        run: make -C common test_llmd
+
+      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off), its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize), its priority bands (order, shed, floors, wait windows and shares, weighted wake, tenant rotation), the P/D role gates waiting at a full role ceiling, and the queue deadline timer (a window is enforced at its end, per pool, no idle wake-ups over 10 s) (production gate code, ASan + UBSan)
         run: make -C common test_fc
 
+      - name: What the gateway reads from a request body's JSON (tier hint, model, stream, max tokens, usage), in the literal and the escaped spellings, and what it rewrites in place (the tier null, the priority key rename) (ASan)
+        run: make -C common test_usage
       - name: Half-close observation (bucket edges, sampling gate, TLS end classification, User-Agent families)
         run: make -C common test_hc
 
@@ -74,6 +129,24 @@ jobs:
 
       - name: A client kept open after its FIN has only its read side shut (source invariant)
         run: make -C common check_client_eof_keep
+
+      - name: A P/D request reports the status its client received, never the prefill leg's (source invariant)
+        run: make -C common check_pd_status_sites
+
+      - name: A response the gateway writes itself is recorded once, as a staged refusal or an outage, without a TTFB sample (source invariant, mutation-tested)
+        run: make -C common check_local_answers
+
+      - name: The capacity-queue deadline timer is opened by proxy_main before any worker thread (source invariant, mutation-tested)
+        run: make -C common check_deadline_init_order
+
+      - name: P/D completion detectors and the prefill/decode status verdicts (ASan)
+        run: make -C common test_pd_complete && ./common/test_pd_complete
+
+      - name: What proves a P/D decode stream finished (ASan + UBSan)
+        run: make -C common test_pd_finish
+
+      - name: The decode leg's EOF under an open stream, finished or cut (ASan + UBSan, mutation-tested)
+        run: make -C common test_pd_eof_finish
 
       - name: The correlation key that joins a request's records across its keep-alive reset
         run: make -C common test_ridjoin
@@ -101,5 +174,14 @@ jobs:
       - name: UC-5 terminal admission framing (exact length, split input, overflow rejection)
         run: make -C common test_admit
 
+      - name: UC-5 backend failure completion Audit (production sender, identity and once-only guards)
+        run: make -C common test_backend_failure_audit
+
+      - name: A started answer takes no new status line (framer state at every cut, senders and reaper with their twin)
+        run: make -C common test_answer
+
       - name: UC-5 unchanged L2 split horizon (all VLAN values, routing/NAT/tunnel exceptions)
         run: make -C common test_l2_reflection
+
+      - name: Atomic P/D reservations, actual cleanup and generation-qualified FIFO wake (ASan + UBSan)
+        run: make -C common test_i18

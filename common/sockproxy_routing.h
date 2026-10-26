@@ -37,4 +37,13 @@ proxy_epval_t *find_endpoint_lpm(proxy_map_ent_t *ent, const char *host,
                                   const char *request_path,
                                   const char *model_name);
 
+/* The pool of a request with no usable Host (sp_route_hostless). */
+enum sp_hostless {
+  SP_HOSTLESS_FIRST,   /* no pool names a model: the listener's first pool */
+  SP_HOSTLESS_MODEL,   /* the pool that names the request's model */
+  SP_HOSTLESS_REFUSE,  /* pools name models, none the request's: refused */
+};
+int sp_route_hostless(const proxy_map_ent_t *ent, const char *model,
+                      proxy_epval_t **pool);
+
 #endif /* __SOCKPROXY_ROUTING_H__ */

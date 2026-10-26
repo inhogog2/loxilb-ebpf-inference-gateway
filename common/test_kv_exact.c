@@ -112,6 +112,7 @@ typedef struct llm_prefix_key {
 typedef struct ep_load_tracker {
   _Atomic uint32_t active_conns;
   _Atomic uint32_t num_gpu_blocks;
+  _Atomic uint8_t  kv_usage_enc;     /* decode KV pressure: 0 = unknown, 1..101 = pct + 1 */
 } ep_load_tracker_t;
 
 typedef struct proxy_epval {

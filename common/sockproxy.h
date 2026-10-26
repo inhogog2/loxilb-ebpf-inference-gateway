@@ -13,6 +13,7 @@
 
 #include "llhttp.h"
 #include "sockproxy_sse_observe.h"
+#include "sockproxy_answer.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -21,9 +22,42 @@
 #include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
 #include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
 #include "sockproxy_abandon.h"      /* unfinished-stream accounting + stalled-client policy */
+#include "sockproxy_obj_hint.h"     /* the objective a request asks for by header (proxy_fd_ent member) */
+#include "sockproxy_llmd.h"         /* the llm-d TTL a request asks for by header (proxy_fd_ent member) */
+#include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
+
+/* Why an HTTP/2 client connection ended (proxy_fd_ent.h2_end_reason). */
+enum {
+  SP_H2_END_UNRECORDED = 0,  /* no site recorded one: the log adds SO_ERROR */
+  SP_H2_END_CLIENT_EOF,      /* the client closed its side */
+  SP_H2_END_CLIENT_ERROR,    /* reading from the client failed (errno) */
+  SP_H2_END_SESSION_ERROR,   /* the HTTP/2 session failed (frames, send) */
+  SP_H2_END_HDR_DEADLINE,    /* a header block outlived the header deadline */
+  SP_H2_END_IDLE,            /* idle timeout */
+  SP_H2_END_LEG,             /* a backend leg's teardown took the client */
+  SP_H2_END_LISTENER,        /* the rule's listener was deleted */
+  SP_H2_END_TEARDOWN,        /* an endpoint teardown or force-close */
+  SP_H2_END_DEFERRED,        /* a deferred close finished */
+  SP_H2_END_REAPER,          /* the P/D reaper ended an unanswered request */
+};
+
+/* Which header-deadline check ended a connection (h2_end_hdr_check). */
+enum {
+  SP_HDR_CHECK_NONE = 0,
+  SP_HDR_CHECK_H2_READ,      /* the worker, reading an HTTP/2 connection */
+  SP_HDR_CHECK_H1_READ,      /* the worker, reading HTTP/1.1 headers */
+  SP_HDR_CHECK_CLOCK,        /* the 1 Hz health pass */
+};
+
+/* The last request's X-Forwarded-For (proxy_fd_ent.l7_xff_verdict). */
+enum {
+  SP_XFF_NONE = 0,           /* no L7 policy, or no valid peer address */
+  SP_XFF_REPLACED,           /* the inbound chain replaced with the peer */
+  SP_XFF_EXTENDED,           /* the inbound chain extended with the peer */
+};
 typedef struct proxy_h2_session proxy_h2_session_t;
 
 // Forward declaration for proxy_arg (defined later, needed for proxy_map_ent)
@@ -138,6 +172,7 @@ void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 // can pin them without the proxy object graph.
 #include "sockproxy_hdr_deadline.h"
 #include "sockproxy_fc.h"  /* capacity admission: per-pool state and per-request permit */
+#include "sockproxy_pool.h"  /* pool lifetime: reference count and the workers' index */
 
 // ============================================================================
 // PROMETHEUS METRICS: Global Stats (Forward Declaration)
@@ -202,6 +237,9 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_prefill_ep_died;        // prefill backend died mid-request (client got 503)
     _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
+    _Atomic uint64_t pd_terminator_synthesized; // graceful-[DONE] sweep wrote the terminator the engine never sent
+    _Atomic uint64_t reap_fallback;             // a reaper ended a client from the health thread: its owner worker could not be handed the end
+    _Atomic uint64_t route_host_missing;        // a request with no usable Host reached dispatch on a listener whose pools name models
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     // Same-EP reconnect on transient backend connect failure (affinity-bearing
     // services only — P/D disagg / KV-exact). A retry that succeeds keeps the
@@ -412,7 +450,25 @@ typedef struct ep_load_tracker {
   // swap-space pressure signal for the SWAP_WEIGHT term (0 when the
   // scraper does not advertise it — the SWAP term then contributes nothing).
   _Atomic uint32_t swap_pressure;
+  // Decode KV-pressure signal (vllm:kv_cache_usage_perc / gpu_cache_usage_perc /
+  // sglang:token_usage), fed by llb_ai_update_ep_kv_usage (same traversal and
+  // locking as the capacity bridge, and like it NEVER stamps last_update_ts).
+  // Encoded so that the zero-filled allocation (sp_pool_alloc memset, no init
+  // site for pd_ep_loads[]) reads as "never reported":
+  //   0      = not reported / unknown
+  //   1..101 = reported percentage + 1 (0..100 %)
+  // Decoded only by pd_kv_usage_dec() in sockproxy_pd.c, consumed only by the
+  // pd_select_decode_excluding score loop when LLB_PD_DECODE_KV_WEIGHT > 0;
+  // freshness rides last_update_ts (the same scraper sample stamps it through
+  // llb_ai_update_ep_queue_depth). An unknown or stale value is neutralized
+  // to the fleet mean, never read as 0 %.
+  _Atomic uint8_t kv_usage_enc;
 } ep_load_tracker_t;
+
+/* cgo contract of llb_ai_update_ep_kv_usage: 0..100 = reported percentage,
+ * PD_KV_USAGE_UNKNOWN = the scraper saw no usage family in this sample. The
+ * bridge maps it onto ep_load_tracker_t.kv_usage_enc (pct + 1, 0 = unknown). */
+#define PD_KV_USAGE_UNKNOWN 0xFF
 
 /* Radix trie for cache-aware prefill EP selection (Tier 1) */
 typedef struct pd_trie pd_trie_t;
@@ -630,8 +686,10 @@ typedef struct proxy_epval {
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
   uint8_t  hold_mode;              // enum sp_hold_mode: hold a client that half-closed after its request
+  uint8_t  ai_objective_strict;    // 1 = a request naming an objective it may not use is refused 403
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
+  uint32_t ai_default_tokens;      // completion tokens reserved for a request without max_tokens (0 = off)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
    * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG,
    * 2=trtllm ⇒ PD_ENGINE_TRTLLM) so the orchestration branch never reads a
@@ -669,6 +727,12 @@ typedef struct proxy_epval {
   uint8_t  pd_balance_abs_threshold;   // default 3
   _Atomic uint32_t pd_tier2_rr;       // RR tie-breaker for Tier 2 min-load
   _Atomic uint32_t pd_decode_rr;      // RR tie-breaker for decode EP tie-breaking (P2 fix: TB3/TB4)
+  // Decode KV-pressure fill state, for the one-shot [PD_DEC] transition log
+  // only (never read by a selection): 0 = the last scored selection had a
+  // fresh reading on every candidate (or LLB_PD_DECODE_KV_WEIGHT is 0 / no
+  // selection scored yet), 1 = a neutral fill was in effect. Zero-filled at
+  // allocation; written only by pd_select_decode's score path.
+  _Atomic uint8_t  pd_kv_fill_state;
   uint32_t pd_session_ttl_sec;         // P/D sliding idle TTL in seconds; 0=default 300s
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP]; // independent of chwbl_config_t
 
@@ -800,7 +864,14 @@ typedef struct proxy_val {
   uint32_t be_tls_gen;               /* +1 on every replacement */
   uint64_t be_tls_replaced_ms;       /* proxy_mono_ms() of the last one; 0: never */
   uint32_t nfds;
+  /* The listener's pools. The table is read and written only under the
+   * proxy lock; notify workers read the published index instead
+   * (sockproxy_pool.h), which is rebuilt after every change to the table. */
   struct proxy_epval *ephash;
+  sp_pool_index_t *_Atomic pools;
+  /* Out of the table but still in the published index, whose rebuild
+   * failed: let go of by the next index published. Under the lock. */
+  struct proxy_epval *pools_waiting;
   struct proxy_fd_ent *fdlist;
   conversation_mapping_t *conv_map;  // Conversation tracking (P0.3)
   pthread_rwlock_t conv_lock;        // Lock for conv_map (P0.3)
@@ -882,20 +953,6 @@ typedef struct proxy_map_ent {
   uint8_t            l7_n_trusted_ranges;
   l7_trusted_range_t l7_trusted_ranges[L7_MAX_TRUSTED_RANGES];
 
-  // (gap-fix): scratch "resolved sub-pool" used by l7_resolve_pool to
-  // forward a matched L7 route to a SPECIFIC subset of the service's endpoints
-  // (the route's backendRefs[].ep, honoring weights) instead of the whole pool.
-  // It is a struct proxy_epval (allocated lazily at first FORWARD on this service)
-  // whose eps[]/n_eps are narrowed from the base pool (val.ephash) per FORWARD.
-  // The proxy hot path is single-threaded (one proxy_run event-loop thread), and
-  // each request fully consumes this scratch (connects to the chosen endpoint)
-  // synchronously before the next is routed, so a single reusable buffer is safe
-  // (mirrors the existing tepval->ep_sel single-threaded mutation in ep.c). It is
-  // an opaque void* here to keep sockproxy.h free of any forward dependency; the
-  // engine TU casts it to (proxy_epval_t *). Freed by proxy_detach_l7_policy and
-  // when the proxy_map_ent is torn down.
-  void   *l7_resolved_pool;         // struct proxy_epval * scratch (opaque here)
-
   // L7 (Tier-1) byte shaper. Config + runtime bucket live HERE on the heap
   // proxy_map_ent (per-service state), never on proxy_arg (the 4096-byte eBPF
   // map value). qos_cfg.cir_Bps == 0 means the shaper is off and the relay
@@ -908,6 +965,15 @@ typedef struct proxy_map_ent {
   struct proxy_qos_bucket qos_up;
   struct proxy_qos_bucket qos_down;
 } proxy_map_ent_t;
+
+/* Whether a policy is attached, read outside the proxy lock (a gate): the
+ * policy unit reads it again, with the routes, under the read lock. The two
+ * writers (attach, clear) store it atomically under the write lock. */
+static inline uint8_t
+l7_policy_on(const proxy_map_ent_t *ent)
+{
+  return __atomic_load_n(&ent->has_l7_policy, __ATOMIC_RELAXED);
+}
 
 // ============================================================================
 // SNI-Based Multi-Certificate Support (GLOBAL CERTIFICATE STORE)
@@ -1135,11 +1201,21 @@ struct proxy_fd_ent {
    * than through it. */
   llhttp_t creq_parser;            // HTTP_REQUEST; settings are one shared static
   uint8_t  creq_parser_inited;
+  creq_block_t cresp_blk;            // the same for a backend read and its response, kept by the response framer
+  creq_block_t creq_blk;             // where the last client read stands in its request (sockproxy_creq_block.h)
 
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;
   sp_sse_observer_t cresp_sse;
   uint8_t cresp_payload_observed;
+  /* A P/D decode stream's finish evidence (sockproxy_pd_terminal.h). The 8 KiB
+   * parse state is allocated on the stream's first body bytes, so no other
+   * connection carries it, and freed when the shell is recycled. Written by
+   * the response framer under this entry's lock; pd_client_finished is its
+   * verdict, the one byte the health thread's sweep and the decode leg's EOF
+   * read without that lock. */
+  struct sp_pd_finish *pd_client_finish;
+  _Atomic uint8_t pd_client_finished;
   /* Set by the response framer under this entry's lock, consumed by the backend
    * leg's EOF without it, so it is atomic and the consumer takes it with an
    * exchange: whoever clears it is the one that counts the completion. A
@@ -1148,6 +1224,9 @@ struct proxy_fd_ent {
    * a decode leg on different fds, and this codebase shards those to different
    * notify workers. */
   _Atomic uint8_t cresp_unframed;  // this response is delimited by the backend's EOF
+  /* Set when that EOF came and ended the answer: the client's connection is
+   * then the only thing left to say so, by closing. */
+  _Atomic uint8_t cresp_eof_ended;
   /* The two counters have one writer each — requests are framed on the client's
    * worker, responses on the backend's — so a relaxed atomic is enough for each
    * and no lock is needed to keep them whole.
@@ -1212,6 +1291,7 @@ struct proxy_fd_ent {
    * one as held. */
   _Atomic uint8_t  eof_hold;          // held on EOF: FIN read, kept open for an owed answer
   _Atomic uint8_t  cresp_answer_open; // the response framer is inside an answer (1xx excluded)
+  _Atomic uint8_t  cresp_in_msg;      // the response framer is inside a message, 1xx included (sockproxy_answer.h)
   _Atomic uint8_t  hold_answer_began; // an answer to the held request has begun
   _Atomic uint8_t  hold_end;          // enum sp_hold_end; the first reason recorded wins
   _Atomic uint32_t hold_leg_ended;    // requests framed when the answer's leg ended, plus one (0: none)
@@ -1252,6 +1332,32 @@ struct proxy_fd_ent {
   void *learn_epv;
   proxy_h2_session_t *h2_session;  // HTTP/2 session context (NULL for HTTP/1.1)
   void *backend_h2_session;        // Backend HTTP/2 session (for backend connections only)
+  /* Why an HTTP/2 client connection ended, for the one line its teardown
+   * logs (proxy_h2_client_end_log): the first cause recorded wins. The leg
+   * fields name the backend connection that caused it, for SP_H2_END_LEG.
+   * The last request's time and its X-Forwarded-For decision are kept for
+   * the same line. Stores only; nothing is logged per request. */
+  uint8_t h2_end_reason;           // SP_H2_END_*
+  uint8_t l7_xff_verdict;          // SP_XFF_*: the last request's X-Forwarded-For
+  uint8_t l7_xff_ntrusted;         // trusted ranges the listener had for it
+  int h2_end_leg_fd;
+  int h2_end_leg_ep;
+  int h2_end_errno;
+  uint32_t h2_end_leg_ip;          // the leg's endpoint, network order
+  uint16_t h2_end_leg_port;        // host order
+  uint64_t h2_last_req_ms;         // monotonic ms the last stream was forwarded
+  /* An HTTP/2 backend leg's endpoint as it was connected (network order),
+   * kept from creation so a client's end line can name it after the leg's
+   * socket has gone (getpeername fails on a reset or closed socket). */
+  uint32_t leg_ep_xip;
+  uint16_t leg_ep_xport;
+  /* SP_H2_END_HDR_DEADLINE only: which check fired (SP_HDR_CHECK_*), the
+   * header block's age, the deadline it outlived and the stream that armed
+   * it (the end line adds the session's last processed stream). */
+  uint8_t h2_end_hdr_check;
+  int64_t h2_end_hdr_age_s;
+  uint32_t h2_end_hdr_ms;
+  int32_t h2_end_hdr_stream;       // the stream that armed it (0: the preface)
   uint64_t nrb;
   uint64_t nrp;
   uint64_t ntb;
@@ -1301,6 +1407,9 @@ struct proxy_fd_ent {
   _Atomic uint8_t mcp_inflight; /* H1 permits one request until its response is framed. */
   uint8_t mcp_retry_pending; /* Only a failed, not yet connected H1 backend leg. */
   uint32_t mcp_retry_excluded; /* Bounded to original pool endpoints per request. */
+  /* The members of the pool this request's L7 FORWARD route names, on any
+   * pool (l7_route_pool), with the route's weights and cursor; set at the
+   * dispatch, cleared at the next one. */
   uint8_t mcp_route_active;
   uint32_t mcp_route_mask;
   uint8_t mcp_route_weights[MAX_PROXY_EP];
@@ -1363,15 +1472,28 @@ struct proxy_fd_ent {
   // or the peer is not IPv4.
   char     l7_peer_ip[L7_HOP_TEXT_MAX];
 
-  // Header-completion deadline anchor (slowloris guard), every listener.
-  // HTTP/1.1: set on the first byte of a request's headers, cleared once
-  // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2: set
-  // when the session is created and when a header block begins, cleared on
-  // END_HEADERS, so it never bounds DATA, PING or WINDOW_UPDATE traffic on a
-  // live stream. While set, the read path and the 1 Hz health pass drop the
-  // connection once (now - anchor) exceeds the listener's deadline; the
-  // health pass is what catches a client that simply stops sending.
-  time_t l7_hdr_accum_start;    // anchor of the in-progress request headers (0=unset)
+  // Index of the interface this connection arrived on, for network-identity
+  // bindings that match on an interface: 0 = not read, -1 = the read failed
+  // (kept, so it is not tried again on every request), else the index. Read
+  // at most once per connection (sockproxy_in_ifindex.h), and only while
+  // such a binding exists, so a gateway with none never makes the calls.
+  // With l7_peer_ip it is the pair a binding is resolved against.
+  int32_t  l7_in_ifindex;
+
+  // Header-completion deadline clock (slowloris guard), every listener.
+  // HTTP/1.1: armed on the first byte of a request's headers, disarmed once
+  // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2:
+  // armed when the session is created (the first HEADERS is owed from the
+  // preface) and re-armed by every header block as it begins (a block is
+  // contiguous on the connection, so a new one means the last one ended);
+  // disarmed on END_HEADERS and when the stream that armed it closes, so it
+  // never bounds a request in flight, DATA, PING or the idle time between
+  // requests. While armed, the read path and the 1 Hz health pass end the
+  // connection once the block outlives the listener's deadline; the health
+  // pass is what catches a client that simply stops sending. Written by the
+  // connection's worker and read by the health pass: see sp_hdr_clock_t for
+  // how a start is published.
+  sp_hdr_clock_t l7_hdr;
 
   llm_prefix_key_t prefix_key;  // LLM prefix extraction (P0.2)
 
@@ -1411,7 +1533,10 @@ struct proxy_fd_ent {
   uint16_t metric_response_status;
   uint8_t  ai_gw_mode;                // 1=AI Gateway connection; copied from the rule at accept
   uint8_t  apikey_auth;               // 0=unset 1=required 2=declared-disabled; copied from the rule at accept
+  uint8_t  pd_rule;                   // 1=the rule is P/D (pd_disagg_enabled); copied from the rule at accept
+  uint8_t  resp_kernel;               // 1=a response on this client connection was paired to the kernel (sockmap): its answers bypass userspace, no status is seen
   uint8_t  metric_ai_recorded;       // 1=this request already counted in ai_requests_total (dedup guard)
+  uint8_t  metric_resp_noted;        // 1=this request's client-visible response is recorded (proxy_note_response_ latch)
 
   // HTTP/HTTPS Trace Context (: Protocol Analyzer)
 #ifdef HAVE_HTTP_TRACE
@@ -1503,10 +1628,31 @@ struct proxy_fd_ent {
                                       // ai_gw_decision_t.key_id. Settle-path twin of tenant/user above:
                                       // the key's own tokens-per-minute bucket charges at consume time,
                                       // which runs long after key_dec has gone out of scope
+  char     auth_net_identity[64];     // Network-identity binding that matched this request's source
+                                      // ("" = none); sized to ai_gw_admit_result_t.net_identity. Set on
+                                      // every admitted request a binding matched, whether it decided the
+                                      // tenant or was noted beside a credential
+  uint8_t  auth_src;                  // AI_GW_AUTH_SRC_*: what decided tenant_id. Per request, with the
+                                      // identity above
   // Upstream hygiene, stamped by the admission gate per request:
   uint8_t  auth_strip_authz;          // 1 = strip Authorization before dispatch (JWT arm decided, no passthrough)
   uint8_t  auth_fwd_identity;         // 1 = inject X-Auth-Tenant/X-Auth-User upstream (verified values)
   uint8_t  auth_jwt_capable;          // 1 = rule mode consults the JWT arm (3/4): always strip client X-Auth-*
+  uint8_t  auth_netid_fwd;            // 1 = the binding that matched this request's source forwards identity:
+                                      // inject X-Auth-Tenant/X-Auth-User upstream. Per request. The strip of
+                                      // client-sent X-Auth-* is the service's, not the request's (ai_gw_netid_bound)
+  // The class of the request, per request with the identity above.
+  // obj_hint is what the request's header asked for; the rest is the
+  // admission gate's answer, zero while no class is configured.
+  sp_obj_hint_t obj_hint;
+  sp_ttl_hint_t ttl_hint;             // x-llm-d-inference-ttl, read only by a rule with fc_llmd_headers on
+  int32_t  adm_priority;              // the priority in force, after the cap
+  uint8_t  adm_class;                 // AI_GW_CLASS_*
+  uint8_t  adm_class_set;             // 1 = the class stage ran for this request
+  uint8_t  adm_objective_denied;      // the header named an objective the request may not use
+  uint8_t  adm_hint_not_applied;      // a body hint could not be read (streamed body)
+  uint8_t  class_expose_pending;      // 1 = the response head still owes the class headers
+  char     adm_objective[64];         // the hint applied: an objective name, "tier:<value>", or ""
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer
@@ -1530,6 +1676,10 @@ struct proxy_fd_ent {
   uint8_t  abandon_reason;            // enum abandon_reason + 1 when the end of an open stream is
                                       // already attributed (backend died, stall abort); 0 = a
                                       // teardown with the stream open is the client leaving
+  uint8_t  end_cause;                 // enum sp_end_cause: why this request's answer ended before
+                                      // the client had all of it, when that is known as it ends
+                                      // (a reaper's cut, a stall, its leg dying under it); 0 = the
+                                      // teardown decides (sockproxy_end_cause.h)
   uint64_t stream_start_mono_ns;      // CLOCK_MONOTONIC stamp at SSE activation; latency source for
                                       // llb_ai_record_request (wall-clock seconds truncated sub-second
                                       // streams to 0 and NTP steps could skew/negate the delta)
@@ -1613,6 +1763,8 @@ struct proxy_fd_ent {
   char     epp_served[64];           // "ip:port" that took the request (response phase)
   uint8_t *epp_resp_head;            // response head gathered for the EPP (heap, bounded)
   uint16_t epp_resp_head_len;
+  uint32_t pd_prefill_load_token;    // Owned legacy load unit: EP+1, zero = none
+  uint32_t pd_decode_load_token;     // Independent of mutable decode routing hint
   int      pd_prefill_ep_idx;        // Selected prefill endpoint index
   int      pd_decode_ep_idx;         // Selected decode endpoint index
   uint8_t *pd_saved_body;            // Heap: original request body for decode phase
@@ -1633,6 +1785,11 @@ struct proxy_fd_ent {
   time_t   pd_phase_start_ts;        // Wall-clock timestamp for timeout tracking
   uint64_t pd_prefill_start_ns;      // Monotonic timestamp for prefill latency
   uint64_t pd_decode_start_ns;       // Monotonic timestamp for decode latency
+  uint64_t pd_first_event_ns;        // Monotonic time the decode answer's first SSE data
+                                     // object reached the client's framer; 0 = none yet.
+                                     // Carried on the lifecycle record (sp_pd_record)
+  uint8_t  pd_fallback_reason;       // PD_FB_*: why the prefill was recomputed on the
+                                     // decode leg; 0 = it was not. Carried likewise
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
   /* SGLang P/D dual-dispatch state. The CLIENT pfe reuses the
@@ -1765,6 +1922,23 @@ pfe_rcv_note(proxy_fd_ent_t *pfe)
  * status parser latches the FIRST status line it sees and never overwrites
  * it, so a 100-Continue exchange leaves metric_response_status at 100 with
  * the real status never recorded. */
+/* Record the response the client receives, once per request: status,
+ * responses-by-status class counter, TTFB sample (sockproxy_http.c). */
+int proxy_note_client_response(struct proxy_fd_ent *pfe, uint16_t status);
+/* The same record for a response the gateway wrote itself (a refusal, an
+ * outage answer): status and class counter, no TTFB sample. */
+int proxy_note_local_answer(struct proxy_fd_ent *pfe, uint16_t status);
+/* proxy_note_local_answer for a refusal: also marks the request recorded, so
+ * no completion is owed beside its deny record. */
+int proxy_note_local_refusal(struct proxy_fd_ent *pfe, uint16_t status);
+/* The same record for one HTTP/2 stream: its class count and, when
+ * sample_ttfb (a backend reply), the TTFB sample from the request's
+ * END_STREAM. Once per stream. Reached through sockproxy_h2.c's two wrappers,
+ * h2_note_backend_response and h2_note_local_answer. */
+struct proxy_h2_stream;
+int proxy_h2_note_stream_response(struct proxy_h2_stream *stream, uint16_t status,
+                                  int sample_ttfb);
+
 static inline int
 proxy_status_is_2xx(unsigned int status)
 {
@@ -2101,8 +2275,13 @@ struct proxy_arg {
   // Half-close hold mode, same hop as the admission fields: enum
   // sp_hold_mode (0 = the process default).
   uint8_t  half_close_mode;
+  // Same hop: 1 = a request naming an objective it may not use is refused.
+  uint8_t  ai_objective_strict;
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
+  // Default reservation, same hop: completion tokens the admission gate
+  // reserves for a request that declares no max_tokens (0 = off).
+  uint32_t ai_default_tokens;
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
   // proxy_add). The nat2proxy hop of the additive chain
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
@@ -2145,6 +2324,17 @@ struct proxy_arg {
   // Admission headers on admitted responses, same hop: 0 = the
   // environment, 1 off, 2 on.
   uint8_t  fc_expose_headers;
+  // Priority bands, same hop (dp_proxy_tacts has the encodings): switches
+  // 0 = the environment; numeric knobs the rule's own, triples by band.
+  uint8_t  fc_wake_policy;
+  uint8_t  fc_shed_queue;
+  uint8_t  fc_tenant_wake;
+  uint8_t  fc_llmd_headers;
+  uint8_t  fc_band_weight[3];
+  uint8_t  fc_band_min_share_pct[3];
+  uint8_t  fc_critical_reserve_pct;
+  uint8_t  fc_band_queue_pct[3];
+  uint32_t fc_band_wait_ms[3];
 
   // The rule's connectionLimit (dp_proxy_tacts.conn_limit), copied by
   // llb_conv_nat2proxy. A fullproxy rule never enters nat_map, so the
@@ -2229,19 +2419,23 @@ proxy_hdr_deadline_ms(const proxy_map_ent_t *ent)
   return sp_hdr_deadline_resolve_ms(configured);
 }
 
-/* True once a client connection has been accumulating request headers for
- * longer than its listener's deadline. The deadline is rounded up to whole
- * seconds, the resolution of the anchor and of the health pass. */
+/* True once a client connection's armed header block has outlived its
+ * listener's deadline. *age (when given) is the block's age in seconds, or
+ * -1 when nothing of this connection's is armed. */
 static inline int
 proxy_hdr_deadline_expired(const proxy_map_ent_t *ent,
-                           const proxy_fd_ent_t *pfe, time_t now)
+                           const proxy_fd_ent_t *pfe, time_t now, int64_t *age)
 {
-  uint32_t ms = proxy_hdr_deadline_ms(ent);
+  return sp_hdr_expired(&pfe->l7_hdr, (const uint64_t *)&pfe->gen, now,
+                        proxy_hdr_deadline_ms(ent), age);
+}
 
-  if (ms == 0 || pfe->l7_hdr_accum_start == 0) {
-    return 0;
-  }
-  return (now - pfe->l7_hdr_accum_start) > (time_t)((ms + 999) / 1000);
+/* Arm the header clock for this connection's generation; see sp_hdr_arm. */
+static inline void
+proxy_hdr_arm(proxy_fd_ent_t *pfe, time_t now, int32_t stream)
+{
+  sp_hdr_arm(&pfe->l7_hdr, now,
+             atomic_load_explicit(&pfe->gen, memory_order_relaxed), stream);
 }
 
 // Ensure structure doesn't exceed eBPF map limits (critical for kernel compatibility)
@@ -2307,6 +2501,22 @@ int proxy_sockmap_drop_accel(struct proxy_ent *key);
 
 /* Deferred teardown bookkeeping (see proxy_fd_ent_t.defer_close_ms). */
 uint64_t proxy_mono_ms(void);
+
+/* Record why an HTTP/2 client connection is ending (sockproxy_h2.c): the
+ * first cause wins; `err` is an errno or 0; `leg` is the backend connection
+ * that caused it, or NULL. A no-op for anything but an HTTP/2 client. */
+void proxy_h2_client_end_mark(proxy_fd_ent_t *pfe, int reason, int err,
+                              const proxy_fd_ent_t *leg);
+/* proxy_h2_client_end_mark for the header deadline: also records which
+ * check fired, the header block's age and the deadline (SP_HDR_CHECK_*). */
+void proxy_h2_client_end_mark_deadline(proxy_fd_ent_t *pfe, int check,
+                                       int64_t age_s, uint32_t deadline_ms);
+/* The one line an HTTP/2 client connection's teardown logs (sockproxy_h2.c):
+ * the recorded cause, the leg and its endpoint, the time since the last
+ * request, the open streams and the last request's X-Forwarded-For. Info
+ * when the client left, at the idle timeout, or when a leg ended with no
+ * request in flight; a warning otherwise. */
+void proxy_h2_client_end_log(proxy_fd_ent_t *pfe);
 void proxy_defer_close_mark(proxy_fd_ent_t *pfe);
 void proxy_defer_close_clear(proxy_fd_ent_t *pfe);
 int proxy_defer_close_pending(void);
@@ -2480,6 +2690,10 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 #ifndef SP_SETUP_CONNECTING
 #define SP_SETUP_CONNECTING (3)
 #endif
+/* Success reserves one P unit; caller commits it or rolls it back.
+ * Mid-request retries pass allow_park=0 and never enqueue a live request. */
+int pd_reserve_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
+                       uint32_t excluded_mask, int allow_park);
 int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                       uint32_t excluded_mask);
 /* same-EP reconnect budget on transient backend connect failure
@@ -2498,6 +2712,8 @@ uint32_t pd_connect_retry_budget(int pd_disagg_enabled, uint32_t kv_exact_mode);
 int pd_parked_pop_head(pd_parked_fifo_t *q, pd_parked_ent_t *out);
 int pd_parked_peek_head(const pd_parked_fifo_t *q, pd_parked_ent_t *out);
 int pd_parked_remove_fd(pd_parked_fifo_t *q, int want_fd, uint64_t want_gen);
+int pd_parked_holds(const pd_parked_fifo_t *q, int fd, uint64_t gen);
+int pd_parked_turn_pending(proxy_epval_t *t, const proxy_fd_ent_t *p);
 /* runtime max-park bound (env LLB_PD_MAX_PARK_SEC; 0/unset = reap off). */
 uint32_t pd_max_park_sec(void);
 /* runtime per-EP parked-FIFO depth (env LLB_PD_QUEUE_DEPTH_PER_EP;
@@ -2518,6 +2734,8 @@ int pd_accept_valve_open(void);
 /* Re-arm the listeners the valve paused when its gate is open. */
 void pd_accept_valve_rearm(void);
 int pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out);
+int pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
+                               int *ep_out, uint32_t excluded);
 int pd_select_any_healthy(proxy_epval_t *tepval, int *ep_out);
 
 /* Radix trie API (sockproxy_pd_trie.c) -- NOT thread-safe, caller must hold pd_trie_lock */

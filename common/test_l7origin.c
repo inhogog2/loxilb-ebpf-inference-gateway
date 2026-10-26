@@ -79,6 +79,17 @@ void proxy_lock_trace_release(pthread_rwlock_t *l) { (void)l; }
 int proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
                                const char *location, const char *body)
 { (void)pfe; (void)status_code; (void)location; (void)body; return 0; }
+/* The records of the H1 answers (sockproxy_http.c); the H2 stub above
+ * answers every request in these tests. */
+int proxy_note_local_answer(proxy_fd_ent_t *pfe, uint16_t status)
+{ (void)pfe; (void)status; return 0; }
+int proxy_note_local_refusal(proxy_fd_ent_t *pfe, uint16_t status)
+{ (void)pfe; (void)status; return 0; }
+void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
+                             const char *code)
+{ (void)pfe; (void)stage; (void)status; (void)code; }
+void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status)
+{ (void)pfe; (void)status; }
 int extract_cookie_by_name(const char *headers, const char *name,
                            char *value, size_t value_size)
 { (void)headers; (void)name; (void)value; (void)value_size; return -1; }
@@ -606,6 +617,9 @@ test_requests_parsed_together_keep_their_own_chains(void)
 int
 main(void)
 {
+  /* The policy unit reads routes under the proxy read lock: the listener
+   * table exists before the first request, as in the product. */
+  listeners_init();
   test_edge_listener();
   test_trusting_listener();
   test_per_request();

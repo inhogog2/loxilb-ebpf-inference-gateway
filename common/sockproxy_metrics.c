@@ -190,6 +190,24 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
             proxy_epval_t *tepval, *tmp_epval;
             HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
                 if (tepval->pd_disagg_enabled) {
+                    /* Endpoint occupancy is independent of cached session count. */
+                    for (int ep = 0; ep < tepval->n_eps; ep++) {
+                        uint64_t units = atomic_load(&tepval->pd_ep_loads[ep].active_conns);
+                        if (tepval->ep_role[ep] == 1) {
+                            snapshot.pd_prefill_inflight += units;
+                        } else if (tepval->ep_role[ep] == 2) {
+                            snapshot.pd_decode_inflight += units;
+                        }
+                    }
+                    /* Clients parked on a prefill endpoint's queue: the per-EP
+                     * FIFO's live count under its own lock (taken under
+                     * PROXY_LOCK here as at every other site). A connection's
+                     * pd_phase is the owner worker's and is not read here. */
+                    pthread_mutex_lock(&tepval->pd_parked_lock);
+                    for (int ep = 0; ep < tepval->n_eps; ep++) {
+                        snapshot.pd_parked_connections += tepval->pd_parked[ep].count;
+                    }
+                    pthread_mutex_unlock(&tepval->pd_parked_lock);
                     pthread_rwlock_rdlock(&tepval->pd_session_lock);
                     snapshot.pd_sessions_active += HASH_COUNT(tepval->pd_session_map);
                     pthread_rwlock_unlock(&tepval->pd_session_lock);
@@ -312,6 +330,10 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
         snapshot.stream_abandon_age_count[r] = atomic_load(&global_stats.stream_abandon.age_count[r]);
     }
     snapshot.stream_stall_abort_sec = sp_sse_stall_abort_sec();
+    sp_pool_counts(&snapshot.pools_live, &snapshot.pools_freed_total);
+    snapshot.pd_terminator_synthesized = atomic_load(&global_stats.pd_terminator_synthesized);
+    snapshot.reap_fallback = atomic_load(&global_stats.reap_fallback);
+    snapshot.route_host_missing = atomic_load(&global_stats.route_host_missing);
 
     return snapshot;
 }
@@ -389,6 +411,45 @@ llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port,
       proxy_epval_t *tepval = node->val.ephash;
       if (tepval && tepval->pd_disagg_enabled && ep_index < tepval->n_eps) {
         atomic_store(&tepval->pd_ep_loads[ep_index].num_gpu_blocks, num_gpu_blocks);
+      }
+      PROXY_UNLOCK();
+      return;
+    }
+    node = node->next;
+  }
+  PROXY_UNLOCK();
+}
+
+/*
+ * llb_ai_update_ep_kv_usage - update per-EP decode KV-cache pressure from the
+ * Go vLLM scraper. Same traversal shape as llb_ai_update_ep_capacity above
+ * (PROXY_LOCK + atomic_store, MAX_PROXY_EP bound, pd_disagg + n_eps guard) and
+ * the same deliberate asymmetry: this writer does NOT stamp last_update_ts
+ * (see the capacity bridge's comment for why that would break the staleness
+ * guard). The queue-depth bridge, called from the same scraper sample, owns
+ * the stamp, so a kv value is exactly as fresh as the queue depth beside it.
+ *
+ * Encoding: the cgo contract is 0..100 or PD_KV_USAGE_UNKNOWN (0xFF). The
+ * field stores pct + 1 so that 0 — the value of a zero-filled pool that no
+ * scraper has ever written (sp_pool_alloc memset; pd_ep_loads[] has no init
+ * site) — means "unknown". Any out-of-range input is stored as unknown rather
+ * than clamped: a broken signal must never look like a reading.
+ */
+void
+llb_ai_update_ep_kv_usage(uint32_t service_ip, uint16_t service_port,
+                          int ep_index, uint32_t kv_usage_pct)
+{
+  uint8_t enc = (kv_usage_pct <= 100) ? (uint8_t)(kv_usage_pct + 1) : 0;
+
+  if (!proxy_struct || ep_index < 0 || ep_index >= MAX_PROXY_EP) return;
+
+  PROXY_LOCK();
+  proxy_map_ent_t *node = proxy_struct->head;
+  while (node) {
+    if (node->key.xip == service_ip && node->key.xport == service_port) {
+      proxy_epval_t *tepval = node->val.ephash;
+      if (tepval && tepval->pd_disagg_enabled && ep_index < tepval->n_eps) {
+        atomic_store(&tepval->pd_ep_loads[ep_index].kv_usage_enc, enc);
       }
       PROXY_UNLOCK();
       return;

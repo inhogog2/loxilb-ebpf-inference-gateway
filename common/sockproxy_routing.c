@@ -80,14 +80,14 @@ build_ephash_key(char *key_buf, size_t buf_size,
  *   5. Would try "host|/" if all prefix matches failed
  *   6. Fallback to "host" (hostname-only, backward compat)
  *
- * @param ent Proxy map entry containing ephash table
+ * @param ix The listener's published pool index, read once per lookup
  * @param host Hostname without port (e.g., "api.example.com")
  * @param request_path Full request path (e.g., "/v1/users/profile/settings")
  * @param model_name AI model name or NULL/empty for wildcard
  * @return Endpoint value or NULL if not found
  */
 static proxy_epval_t*
-find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
+find_endpoint_for_host(const sp_pool_index_t *ix, const char *host,
                        const char *request_path, const char *model_name)
 {
   proxy_epval_t *best_match = NULL;
@@ -96,7 +96,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
   char path_copy[256];
   int best_match_len = -1;  /* Used for debug logging and path matching */
 
-  if (!ent || !host) {
+  if (!ix || !host) {
     return NULL;
   }
 
@@ -119,7 +119,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
     build_ephash_key(search_key, sizeof(search_key), host, path_copy, model_name);
 
     /* Try to find this prefix */
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
 
     if (tepval && (tepval->path_match_mode != 2 ||
                    strlen(path_copy) == path_len)) {
@@ -144,7 +144,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
        * When path_copy is already "/" this is a harmless re-check (already tried
        * in loop body); when path_copy is "/v1" etc., "/" hasn't been tried yet. */
       build_ephash_key(search_key, sizeof(search_key), host, "/", model_name);
-      HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+      tepval = sp_pool_index_find(ix, search_key);
       if (tepval && (tepval->path_match_mode != 2 || path_len == 1)) {
         best_match = tepval;
         best_match_len = 1;
@@ -167,7 +167,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
    * this missing branch. */
   if (!best_match && model_name && model_name[0] != '\0') {
     build_ephash_key(search_key, sizeof(search_key), host, "", model_name);
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
     if (tepval) {
       return tepval;
     }
@@ -183,7 +183,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
 
     while (strlen(path_copy) > 0) {
       build_ephash_key(search_key, sizeof(search_key), host, path_copy, "");
-      HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+      tepval = sp_pool_index_find(ix, search_key);
       if (tepval && (tepval->path_match_mode != 2 ||
                      strlen(path_copy) == path_len)) {
         return tepval;  /* Wildcard pool found */
@@ -192,7 +192,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
       if (last_slash == path_copy) {
         /* Try root "/" as final prefix (harmless re-check when path_copy is "/") */
         build_ephash_key(search_key, sizeof(search_key), host, "/", "");
-        HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+        tepval = sp_pool_index_find(ix, search_key);
         if (tepval && (tepval->path_match_mode != 2 || path_len == 1))
           return tepval;
         break;
@@ -210,7 +210,7 @@ find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
  * Use empty model — IP-based VIPs have no model in their key. */
   if (!best_match) {
     build_ephash_key(search_key, sizeof(search_key), host, "", "");
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
     if (tepval) {
       best_match = tepval;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -230,7 +230,10 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     return NULL;
   }
 
-  proxy_epval_t *best_match = find_endpoint_for_host(ent, host, request_path,
+  /* One index for the whole lookup: every fallback below is answered from
+   * the same snapshot of the listener's pools (sockproxy_pool.h). */
+  const sp_pool_index_t *ix = sp_pool_index(ent);
+  proxy_epval_t *best_match = find_endpoint_for_host(ix, host, request_path,
                                                    model_name);
   if (best_match) {
     return best_match;
@@ -255,7 +258,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
       /* A no-host rule can carry the same model/path constraints as a
        * host rule. Reuse the complete lookup instead of checking only
        * pathless keys, preserving exact and longest-prefix semantics. */
-      best_match = find_endpoint_for_host(ent, self_host, request_path,
+      best_match = find_endpoint_for_host(ix, self_host, request_path,
                                          model_name);
       if (best_match) {
         return best_match;
@@ -268,7 +271,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
    * (e.g., "loxicmd create lb 10.10.10.254 --tcp=2020:8080 --endpoints=...") */
   if (!best_match) {
     build_ephash_key(search_key, sizeof(search_key), "", "", "");
-    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    tepval = sp_pool_index_find(ix, search_key);
     if (tepval) {
       best_match = tepval;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -278,4 +281,95 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
   }
 
   return best_match;
+}
+
+/* The model a pool was added for: the third field of its key
+ * (build_ephash_key: "host|path|model" or "host||model"), "" for a wildcard
+ * pool. */
+static const char *
+sp_pool_key_model(const proxy_epval_t *p)
+{
+  const char *sep = strchr(p->ephash_key, '|');
+
+  sep = sep ? strchr(sep + 1, '|') : NULL;
+  return sep ? sep + 1 : "";
+}
+
+/* The pool of a request that reached dispatch with no usable Host (ROUTE-01's
+ * second defence). The listener's first pool is whatever rule was added first,
+ * so on a listener whose pools name models it would serve the request from
+ * another model's engine. There the request goes to the pool that names its
+ * model (exact name, the first in the table's order), or is refused when none
+ * does or it names none. A listener with no model pool keeps the first pool,
+ * as before: a plain rule, or a raw TCP stream, has no Host to lose.
+ * *pool is NULL on a refusal and when the listener has no pool. */
+int
+sp_route_hostless(const proxy_map_ent_t *ent, const char *model,
+                  proxy_epval_t **pool)
+{
+  const sp_pool_index_t *ix = sp_pool_index(ent);
+  proxy_epval_t *named = NULL;
+  int any_model = 0;
+
+  *pool = NULL;
+  if (!ix) {
+    return SP_HOSTLESS_FIRST;
+  }
+  for (uint32_t i = 0; i < ix->n; i++) {
+    proxy_epval_t *p = ix->order[i];
+    const char *pm = sp_pool_key_model(p);
+
+    if (pm[0] == '\0') {
+      continue;
+    }
+    any_model = 1;
+    if (!named && model && model[0] != '\0' && strcmp(pm, model) == 0) {
+      named = p;
+    }
+  }
+  if (!any_model) {
+    *pool = ix->first;
+    return SP_HOSTLESS_FIRST;
+  }
+  if (!named) {
+    return SP_HOSTLESS_REFUSE;
+  }
+  *pool = named;
+  return SP_HOSTLESS_MODEL;
+}
+
+/* The default reservation of the pool a request's host, path and model
+ * select: the lookup dispatch runs, read for one field. host NULL = no
+ * usable Host, where dispatch asks sp_route_hostless. 0 when no pool
+ * matches. */
+int
+sp_resv_default_tokens_route(proxy_map_ent_t *ent, const char *host,
+                             const char *path, const char *model)
+{
+  proxy_epval_t *ep;
+
+  if (!ent)
+    return 0;
+  if (!host)
+    sp_route_hostless(ent, model, &ep);
+  else
+    ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
+  return ep ? (int)ep->ai_default_tokens : 0;
+}
+
+/* The same lookup for the rule's ai_objective_strict. 0 when no pool
+ * matches: the request is refused at dispatch whatever it names. */
+int
+sp_resv_objective_strict_route(proxy_map_ent_t *ent, const char *host,
+                               const char *path, const char *model)
+{
+  proxy_epval_t *ep;
+
+  if (!ent)
+    return 0;
+  if (!host)
+    sp_route_hostless(ent, model, &ep);
+  else
+    ep = find_endpoint_lpm(ent, host, path ? path : "/", model ? model : "");
+  return ep ? (int)ep->ai_objective_strict : 0;
 }

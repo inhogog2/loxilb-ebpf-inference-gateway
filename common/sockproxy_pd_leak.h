@@ -148,6 +148,205 @@ pd_http_resp_status(const uint8_t *buf, size_t len)
   }
 }
 
+/*
+ * pd_resp_error_excerpt - the origin's error string from an HTTP error reply,
+ * for the log line of a reject the gateway relays.
+ *
+ * Copies the first JSON "message" string of the body (vLLM's
+ * {"object":"error","message":...} and {"error":{"message":...}} shapes),
+ * else the body's leading bytes, into out (NUL-terminated, at most cap - 1
+ * bytes). Bounded by len and cap; a byte outside printable ASCII becomes '.',
+ * so the excerpt stays one log line. Returns its length; 0 when the buffer
+ * holds no body.
+ */
+static inline size_t
+pd_resp_error_excerpt(const uint8_t *buf, size_t len, char *out, size_t cap)
+{
+  const uint8_t *b, *e, *p;
+  int quoted = 0, esc = 0;
+  size_t n = 0;
+
+  if (out == NULL || cap == 0) return 0;
+  out[0] = '\0';
+  if (buf == NULL) return 0;
+  b = (const uint8_t *)memmem(buf, len, "\r\n\r\n", 4);
+  if (b == NULL) return 0;
+  b += 4;
+  e = buf + len;
+  p = (const uint8_t *)memmem(b, (size_t)(e - b), "\"message\"", 9);
+  if (p != NULL) {
+    p += 9;
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':'))
+      p++;
+    if (p < e && *p == '"') {
+      b = p + 1;
+      quoted = 1;
+    }
+  }
+  for (p = b; p < e && n + 1 < cap; p++) {
+    if (quoted && !esc && *p == '"') break;
+    esc = quoted && !esc && *p == '\\';
+    out[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : '.';
+  }
+  out[n] = '\0';
+  return n;
+}
+
+/*
+ * pd_prefill_status_verdict - what the sequential P/D machine does with a
+ * prefill reply of the given status.
+ *
+ * PD_PR_RELAY: an origin 4xx is a deterministic client error that every
+ * engine would repeat (unknown model, malformed body, prompt over the context
+ * window). The decode leg would answer the same 4xx, so the client gets the
+ * prefill reply and decode is not called. A reply cut at the buffer cap is
+ * relayed by its status: the cut body is not the origin's any more, so the
+ * relay writes a short gateway body in its place (pd_prefill_cut_reject)
+ * rather than spend a decode call on the same reject.
+ *
+ * PD_PR_DECODE: everything else. A 5xx keeps the documented degradation (the
+ * decode leg recomputes the prefill and the request is served; the breaker's
+ * origin streak sees the 5xx), and an unknown status (0) is neither. 408 and
+ * 429 are the prefill engine timing out or shedding load, transient like a
+ * 5xx, so they take the same decode recompute.
+ */
+#define PD_PR_DECODE 0
+#define PD_PR_RELAY  1
+
+static inline int
+pd_prefill_status_verdict(int status)
+{
+  return (status >= 400 && status < 500 && status != 408 && status != 429)
+             ? PD_PR_RELAY : PD_PR_DECODE;
+}
+
+/*
+ * pd_prefill_cut_reject - the response a client gets for an origin 4xx whose
+ * prefill reply was cut at the buffer cap: the engine's status, and a short
+ * gateway body in place of the cut one, framed by its length. Returns the
+ * length written into out, 0 when it does not fit.
+ */
+static inline size_t
+pd_prefill_cut_reject(int status, char *out, size_t cap)
+{
+  char body[160];
+  const char *reason;
+  int bl, n;
+
+  switch (status) {
+  case 400: reason = "Bad Request"; break;
+  case 401: reason = "Unauthorized"; break;
+  case 403: reason = "Forbidden"; break;
+  case 404: reason = "Not Found"; break;
+  case 413: reason = "Content Too Large"; break;
+  case 422: reason = "Unprocessable Content"; break;
+  default:  reason = "Client Error"; break;
+  }
+  bl = snprintf(body, sizeof(body),
+                "{\"error\":\"prefill_rejected\",\"status\":%d,"
+                "\"detail\":\"the engine's reply was cut at the gateway's buffer cap\"}",
+                status);
+  if (bl <= 0 || (size_t)bl >= sizeof(body))
+    return 0;
+  n = snprintf(out, cap,
+               "HTTP/1.1 %d %s\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %d\r\n"
+               "\r\n"
+               "%s", status, reason, bl, body);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+/*
+ * pd_prefill_fallback_reason - why a prefill reply that pd_prefill_status_verdict
+ * sent to the decode leg was recomputed there (loxilb_ai_pd_prefill_fallback_total
+ * {reason}); PD_FB_NONE when it was not a fallback. The reason is the condition
+ * that forced the fallback, in verdict order: when the status alone forces it,
+ * the status is the reason, whether or not the body was cut; when the reply
+ * would have been used and the fallback happened only because it was cut at
+ * the buffer cap, the reason is truncated (a cut 2xx).
+ *
+ *   >= 500             -> PD_FB_ORIGIN_5XX  (cut or not)
+ *   408 / 429          -> PD_FB_ORIGIN_408 / PD_FB_ORIGIN_429  (cut or not)
+ *   0 (unreadable)     -> PD_FB_NO_STATUS   (cut or not: the status alone forces it)
+ *   1xx, 3xx           -> PD_FB_OTHER       (an unusable reply)
+ *   2xx cut            -> PD_FB_TRUNCATED
+ *   2xx not cut        -> PD_FB_NONE        (the normal path)
+ *   other 4xx          -> PD_FB_NONE        (relayed, cut or not: never reaches decode)
+ */
+#define PD_FB_NONE        0
+#define PD_FB_ORIGIN_5XX  1
+#define PD_FB_ORIGIN_408  2
+#define PD_FB_ORIGIN_429  3
+#define PD_FB_NO_STATUS   4
+#define PD_FB_TRUNCATED   5
+#define PD_FB_OTHER       6
+static inline int
+pd_prefill_fallback_reason(int status, int truncated)
+{
+  if (status >= 500) return PD_FB_ORIGIN_5XX;
+  if (status == 408) return PD_FB_ORIGIN_408;
+  if (status == 429) return PD_FB_ORIGIN_429;
+  if (status <= 0) return PD_FB_NO_STATUS;
+  if (status < 200 || (status >= 300 && status < 400)) return PD_FB_OTHER;
+  if (status >= 400) return PD_FB_NONE;
+  return truncated ? PD_FB_TRUNCATED : PD_FB_NONE;
+}
+
+/*
+ * pd_decode_error_phase - the llb_ai_pd_record error_phase of a P/D request
+ * whose decode leg delivered its whole response, from the status the client
+ * received (the decode leg's; the prefill reply is not captured).
+ *
+ *   2xx, 3xx -> 0  complete / success
+ *   4xx      -> 6  decode / rejected  (origin refused; relayed verbatim)
+ *   5xx      -> 2  decode / error
+ *   0, 1xx   -> 7  decode / unknown   (no final status line was read)
+ *
+ * An unknown status is not a success. The capture reads the status line at
+ * the start of the decode leg's first read; a first read of 16 bytes or less,
+ * a status line split across reads, or a reply that is not HTTP/1.x leaves it
+ * unread, and no other record names that request's outcome.
+ */
+static inline int
+pd_decode_error_phase(int status)
+{
+  if (status < 200) return 7;
+  if (status < 400) return 0;
+  if (status < 500) return 6;
+  return 2;
+}
+
+/*
+ * pd_reap_error_phase - the llb_ai_pd_record error_phase of a P/D request a
+ * reaper ends while it is still in flight, from its pd_phase (the numbers are
+ * sockproxy.h's PD_PHASE_*; sockproxy_health.c asserts them):
+ *
+ *   1..3  PREFILL_SENDING / _WAITING / _DONE -> 1  prefill / timeout
+ *   4     DECODE_SENDING  (no decode byte)   -> 3  decode / timeout
+ *   5     DECODE_STREAMING (the answer began) -> 8  decode / truncated
+ *   else  not in flight                       -> -1 nothing to record
+ *
+ * The phase names the cause. A begun answer a reaper ends was ended by the
+ * gateway: the engine went silent (the sweep, the stream timeout, the idle
+ * cap) or a policy cap ended it (the duration cap), so it is decode/truncated
+ * whether the gateway wrote a terminator or cut it with an error;
+ * pd_terminator_synthesized tells the two apart. decode/error (2) is the
+ * engine's death, which only the decode leg sees. A client that stopped
+ * reading is the client's abort: the stall reaper records aborted (9), not
+ * this table's value. -1 for every other
+ * phase is what makes the record once: the reaper moves the request to ERROR
+ * after recording it.
+ */
+static inline int
+pd_reap_error_phase(int pd_phase)
+{
+  if (pd_phase >= 1 && pd_phase <= 3) return 1;
+  if (pd_phase == 4) return 3;
+  if (pd_phase == 5) return 8;
+  return -1;
+}
+
 /* PD_MSG_END_TAIL_KEEP - bytes of trailing context carried between successive
  * reads so a message-end terminator that straddles two TCP segments is still
  * detected. Must be >= the longest terminator pd_detect_http_msg_end matches:

@@ -231,12 +231,10 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
 #ifdef HAVE_DP_GPU_ROUTING
     // PRODUCTION: Validate CHWBL load counters after session cleanup
     // This helps detect and log any load tracking inconsistencies
-    if (ent->val.ephash) {
-      proxy_epval_t *tepval, *tmp_epval;
-      HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-        if (tepval->select == PROXY_SEL_CHWBL) {
-          chwbl_validate_load_counters(tepval);
-        }
+    const sp_pool_index_t *ix = sp_pool_index(ent);
+    for (uint32_t i = 0; ix && i < ix->n; i++) {
+      if (ix->order[i]->select == PROXY_SEL_CHWBL) {
+        chwbl_validate_load_counters(ix->order[i]);
       }
     }
 #endif /* HAVE_DP_GPU_ROUTING */
@@ -541,6 +539,9 @@ llb_fatal_handler(int sig, siginfo_t *si, void *uc)
       llb_async_write2("[FAILLOUD] C backtrace (innermost first):\n");
       backtrace_symbols_fd(bt, nbt, 2);
     }
+    /* The worker's last log lines may still be in its ring. */
+    llb_async_write2("[FAILLOUD] this worker's unwritten log lines:\n");
+    log_emergency_dump(2);
     signal(sig, SIG_DFL);
     raise(sig);
     _exit(134);
@@ -764,6 +765,14 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
    * rate-limits itself; with no shaper configured it is one atomic load. */
   cbs.tick = proxy_qos_tick;
 
+  /* Pools are counted and freed after a grace period (sockproxy_pool.h);
+   * a capacity permit is one of a pool's holders. */
+  sp_pool_init(proxy_pool_finalize);
+  fc_set_owner_hooks(sp_pool_fc_hold, sp_pool_fc_drop);
+  if (sp_qsbr_start() != 0) {
+    log_error("sockproxy: the reclaimer thread did not start; deleted pools are not freed");
+  }
+
   proxy_struct = calloc(sizeof(proxy_struct_t), 1);
   if (proxy_struct == NULL) {
     assert(0);
@@ -936,6 +945,13 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   }
 #endif
 
+  /* From here on a log call queues its line and the log's writer thread does
+   * the writing: no worker waits for the log's device. Start-up above wrote
+   * for itself. */
+  if (log_async_start() != 0) {
+    log_error("log: the writer thread did not start; log lines stay synchronous");
+  }
+
   /* Stage 1: install the fail-loud fatal-signal handler BEFORE any raw worker
    * thread starts, so a worker fault crashes loud+fast instead of wedging ~30s. */
   llb_install_fatal_handlers();
@@ -945,10 +961,25 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   pfe_pool_selftest();
 #endif
 
+  /* The capacity-queue deadline timer is opened HERE, before any worker
+   * thread exists: the drain checker reads its tfd on every pass (a process
+   * without a timer owes the deadline sweep to that pass) and the deadline
+   * thread waits on it; a pthread_create after this write orders both reads
+   * after it. Opened in the thread itself, the first drain-checker pass could
+   * read the field while the thread wrote it (TSan, candidate c59ba1fb). */
+  if (fc_deadline_init(fc_deadline_global()) != 0)
+    log_error("[AIGateway] queue deadline timer: timerfd_create failed (%s); "
+              "deadlines run on the 1 Hz health pass", strerror(errno));
+
   pthread_create(&proxy_struct->pthr, NULL, proxy_run, NULL);
 
   // P2: Start draining checker thread
   pthread_create(&proxy_struct->drain_checker_thr, NULL, proxy_drain_checker_thread, NULL);
+
+  /* Capacity-queue deadlines: a thread asleep on a timer armed to the
+   * earliest pending deadline (not a cadence), so a configured wait window
+   * is the enforced window. */
+  pthread_create(&proxy_struct->fc_deadline_thr, NULL, proxy_fc_deadline_thread, NULL);
   
   // Start conversation mapping cleanup thread
   pthread_create(&proxy_struct->conversation_cleanup_thr, NULL, proxy_conversation_cleanup_thread, NULL);

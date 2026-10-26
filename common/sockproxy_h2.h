@@ -20,11 +20,14 @@
 #include <pthread.h>
 #include "uthash.h"
 #include "sockproxy_fc.h"   /* per-stream capacity admission permit */
+#include "sockproxy_obj_hint.h"   /* the objective a request asks for by header */
 #include "sockproxy_l7trust.h"   /* l7_hop_list_t on the per-stream request state */
 
 // Forward declarations
 struct proxy_fd_ent;
 typedef struct proxy_fd_ent proxy_fd_ent_t;
+struct proxy_map_ent;
+struct proxy_epval;
 
 struct proxy_h2_session;
 typedef struct proxy_h2_session proxy_h2_session_t;
@@ -133,6 +136,8 @@ typedef struct proxy_h2_stream {
   char     tenant_id[128];
   char     auth_user_id[128];
   char     auth_key_id[64];
+  char     auth_net_identity[64];    // binding that matched the stream's source ("" = none)
+  uint8_t  auth_src;                 // AI_GW_AUTH_SRC_*: what decided tenant_id
   char     effective_model[128];     // the gate's body-first model resolution
   char     svc_ident[64];            // "VIP:port" captured at admission — teardown paths
                                      // must not chase the rule head after it may be gone
@@ -142,6 +147,18 @@ typedef struct proxy_h2_stream {
   uint8_t  auth_strip_authz;         // upstream hygiene switches, parity with the H1 splice
   uint8_t  auth_fwd_identity;
   uint8_t  auth_jwt_capable;
+  uint8_t  auth_netid_fwd;           // the matched binding forwards identity upstream
+  // The class of the request: what its header asked for, and the gate's
+  // answer (all zero while no class is configured).
+  sp_obj_hint_t obj_hint;
+  int32_t  adm_priority;
+  uint8_t  adm_class;                // AI_GW_CLASS_*
+  uint8_t  adm_class_set;            // the class stage ran
+  uint8_t  adm_objective_denied;
+  uint8_t  adm_hint_not_applied;
+  uint8_t  class_expose;             // the response head carries the class headers
+  uint8_t  resp_strip_api_key;       // the service declares api_key_auth: a backend's x-api-key stays out of a response head
+  char     adm_objective[64];
   uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
   int64_t  usage_res_epoch;          // reservation window tag
   uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)
@@ -149,7 +166,9 @@ typedef struct proxy_h2_stream {
                                      // (mirrors PROXY_USAGE_TAIL_KEEP)
   uint16_t usage_tail_len;
   uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
-  int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
+  uint64_t metric_req_start_ns;      // the request's END_STREAM: the TTFB base (sockproxy_http.c resp_note_write_)
+  uint8_t  metric_resp_noted;        // 1 = this stream's client-visible response is recorded (the once-per-stream latch)
+  int      metric_response_status;   // :status the client got: the backend's, or a local outage answer's (0 = unseen)
   uint8_t  response_is_sse;           // final response media type, per stream
   uint8_t  fc_first_data_seen;       // the first response DATA chunk was looked at for TTFT
   fc_permit_t fc;                    // capacity admission permit of THIS stream (one
@@ -280,6 +299,7 @@ typedef struct backend_h2_session {
   int connected;                     // 1 = connected and ready
   int goaway_sent;                   // 1 = GOAWAY sent to backend
   int goaway_received;               // 1 = GOAWAY received from backend
+  uint8_t leg_ended;                 // 1 = its client streams were answered for its end
 
   // Backend endpoint info. The hash key is `slot`, the per-connection
   // backend-connection slot — NOT ep_idx: two model pools on one rule both
@@ -410,7 +430,29 @@ int proxy_h2_handle_client_data(proxy_fd_ent_t *pfe);
 int proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe);
 /* H1 bridge EOF/errors are isolated to their own H2 stream. */
 int proxy_h2_h1_backend_eof(proxy_fd_ent_t *pfe, int clean_eof);
-/* Pure C detach; called under PROXY_LOCK before backend pair teardown. */
+/* An HTTP/2 backend leg's end reaches only the client streams it carries:
+ * they are answered (see proxy_h2_backend_leg_unanswered) and the client's
+ * other legs and streams go on. Call with nothing held, before the leg's
+ * teardown takes PROXY_LOCK. Returns 1 when pfe was such a leg. */
+int proxy_h2_backend_leg_end(proxy_fd_ent_t *pfe);
+/* A request body handed to a backend stream: the bytes are copied into the
+ * source (one allocation, freed with free()), so the backend can read them
+ * after the client stream that held them is gone. */
+typedef struct {
+  uint8_t *data;      // the copy, right after this header
+  size_t len;
+  size_t offset;      // read position
+} h2_data_source_t;
+h2_data_source_t *proxy_h2_body_source_new(const uint8_t *body, size_t len);
+
+/* A new HTTP/2 backend leg's own fields, before it is linked to its client.
+ * It takes the pool (the slot's reuse identity) and no P/D unit. */
+void proxy_h2_backend_leg_init(proxy_fd_ent_t *bpfe, int fd, void *ssl,
+                               struct proxy_map_ent *ent, int ep_idx,
+                               struct proxy_epval *tepval, backend_h2_session_t *bs);
+/* Pure C detach of one backend leg (bridge or HTTP/2) from its HTTP/2
+ * client, so the leg's teardown does not cascade to the client; called under
+ * PROXY_LOCK before backend pair teardown. */
 void proxy_h2_h1_backend_detach(proxy_fd_ent_t *pfe);
 
 /**
@@ -432,8 +474,10 @@ int proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream);
 void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
 
 /**
- * A backend leg ended before it answered: every client stream it carries
- * gets a 503. Call with nothing held, while the two entries are linked.
+ * A backend leg ended: every client stream it still carries is answered, once
+ * per leg. A stream with no response yet gets a 503; one whose response had
+ * started is reset, since the rest of it cannot come. Call with nothing held,
+ * while the two entries are linked.
  *
  * @param client  Client entry (owns the HTTP/2 session)
  * @param backend Backend entry whose leg ended
@@ -487,6 +531,14 @@ typedef struct h2_inflight_settle {
   char    client_ip[L7_HOP_TEXT_MAX];
   char    origin_ip[L7_HOP_TEXT_MAX];
   int     trusted_hops;
+  /* What decided the tenant and the binding that matched, copied with the
+   * identity above. */
+  int     auth_src;
+  char    net_identity[64];
+  /* The request's class, for the same record. */
+  int     priority;
+  int     class_info;   /* AI_GW_CLASSF_* */
+  char    objective[64];
 } h2_inflight_settle_t;
 
 /*
@@ -537,6 +589,12 @@ int proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
  */
 int proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
                                  const nghttp2_nv *extra, size_t nextra);
+
+/* Drop every field named `name` (case-insensitive, the whole name) from the
+ * response header set collected for a stream, before it is submitted to the
+ * client. Returns the number of fields dropped. Touches nothing else. */
+size_t proxy_h2_drop_resp_header(stream_mapping_t *mapping,
+                                 const char *name, size_t namelen);
 
 /**
  * Create or get backend HTTP/2 session for endpoint

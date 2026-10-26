@@ -221,7 +221,42 @@ typedef struct proxy_metrics_snapshot {
     uint64_t stream_abandon_age_sum_s[3];
     uint64_t stream_abandon_age_count[3];
     uint64_t stream_stall_abort_sec;
+
+    /* Pools (proxy_epval_t) allocated and not yet freed, a deleted pool
+     * still held by its connections included, and pools freed since start
+     * (sockproxy_pool.h). TAIL-APPEND ONLY — same three-way lockstep
+     * contract as the blocks above. */
+    uint64_t pools_live;
+    uint64_t pools_freed_total;
+
+    /* Terminators the graceful-[DONE] sweep wrote for a decode engine that
+     * went silent without one (the mechanism behind decode/truncated).
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t pd_terminator_synthesized;
+
+    /* Clients a reaper ended from the health thread because their owner
+     * worker could not be handed the end (no owner, or the wake failed). A
+     * request such an end frees inline has no request record.
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t reap_fallback;
+
+    /* Requests that reached dispatch with no usable Host on a listener whose
+     * pools name models (ROUTE-01's second defence routed or refused them).
+     * Expected 0: non-zero says a path lost the Host.
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t route_host_missing;
+
+    /* P/D admission units held now on prefill and on decode endpoints, and
+     * the clients parked on a prefill endpoint's queue (the per-EP FIFO's
+     * live count, not a connection phase).
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t pd_prefill_inflight;
+    uint64_t pd_decode_inflight;
+    uint64_t pd_parked_connections;
 } proxy_metrics_snapshot_t;
+
+_Static_assert(sizeof(proxy_metrics_snapshot_t) == 6096,
+               "proxy_metrics_snapshot_t ABI: keep C, Go and stub mirrors aligned");
 
 /* =========================================================================
  * Public API
@@ -300,11 +335,14 @@ int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
  * ========================================================================= */
 #define PROXY_FC_STAT_MAX 256   /* pools reported per proxy_get_fc_stats call */
 #define PROXY_FC_ROLES 3
-#define PROXY_FC_REASONS 13     /* enum fc_reason: the decisions array grew with the queue and tenant-share reasons */
+#define PROXY_FC_REASONS 14     /* enum fc_reason: the decisions array grew with the queue, tenant-share and shed reasons */
 #define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
 #define PROXY_FC_QWAIT_BUCKETS 8 /* queue wait histogram buckets (FC_QWAIT_BUCKETS) */
 #define PROXY_FC_LIMITS 8        /* configured limits with a source, first block */
-#define PROXY_FC_ADAPT_LIMITS 3  /* adaptive, warm-up, TTFT target: FC_LIMITS is the sum */
+#define PROXY_FC_ADAPT_LIMITS 3  /* adaptive, warm-up, TTFT target */
+#define PROXY_FC_BAND_LIMITS 9   /* the band knobs (FC_BAND_LIMITS): FC_LIMITS is the sum with the tenant share and the headers */
+#define PROXY_FC_BANDS 3         /* FC_BANDS: 0 standard, 1 critical, 2 sheddable */
+#define PROXY_FC_BAND_OUTCOMES 5 /* enum fc_band_outcome: admitted, queued, shed, expired, cancelled */
 
 typedef struct proxy_fc_svc_stat {
     uint32_t xip;                          /* service VIP, network byte order (v4) */
@@ -346,26 +384,55 @@ typedef struct proxy_fc_svc_stat {
     uint8_t  src_tenant;                   /* source of tenant_share_pct */
     uint8_t  expose_headers;               /* 1 when admitted responses carry the admission headers */
     uint8_t  src_expose;                   /* source of expose_headers */
+    uint32_t tenant_slots;                 /* tenants the pool tracks by name: the table size in force */
+    /* Priority bands: same lockstep, offsets pinned below. Triples by band. */
+    uint32_t band_inflight[PROXY_FC_BANDS];      /* gauge: service units held per band */
+    uint32_t band_queued[PROXY_FC_BANDS];        /* gauge: requests waiting per band */
+    uint32_t band_wait_ms[PROXY_FC_BANDS];       /* a band's wait window, 0 = the queue's */
+    uint8_t  wake_policy;                  /* enum fc_wake_policy: 0 strict, 1 weighted */
+    uint8_t  shed_queue;                   /* 1: sheddable waits at the ceiling */
+    uint8_t  tenant_wake;                  /* enum fc_tenant_wake: 0 fifo, 1 rr */
+    uint8_t  llmd_headers;                 /* 1: llm-d headers on */
+    uint8_t  band_weight[PROXY_FC_BANDS];        /* weighted wake weights, 0 = not set */
+    uint8_t  band_min_share_pct[PROXY_FC_BANDS]; /* floors, binding while the band has a waiter */
+    uint8_t  band_queue_pct[PROXY_FC_BANDS];     /* a band's share of the queue depth, 0 = shared */
+    uint8_t  bands;                        /* 1 when a band knob differs from its default */
+    uint8_t  src_band[PROXY_FC_BAND_LIMITS];     /* enum fc_src per band knob, in enum fc_limit order */
+    uint8_t  band_fallback;                /* enum fc_band_fallback: why the switches above differ from the configured ones */
+    uint8_t  wake_policy_cfg;              /* the switches as configured (rule, else environment); the ones above run */
+    uint8_t  shed_queue_cfg;
+    uint8_t  tenant_wake_cfg;
+    uint8_t  critical_reserve_pct;          /* units no other band may take, % of the ceiling in force */
+    uint8_t  band_pad[4];
+    /* Per band and outcome (enum fc_band_outcome), standard derived:
+     * same lockstep, offset pinned below. */
+    uint64_t band_outcome[PROXY_FC_BANDS][PROXY_FC_BAND_OUTCOMES];
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
  * definition, and its test links a stub with a third: all three pin the
  * same layout, so a field moved in one without the others fails to build
  * instead of shifting every counter after it. */
-_Static_assert(sizeof(proxy_fc_svc_stat_t) == 368, "proxy_fc_svc_stat_t size");
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 568, "proxy_fc_svc_stat_t size");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 144, "pool offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 208, "queued offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 224, "qwait_bucket offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 296, "qwait_count offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, telemetry_stale_ms) == 304, "telemetry_stale_ms offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, src) == 308, "src offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, effective_max_outstanding) == 320,
+_Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 152, "pool offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 216, "queued offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 232, "qwait_bucket offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 304, "qwait_count offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, telemetry_stale_ms) == 312, "telemetry_stale_ms offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, src) == 316, "src offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, effective_max_outstanding) == 328,
                "effective_max_outstanding offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, adaptive) == 332, "adaptive offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 338, "warming_eps offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 344, "adapt_down offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, tenants_active) == 360, "tenants_active offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, adaptive) == 340, "adaptive offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 346, "warming_eps offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 352, "adapt_down offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, tenants_active) == 368, "tenants_active offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, tenant_slots) == 376, "tenant_slots offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, band_inflight) == 380, "band_inflight offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, wake_policy) == 416, "wake_policy offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, src_band) == 430, "src_band offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, band_fallback) == 439, "band_fallback offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, band_outcome) == 448, "band_outcome offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every
@@ -377,7 +444,8 @@ int proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max);
 
 /*
  * proxy_get_fc_anomaly - the process-wide anomaly counter for `kind`
- * (enum fc_anomaly: 0 underflow, 1 unknown_permit); 0 for any other kind.
+ * (enum fc_anomaly: 0 underflow, 1 unknown_permit, 2 tenant_table_full,
+ * 3 h2_deny_headers); 0 for any other kind.
  */
 uint64_t proxy_get_fc_anomaly(int kind);
 

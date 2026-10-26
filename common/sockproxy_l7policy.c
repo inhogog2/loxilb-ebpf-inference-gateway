@@ -42,6 +42,7 @@
 #include "sockproxy_l7policy.h"
 #include "sockproxy_health.h" /* CB snapshot guard */
 #include "sockproxy_internal.h" /* proxy_struct_t, proxy_struct, PROXY_LOCK/UNLOCK (attach) */
+#include "sockproxy_ai_admit.h" /* AI_GW_STAGE_ROUTE: a REJECT's deny record */
 #include "sockproxy_cache.h"    /* cmp_proxy_ent — entry equality at attach/detach */
 #include "sockproxy_cookie.h"   /* stateless cookie token derive/verify (pure) */
 #include "log.h"                /* log_error — attach diagnostics */
@@ -433,8 +434,13 @@ int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
                "\r\n"
                "%s\r\n",
                code, l7_reason_phrase(code), safe_body);
-  if (n > 0 && n < (int)sizeof(resp))
+  if (n > 0 && n < (int)sizeof(resp)) {
+    /* A refusal before any backend was chosen, recorded as every answer the
+     * gateway writes itself: the response, and a deny record at ROUTE. */
+    proxy_note_local_refusal(pfe, (uint16_t)code);
+    proxy_record_local_deny(pfe, AI_GW_STAGE_ROUTE, code, "l7_policy_reject");
     send(pfe->fd, resp, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
 
   shutdown(pfe->fd, SHUT_RDWR);
   return 0;
@@ -486,8 +492,11 @@ int l7_send_redirect(struct proxy_fd_ent *pfe, int status_code,
                "Connection: close\r\n"
                "\r\n",
                code, l7_reason_phrase(code), location);
-  if (n > 0 && n < (int)sizeof(resp))
+  if (n > 0 && n < (int)sizeof(resp)) {
+    /* A configured answer that completes the request with its 3xx. */
+    proxy_record_local_completion(pfe, (uint16_t)code);
     send(pfe->fd, resp, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
 
   shutdown(pfe->fd, SHUT_RDWR);
   return 0;
@@ -498,120 +507,60 @@ int l7_send_redirect(struct proxy_fd_ent *pfe, int status_code,
  * ------------------------------------------------------------------------- */
 
 /*
- * l7_resolve_pool — map a FORWARD action to a tepval-equivalent (proxy_epval_t *)
- * representing the MATCHED ROUTE'S target backend set so FORWARD re-enters the
- * EXISTING intra-pool endpoint selector (a plain pool, never the AI model
- * engine) but selects ONLY among the route's endpoints (honoring weights).
+ * l7_route_pool — the pool a FORWARD goes to, and the endpoints of it the
+ * request may select. The pool is always the listener's own (pool0): a
+ * FORWARD that names a subset of its members (fwd->refs[i].ep, the member's
+ * position in the pool) restricts the selection to them on the connection,
+ * with the route's weights, and never copies the pool. Health, circuit
+ * breaker and drain state stay the pool's, and so does every count the
+ * request leaves on its endpoint; the connection holds the pool like any
+ * other.
  *
- * Mechanism (gap-fix): the service's backends are the members (eps[]) of the base
- * pool ent->val.ephash. A FORWARD route names a SUBSET of those members by index
- * in fwd->refs[].ep (the position of the member in the VIP's endpoint list, e.g.
- * ep0/ep1/ep2 from the LB-rule seed) plus an optional per-ref weight. We build a
- * NARROWED copy of the base pool that carries only the referenced endpoints, then
- * hand it back so the existing EP-select switch picks WITHIN that subset.
+ *   fwd->n_refs == 0  -> the whole pool, selected as the pool selects (an MCP
+ *                        pool: masked over all its members);
+ *   fwd->n_refs  > 0  -> the referenced members only, round-robin, weighted
+ *                        when the refs' weights differ (single ref => that
+ *                        one member), never CHWBL / P/D / the model engine.
  *
- *   fwd->n_refs == 0  -> no subset named: forward to the whole base pool (the
- *                        prior behavior — a plain catch-all FORWARD).
- *   fwd->n_refs  > 0  -> forward to exactly the referenced endpoints, with their
- *                        weights applied (single ref => that one endpoint).
- *
- * Lifetime / safety: the narrowed pool lives in a SINGLE reusable scratch buffer
- * on the proxy_map_ent (ent->l7_resolved_pool), allocated lazily. The proxy hot
- * path is single-threaded (one proxy_run event-loop thread) and each request
- * fully consumes the resolved pool (connects to the selected endpoint) within the
- * same synchronous dispatch before the next request is routed — exactly the model
- * under which the existing code mutates tepval->ep_sel without per-call locking.
- * We DO NOT return a stack temporary, and we deliberately DROP every shared owned
- * pointer (hash_ring / chwbl_config / pd_trie / session maps / locks) from the
- * scratch copy and force select = PROXY_SEL_RR (or PROXY_SEL_WRR when the refs
- * carry non-uniform weights) so the narrowed pool never touches — and can never
- * double-free — those subsystems. Returns NULL when there is no usable pool.
+ * Under the read lock (the route's refs and pool0's members). NULL when no
+ * referenced member exists in the pool.
  */
-proxy_epval_t *
-l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
+static proxy_epval_t *
+l7_route_pool(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent, proxy_epval_t *pool0,
+              const l7_decision_t *d, int mcp)
 {
-  proxy_epval_t *base;
-  proxy_epval_t *sub;
-  int i, n_sel;
-  uint8_t saw_weight, nonuniform;
-  uint8_t first_weight;
+  const l7_forward_t *fwd = &d->u.fwd;
+  int slot;
 
-  if (!ent)
+  if (!pool0 || !pfe)
+    return pool0;
+  if (fwd->n_refs == 0 && !mcp)
+    return pool0;
+  /* An MCP policy has at most 256 routes (attach); others share a cursor
+   * slot per 256, which keeps membership and only merges two cursors. */
+  if (d->route_index < 0 || (mcp && d->route_index >= 256))
     return NULL;
-
-  base = ent->val.ephash;
-  if (!base)
+  slot = d->route_index % 256;
+  pfe->mcp_route_mask = 0;
+  memset(pfe->mcp_route_weights, 0, sizeof(pfe->mcp_route_weights));
+  for (int ri = 0; ri < fwd->n_refs && ri < MAX_PROXY_EP; ri++) {
+    uint32_t ei = fwd->refs[ri].ep;
+    if (ei >= (uint32_t)pool0->n_eps || ei >= MAX_PROXY_EP)
+      continue;                     /* ref names a non-existent member -> skip */
+    pfe->mcp_route_mask |= UINT32_C(1) << ei;
+    pfe->mcp_route_weights[ei] = fwd->refs[ri].weight;
+  }
+  if (!fwd->n_refs) {
+    for (int ei = 0; ei < pool0->n_eps && ei < MAX_PROXY_EP; ei++)
+      pfe->mcp_route_mask |= UINT32_C(1) << ei;
+  }
+  if (!pfe->mcp_route_mask)
     return NULL;
-
-  /* No subset named -> forward to the whole service pool (plain catch-all). */
-  if (!fwd || fwd->n_refs == 0)
-    return base;
-
-  /* Lazily allocate the single reusable scratch resolved-pool on the map_ent. */
-  if (!ent->l7_resolved_pool) {
-    ent->l7_resolved_pool = calloc(1, sizeof(proxy_epval_t));
-    if (!ent->l7_resolved_pool)
-      return base;                  /* allocation failed -> degrade to base pool */
-  }
-  sub = (proxy_epval_t *)ent->l7_resolved_pool;
-
-  /* Start from a byte copy of the base pool so the EP-select switch sees the same
-   * shape, THEN strip every shared owned pointer (we must never free those via the
-   * scratch) and reset the per-pool selection state. */
-  /* CB writers run independently of the proxy global lock; protect the
-   * byte snapshot too. The guard is static, so no locked object is copied. */
-  circuit_breaker_lock();
-  memcpy(sub, base, sizeof(*sub));
-  circuit_breaker_unlock();
-  sub->hash_ring        = NULL;     /* never touch CHWBL state through the scratch */
-  sub->chwbl_config     = NULL;
-  sub->pd_trie          = NULL;
-  sub->pd_session_map   = NULL;
-  sub->pd_disagg_enabled = 0;       /* a FORWARD subset is a plain pool */
-  sub->ai_gw_mode       = 0;
-  sub->pd_cache_aware_mode = 0;
-  sub->cb_enabled       = 0;        /* circuit-breaker state belongs to the base   */
-  sub->ep_sel           = 0;        /* fresh RR cursor for the narrowed set        */
-  sub->wrr_initialized  = 0;        /* recompute WRR for the narrowed weights      */
-
-  /* Copy ONLY the referenced endpoints into the narrowed eps[]. fwd->refs[i].ep is
-   * the index of a member in the base pool; out-of-range / inactive refs are
-   * skipped. We also carry the ref weight onto the endpoint (Gateway weighted
-   * backendRefs) and detect whether the weights are non-uniform. */
-  n_sel = 0;
-  saw_weight = 0;
-  nonuniform = 0;
-  first_weight = 0;
-  for (i = 0; i < fwd->n_refs && i < MAX_PROXY_EP; i++) {
-    uint32_t ei = fwd->refs[i].ep;
-    uint8_t  w  = fwd->refs[i].weight;
-    if (ei >= (uint32_t)base->n_eps || ei >= MAX_PROXY_EP)
-      continue;                     /* ref names a non-existent member -> skip      */
-    sub->eps[n_sel] = base->eps[ei];        /* xip/xport/protocol/inv/... */
-    sub->ep_stats[n_sel] = base->ep_stats[ei];
-    if (w != 0)
-      sub->eps[n_sel].weight = w;           /* ref weight overrides member weight   */
-    if (!saw_weight) {
-      first_weight = sub->eps[n_sel].weight;
-      saw_weight = 1;
-    } else if (sub->eps[n_sel].weight != first_weight) {
-      nonuniform = 1;
-    }
-    n_sel++;
-  }
-
-  if (n_sel == 0)
-    return NULL;                    /* every ref was invalid -> no usable backend   */
-
-  sub->n_eps = n_sel;
-
-  /* Uniform (or single-endpoint) weights -> plain round-robin within the subset;
-   * non-uniform weights -> weighted round-robin (the existing EP-select switch
-   * computes the smooth-WRR schedule from eps[].weight on demand). Either way the
-   * subset is a PLAIN pool — it never re-enters CHWBL / P/D / the AI model engine. */
-  sub->select = (n_sel > 1 && nonuniform) ? PROXY_SEL_WRR : PROXY_SEL_RR;
-
-  return sub;
+  pfe->mcp_selector_state = &ent->mcp_l7_selector[slot];
+  pfe->mcp_route_active = 1;
+  pfe->mcp_route_ticket = atomic_fetch_add_explicit(&ent->mcp_l7_rr_ticket[slot], 1,
+                                                    memory_order_relaxed);
+  return pool0;
 }
 
 /*
@@ -738,17 +687,18 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
 {
   l7_decision_t d;
   const l7_route_t *routes;
-  int mcp_locked=ent && ent->val.ephash && ent->val.ephash->mcp_stateless;
-  /* Readers previously raced regfree/free at policy replacement. Hold the
-   * generation only while evaluating/copying; response callbacks run unlocked. */
-  if (mcp_locked) PROXY_RDLOCK();
+  proxy_epval_t *pool0 = sp_pool_first(ent);  /* the listener's first pool, read once */
+  int mcp = pool0 && pool0->mcp_stateless;
+
+  /* A policy replace or detach frees the routes and their compiled programs
+   * under the write lock: they are read under the read lock only, and the
+   * decision is a copy. Responses go out after the unlock. */
+  PROXY_RDLOCK();
 
   /* DISCRIMINATOR: no L7 policy attached => pure no-op fall-through, so
- * every AI/model service runs UNCHANGED (Pitfall 5). This is
-   * the first reader of has_l7_policy (declared on proxy_map_ent by Plan 04;
-   * populated by Plan 05's proxy_attach_l7_policy). */
+   * every AI/model service runs UNCHANGED (Pitfall 5). */
   if (!ent || !ent->has_l7_policy) {
-    if (mcp_locked) PROXY_UNLOCK();
+    PROXY_UNLOCK();
     return L7_DISPATCH_FALLTHROUGH;
   }
 
@@ -758,7 +708,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
   if (l7_policy_evaluate(pfe, routes, ent->n_l7_routes, &d) == 0) {
     switch (d.kind) {
     case L7A_REJECT:
-      if (mcp_locked) PROXY_UNLOCK();
+      PROXY_UNLOCK();
       l7_send_reject(pfe, d.u.reject.status_code, d.reject_body);
       return L7_DISPATCH_TERMINATED;
     case L7A_REDIRECT:
@@ -767,50 +717,23 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
        * (l7_policy_evaluate) precisely so it could be built here, where pfe carries
        * the per-connection (H1) / stream-mirrored (H2) request fields. On failure to
        * resolve a target, d.location stays empty and l7_send_redirect fails closed to
- * 400 rather than emitting an injectable/invalid header. */
-      if (mcp_locked) PROXY_UNLOCK();
+       * 400 rather than emitting an injectable/invalid header. */
+      PROXY_UNLOCK();
       l7_assemble_redirect_location(pfe, &d.u.redir, d.location, sizeof(d.location));
       l7_send_redirect(pfe, d.u.redir.status_code, d.location);
       return L7_DISPATCH_TERMINATED;
     case L7A_FORWARD:
-      if (ent->val.ephash && ent->val.ephash->mcp_stateless) {
-        /* Keep original endpoint indices and base-pool lifetime. A narrowed
-         * shared scratch would reset RR and be retained by backend legs. */
-        if (d.route_index < 0 || d.route_index >= 256) {
-          if (mcp_locked) PROXY_UNLOCK();
-          l7_send_reject(pfe, 503, NULL);
-          return L7_DISPATCH_TERMINATED;
-        }
-        pfe->mcp_route_mask=0;
-        memset(pfe->mcp_route_weights,0,sizeof(pfe->mcp_route_weights));
-        for (int ri=0; ri<d.u.fwd.n_refs && ri<MAX_PROXY_EP; ri++) {
-          uint32_t ei=d.u.fwd.refs[ri].ep;
-          if (ei >= (uint32_t)ent->val.ephash->n_eps || ei>=MAX_PROXY_EP) continue;
-          pfe->mcp_route_mask |= UINT32_C(1)<<ei;
-          pfe->mcp_route_weights[ei]=d.u.fwd.refs[ri].weight;
-        }
-        if (d.u.fwd.n_refs && !pfe->mcp_route_mask) {
-          if (mcp_locked) PROXY_UNLOCK();
-          l7_send_reject(pfe, 503, NULL);
-          return L7_DISPATCH_TERMINATED;
-        }
-        if (!d.u.fwd.n_refs) {
-          for (int ei=0; ei<ent->val.ephash->n_eps && ei<MAX_PROXY_EP; ei++)
-            pfe->mcp_route_mask |= UINT32_C(1)<<ei;
-        }
-        pfe->mcp_selector_state=&ent->mcp_l7_selector[d.route_index];
-        pfe->mcp_route_active=1;
-        pfe->mcp_route_ticket=atomic_fetch_add_explicit(
-            &ent->mcp_l7_rr_ticket[d.route_index],1,memory_order_relaxed);
-        if (tepval_out) *tepval_out=ent->val.ephash;
-      } else if (tepval_out) {
-        *tepval_out = l7_resolve_pool(ent, &d.u.fwd);
+      if (tepval_out)
+        *tepval_out = l7_route_pool(pfe, ent, pool0, &d, mcp);
+      PROXY_UNLOCK();
+      if (mcp && tepval_out && !*tepval_out) {
+        l7_send_reject(pfe, 503, NULL);
+        return L7_DISPATCH_TERMINATED;
       }
-      if (mcp_locked) PROXY_UNLOCK();
       return L7_DISPATCH_FORWARD;
     default:
       /* Unknown action kind — terminal default reject. */
-      if (mcp_locked) PROXY_UNLOCK();
+      PROXY_UNLOCK();
       l7_send_reject(pfe, 404, NULL);
       return L7_DISPATCH_TERMINATED;
     }
@@ -818,7 +741,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
 
   /* No route matched: Gateway no-match default is 404 (configurable, RESEARCH
    * Open-Questions resolution). */
-  if (mcp_locked) PROXY_UNLOCK();
+  PROXY_UNLOCK();
   l7_send_reject(pfe, 404, NULL);
   return L7_DISPATCH_TERMINATED;
 }
@@ -962,7 +885,6 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
 {
   const l7_route_t *route;
   l7_hdr_filter_t filters[L7_MAX_HDR_FILTERS];
-  int modern;
   char port_str[8];
   uint8_t i, n;
 
@@ -988,18 +910,31 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
    * Each value is validated (the peer IP / scheme are loxilb-derived and
    * well-formed, but validate anyway as defence-in-depth — a malformed one is
    * dropped, never spliced). */
+  pfe->l7_xff_verdict = SP_XFF_NONE;
+  pfe->l7_xff_ntrusted = 0;
   if (xff_ip && l7_hdr_value_valid(xff_ip)) {
     char chain[L7_HDR_VALUE_MAX];
+    uint8_t n_trusted;
 
+    /* The trusted ranges ride the policy: an attach rewrites them and a
+     * detach clears them under the write lock, so they are read under the
+     * read lock, and nothing below it emits. */
+    PROXY_RDLOCK();
     l7_derive_origin(scope, ent, xff_ip);
+    n_trusted = ent->l7_n_trusted_ranges;
+    PROXY_UNLOCK();
 
-    if (ent->l7_n_trusted_ranges > 0 &&
+    pfe->l7_xff_ntrusted = n_trusted;
+    if (n_trusted > 0 &&
         l7_chain_append_peer(scope ? scope->hops : NULL, xff_ip,
                              chain, sizeof(chain)) > 0 &&
-        l7_hdr_value_valid(chain))
+        l7_hdr_value_valid(chain)) {
+      pfe->l7_xff_verdict = SP_XFF_EXTENDED;
       emit(ctx, L7HDR_SET, "X-Forwarded-For", chain);
-    else
+    } else {
+      pfe->l7_xff_verdict = SP_XFF_REPLACED;
       emit(ctx, L7HDR_SET, "X-Forwarded-For", xff_ip);
+    }
   }
 
   snprintf(port_str, sizeof(port_str), "%u", (unsigned)listener_port);
@@ -1008,14 +943,14 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
   if (xfproto && l7_hdr_value_valid(xfproto))
     emit(ctx, L7HDR_SET, "X-Forwarded-Proto", xfproto);
 
-  /* (4) The matched route's bounded insertHeaders ops. */
-  modern=ent->val.ephash && ent->val.ephash->mcp_stateless;
-  if (modern) PROXY_RDLOCK();
+  /* (4) The matched route's bounded insertHeaders ops, copied under the read
+   * lock: a policy replace or detach frees the routes under the write lock. */
+  PROXY_RDLOCK();
   route = l7_first_matching_route(pfe, (proxy_map_ent_t *)ent);
   n=route ? route->n_hdr_filters : 0;
   if (n > L7_MAX_HDR_FILTERS) n=L7_MAX_HDR_FILTERS;
   if (n) memcpy(filters,route->hdr_filters,(size_t)n*sizeof(filters[0]));
-  if (modern) PROXY_UNLOCK();
+  PROXY_UNLOCK();
   /* No route-owned pointer reaches emit, which can call protocol callbacks. */
   for (i = 0; i < n; i++) {
     const l7_hdr_filter_t *f = &filters[i];
@@ -1113,12 +1048,19 @@ l7_cookie_node_match(const struct proxy_map_ent *node,
 int
 l7_cookie_persist_active(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent)
 {
-  if (ent && ent->val.ephash && ent->val.ephash->mcp_stateless) return 0;
+  const proxy_epval_t *pool0 = sp_pool_first(ent);
+  if (pool0 && pool0->mcp_stateless) return 0;
   const l7_route_t *route;
-  if (!pfe || !ent || !ent->has_l7_policy)
+  int on;
+  if (!pfe || !ent)
     return 0;
-  route = l7_first_matching_route(pfe, (proxy_map_ent_t *)ent);
-  return (route && route->cookie_persist) ? 1 : 0;
+  /* The policy and its routes are read under the read lock
+   * (l7_route_dispatch). */
+  PROXY_RDLOCK();
+  route = ent->has_l7_policy ? l7_first_matching_route(pfe, (proxy_map_ent_t *)ent) : NULL;
+  on = (route && route->cookie_persist) ? 1 : 0;
+  PROXY_UNLOCK();
+  return on;
 }
 
 /* Reconstruct the presented cookie value of name LB_COOKIE_NAME from the bounded
@@ -1215,15 +1157,7 @@ l7_clear_attached(proxy_map_ent_t *ent)
     ent->l7_routes = NULL;
   }
   ent->n_l7_routes = 0;
-  ent->has_l7_policy = 0;
-  /* Free the FORWARD scratch resolved-pool (gap-fix). It holds NO owned sub-
-   * objects (l7_resolve_pool deliberately strips every shared owned pointer —
-   * hash_ring/chwbl_config/pd_trie/session maps — before use), so a plain free
-   * of the buffer itself is correct and leak-free. */
-  if (ent->l7_resolved_pool) {
-    free(ent->l7_resolved_pool);
-    ent->l7_resolved_pool = NULL;
-  }
+  __atomic_store_n(&ent->has_l7_policy, 0, __ATOMIC_RELAXED);
 }
 
 /*
@@ -1330,7 +1264,7 @@ int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
         atomic_store_explicit(&node->mcp_l7_rr_ticket[ri],0,memory_order_relaxed);
       node->l7_routes = copy;           /* POPULATE Plan-04 discriminator field */
       node->n_l7_routes = n_routes;     /* POPULATE Plan-04 discriminator field */
-      node->has_l7_policy = 1;          /* POPULATE Plan-04 discriminator field */
+      __atomic_store_n(&node->has_l7_policy, 1, __ATOMIC_RELAXED); /* POPULATE Plan-04 discriminator field */
       PROXY_UNLOCK();
       return 0;
     }
@@ -1444,15 +1378,19 @@ int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
  * Cookie predicates use the Cookie header as their operand source. */
 int l7_mcp_header_used(const proxy_map_ent_t *ent, const char *name, size_t len)
 {
-  if (!ent || !ent->has_l7_policy || !ent->l7_routes) return 0;
-  const l7_route_t *routes=ent->l7_routes;
-  for (int i=0;i<ent->n_l7_routes;i++)
-    for (unsigned j=0;j<routes[i].n_sets;j++)
-      for (unsigned k=0;k<routes[i].sets[j].n_conds;k++) {
+  int used = 0;
+  if (!ent || !l7_policy_on(ent)) return 0;
+  /* The routes are read under the read lock (l7_route_dispatch). */
+  PROXY_RDLOCK();
+  const l7_route_t *routes=ent->has_l7_policy ? ent->l7_routes : NULL;
+  for (int i=0;routes && !used && i<ent->n_l7_routes;i++)
+    for (unsigned j=0;!used && j<routes[i].n_sets;j++)
+      for (unsigned k=0;!used && k<routes[i].sets[j].n_conds;k++) {
         const l7_condition_t *cond=&routes[i].sets[j].conds[k];
         if (cond->field==L7F_HEADER && strlen(cond->key)==len &&
-            !strncasecmp(cond->key,name,len)) return 1;
-        if (cond->field==L7F_COOKIE && len==6 && !strncasecmp(name,"cookie",6)) return 1;
+            !strncasecmp(cond->key,name,len)) used = 1;
+        if (cond->field==L7F_COOKIE && len==6 && !strncasecmp(name,"cookie",6)) used = 1;
       }
-  return 0;
+  PROXY_UNLOCK();
+  return used;
 }

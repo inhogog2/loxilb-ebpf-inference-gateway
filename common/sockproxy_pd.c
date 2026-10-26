@@ -36,6 +36,8 @@
 extern void llb_ai_pd_session_hit(char *model_name);
 /* AI Gateway CGO bridge: terminal routing-tier selection counter */
 extern void llb_ai_pd_tier_selected(char *model_name, int tier);
+/* AI Gateway CGO bridge: terminal decode selection counter (plan A4) */
+extern void llb_ai_pd_decode_selected(char *model_name, int path, int kv_fill);
 /* Forward-declare overflow counter increment (defined in sockproxy_metrics.c) */
 extern void pd_kv_overflow_inc(void);
 #else
@@ -1373,6 +1375,38 @@ pd_kv_loadguard_on(void)
   return v;
 }
 
+/* Decode KV-pressure weight (cached getenv, read once — same pattern as
+ * pd_kv_loadguard_on above, so a change needs a restart to take effect).
+ *   LLB_PD_DECODE_KV_WEIGHT=W   0 (default) = off: pd_select_decode_excluding's
+ *                              score loop is the shipped conns + queued, and
+ *                              kv_usage_enc is never loaded.
+ *                              1..1000 = "virtual in-flight requests a decode
+ *                              EP at 100 % KV usage carries": the score gains
+ *                              (kv_eff * W) / 100, kv_eff being the EP's own
+ *                              fresh reading or, when unknown/stale, the mean of
+ *                              the fresh readings in the candidate set (neutral).
+ * Values above 1000 clamp to 1000; anything unparsable or negative reads as 0.
+ * Until the REST knob lands (plan §4 PR-4) this is the only switch. */
+#define PD_DECODE_KV_WEIGHT_MAX 1000
+static uint32_t
+pd_decode_kv_weight(void)
+{
+  static int cached = -1;
+  int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+  if (v >= 0) return (uint32_t)v;
+  const char *e = getenv("LLB_PD_DECODE_KV_WEIGHT");
+  v = 0;
+  if (e && *e) {
+    char *end = NULL;
+    errno = 0;
+    long w = strtol(e, &end, 10);
+    if (errno == 0 && end != e && *end == '\0' && w > 0)
+      v = (w > PD_DECODE_KV_WEIGHT_MAX) ? PD_DECODE_KV_WEIGHT_MAX : (int)w;
+  }
+  __atomic_store_n(&cached, v, __ATOMIC_RELEASE);
+  return (uint32_t)v;
+}
+
 /* distinct return for "all prefill EPs at in-flight cap". Normally provided
  * by sockproxy.h, but under the unit-test guards (TEST_PD_CACHE_AWARE) sockproxy.h is
  * not included, so define it here too (idempotent #ifndef). */
@@ -1406,6 +1440,8 @@ pd_kv_loadguard_on(void)
 #define PD_CTRL_STATE(p)  (((p) >> 24) & 0xff)
 #define PD_CTRL_WEIGHT(p) ((p) & 0xff)
 #endif
+
+#include "sockproxy_pd_reservation.h"
 
 /* per-EP in-flight admission cap (env LLB_PD_MAX_INFLIGHT_PER_EP, cached
  * getenv-once). 0/unset = DISABLED -> pd_select_prefill is byte-identical to today
@@ -1592,6 +1628,24 @@ pd_queued_or_fill(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_fill,
   return atomic_load(&ld->queued_requests);
 }
 
+/* Decode KV-pressure reading. kv_usage_enc is pct + 1 with 0 = never reported
+ * (the zero-filled pool), so "reported 0 %" (enc 1) and "unknown" (enc 0) are
+ * distinct. Returns 1 and the percentage when the EP has a FRESH reading —
+ * freshness is the queue-depth stamp, which the same scraper sample writes —
+ * and 0 (pct_out untouched) when it is unknown or stale; the caller then
+ * substitutes the neutral fill. Only called when LLB_PD_DECODE_KV_WEIGHT > 0,
+ * so the W == 0 path never loads kv_usage_enc. */
+static inline int
+pd_kv_usage_fresh(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_ms,
+                  uint32_t *pct_out)
+{
+  uint8_t enc = atomic_load(&ld->kv_usage_enc);
+  if (enc == 0 || enc > 101) return 0;
+  if (!pd_queued_is_fresh(ld, now_sec, stale_ms)) return 0;
+  *pct_out = (uint32_t)enc - 1;
+  return 1;
+}
+
 /* ===========================================================================
  * bounded-admission FIFO dequeue + reap primitives.
  *
@@ -1625,6 +1679,37 @@ pd_parked_peek_head(const pd_parked_fifo_t *q, pd_parked_ent_t *out)
   if (!q || q->count == 0) return 0;
   if (out) *out = q->slot[q->head];
   return 1;
+}
+
+/* 1 when an entry for (fd, gen) is still in the FIFO, 0 otherwise. O(count).
+ * A parked request's entry leaves only by a pop for its turn (slot return,
+ * drain) or by removal at cleanup or reap, so a resume that still finds its
+ * entry is not its turn. */
+int
+pd_parked_holds(const pd_parked_fifo_t *q, int fd, uint64_t gen)
+{
+  if (!q) return 0;
+  uint16_t idx = q->head;
+  for (uint16_t k = 0; k < q->count; k++) {
+    if (q->slot[idx].fd == fd && q->slot[idx].gen == gen) return 1;
+    idx = (uint16_t)((idx + 1) % PD_MAX_QUEUE_DEPTH);
+  }
+  return 0;
+}
+
+/* 1 while a parked request's own entry is still in its FIFO: a resume now is
+ * not its turn. Takes pd_parked_lock. */
+int
+pd_parked_turn_pending(proxy_epval_t *t, const proxy_fd_ent_t *p)
+{
+  int held = 0;
+
+  if (!t || !p || p->park_ep_idx < 0 || p->park_ep_idx >= t->n_eps) return 0;
+  pthread_mutex_lock(&t->pd_parked_lock);
+  held = pd_parked_holds(&t->pd_parked[p->park_ep_idx], p->fd,
+                         atomic_load_explicit(&p->gen, memory_order_relaxed));
+  pthread_mutex_unlock(&t->pd_parked_lock);
+  return held;
 }
 
 /* Remove the entry matching want_fd (and, if want_gen!=0, also want_gen) from the
@@ -1788,10 +1873,77 @@ pd_record_tier_selected(proxy_fd_ent_t *pfe, int tier)
 }
 #endif
 
-int
-pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
-                  uint32_t excluded_mask)
+/* Decode selection path, the `path` argument of llb_ai_pd_decode_selected
+ * (plan A4). Defined here rather than in sockproxy_ai_gw.h because the unit
+ * builds compile this file without that header; the Go side mirrors the
+ * encoding in RecordPDDecodeSelected and drops any other value. */
+#define PD_DEC_PATH_HINT     0  /* session-pinned decode EP kept (branch [1]) */
+#define PD_DEC_PATH_SCORE    1  /* min-load pick; every scored pick with W=0 */
+#define PD_DEC_PATH_SCORE_KV 2  /* W>0 and the kv term changed the best set */
+
+/* Record one terminal decode selection for Prometheus. Model fallback as
+ * pd_record_tier_selected. Called ONLY from pd_select_decode (admission,
+ * mid-cycle prefill-connect failover, SGLang pair retry) — never from
+ * pd_select_decode_excluding, whose only direct caller, pd_connect_decode,
+ * re-reads the admission choice at connect time and must not count it twice. */
+#if !defined(TEST_PD_REWRITER) && !defined(TEST_PD_CACHE_AWARE)
+static void
+pd_record_decode_selected(proxy_fd_ent_t *pfe, int path, int kv_fill)
 {
+  const char *model = "";
+  if (pfe->x_model_header[0] != '\0') {
+    model = pfe->x_model_header;
+  } else if (pfe->prefix_key.model[0] != '\0') {
+    model = pfe->prefix_key.model;
+  }
+  llb_ai_pd_decode_selected((char *)model, path, kv_fill);
+}
+#else
+/* Unit builds: the recorder parks the last decision where the unit can read
+ * it (test_pd_cache_aware's Suite E asserts the path classification). -1 =
+ * nothing recorded since the unit last reset them. */
+static int pd_test_last_decode_path = -1;
+static int pd_test_last_decode_kv_fill = -1;
+static inline void
+pd_record_decode_selected(proxy_fd_ent_t *pfe, int path, int kv_fill)
+{
+  (void)pfe;
+  pd_test_last_decode_path = path;
+  pd_test_last_decode_kv_fill = kv_fill;
+}
+#endif
+
+/* One-shot [PD_DEC] transition log (plan A4): the first selection that has to
+ * neutralise a candidate's kv term logs once, and so does the first selection
+ * after that with a fresh reading on every candidate. The state is per
+ * service (proxy_epval_t.pd_kv_fill_state, zero-filled); atomic_exchange so
+ * concurrent selections log each edge once. Only called with W > 0. */
+static void
+pd_kv_fill_transition(proxy_epval_t *tepval, int fd, int n_fill, int n_scored,
+                      uint32_t kv_fill, uint32_t kv_w)
+{
+  uint8_t want = n_fill > 0 ? 1 : 0;
+  uint8_t was = atomic_exchange(&tepval->pd_kv_fill_state, want);
+  if (was == want) return;
+  (void)fd; (void)n_scored; (void)kv_fill; (void)kv_w;  /* log_info is a no-op in unit builds */
+  if (want)
+    log_info("[PD_DEC] fd=%d kv signal unknown or stale on %d of %d decode "
+             "candidates: neutral fill %u%% in effect (W=%u)",
+             fd, n_fill, n_scored, kv_fill, kv_w);
+  else
+    log_info("[PD_DEC] fd=%d kv signal fresh on all %d decode candidates "
+             "again (W=%u)", fd, n_scored, kv_w);
+}
+
+static int pd_select_prefill_impl(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
+                                  int *ep_out, uint32_t excluded_mask, int reserve,
+                                  int allow_park)
+{
+  const uint32_t original_excluded = excluded_mask;
+  uint32_t rejected = 0;
+select_again:
+  excluded_mask = original_excluded;
+  *ep_out = -1;
   /* --: global-controller advisory fold-in (SNAP-03/04) ---
    * G3 guard order (Pitfall 2): read pd_ctrl_mode FIRST. mode 0 == controller
    * absent/autonomous == ZERO further controller work (no loop, no pd_ctrl_ep
@@ -1849,14 +2001,15 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
             tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
         if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* no NEW work */
         healthy_elig++;
-        if (atomic_load(&tepval->pd_ep_loads[i].active_conns) >= cap)
+        if ((rejected & (1u << (unsigned)i)) ||
+            atomic_load(&tepval->pd_ep_loads[i].active_conns) >= cap)
           cap_excl |= (1u << (unsigned)i);
         else
           under_cap++;
       }
       if (healthy_elig > 0 && under_cap == 0) {
         /* All healthy prefill EPs at the in-flight cap. */
-        uint32_t depth = pd_queue_depth_per_ep();
+        uint32_t depth = allow_park ? pd_queue_depth_per_ep() : 0;
         if (depth == 0) {
           /* Default-off: shed (retriable) exactly as . Byte-identical. */
           uint64_t n = atomic_fetch_add(&pd_admission_shed_total, 1) + 1;
@@ -1873,6 +2026,27 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
          * (the cap loop already proved they are all capped & eligible) under
          * pd_parked_lock so the depth read and the enqueue are atomic together. */
         pthread_mutex_lock(&tepval->pd_parked_lock);
+        /* Pair a fresh capacity read with enqueue under the FIFO lock.
+         * A release before this read retries; a release after it wakes the
+         * entry after acquiring the same lock. No lost last-slot wakeup. */
+        if (reserve) {
+          int available = 0;
+          for (int i = 0; i < tepval->n_eps && i < 32; i++) {
+            if (tepval->ep_role[i] != 1 || tepval->eps[i].inv ||
+                (excluded_mask & (1u << (unsigned)i)) ||
+                (tepval->cb_enabled &&
+                 tepval->circuit_breakers[i].state == CB_STATE_OPEN) ||
+                pd_ctrl_draining(tepval, i, cmode))
+              continue;
+            if (atomic_load(&tepval->pd_ep_loads[i].active_conns) < cap)
+              available = 1;
+          }
+          if (available) {
+            pthread_mutex_unlock(&tepval->pd_parked_lock);
+            rejected = 0;
+            goto select_again;
+          }
+        }
         int park_ep = -1;
         uint32_t best_count = depth;  /* only EPs strictly under bound qualify */
         for (int i = 0; i < tepval->n_eps && i < 32; i++) {
@@ -1920,6 +2094,11 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     }
   }
 
+  /* A failed reservation is excluded even when cap0 disables the cap
+   * scan, or a draining session is absent from the NEW-work scan. Each
+   * candidate is tried at most once; never spin on a full pinned owner. */
+  excluded_mask |= rejected;
+
   /* --- Tier 0: Session stickiness (always active for pd_disagg) --- */
   const char *session_key = NULL;
   const char *session_key_src = "none";
@@ -1944,6 +2123,10 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           !tepval->eps[pre].inv &&
           !(tepval->cb_enabled &&
             tepval->circuit_breakers[pre].state == CB_STATE_OPEN)) {
+        if (reserve && !pd_load_try_reserve(tepval, pre, pd_max_inflight_per_ep())) {
+          rejected |= 1u << (unsigned)(pre);
+          goto select_again;
+        }
         pfe->pd_decode_ep_idx = dec;  /* Pass decode hint to pd_select_decode */
         *ep_out = pre;
         /* US-H105: Record Tier-0 session stickiness hit for Prometheus */
@@ -1998,6 +2181,11 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           !(tepval->cb_enabled &&
             tepval->circuit_breakers[trie_ep].state == CB_STATE_OPEN) &&
           !pd_ctrl_draining(tepval, trie_ep, cmode) /* no NEW work */) {
+        if (reserve &&
+            !pd_load_try_reserve(tepval, trie_ep, pd_max_inflight_per_ep())) {
+          rejected |= 1u << (unsigned)(trie_ep);
+          goto select_again;
+        }
         /* Tier 1 hit — update trie timestamp */
         pthread_rwlock_wrlock(&tepval->pd_trie_lock);
         pd_trie_insert(tepval->pd_trie, pfe->prefix_key.prefix,
@@ -2047,6 +2235,10 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     if (kv_loadguard_ok &&
         pd_kv_exact_select(tepval, pfe, ep_out,
                            excluded_mask | ctrl_drain) == 0) {
+      if (reserve && !pd_load_try_reserve(tepval, *ep_out, pd_max_inflight_per_ep())) {
+        rejected |= 1u << (unsigned)(*ep_out);
+        goto select_again;
+      }
       pd_record_tier_selected(pfe, 15);
       return 0;  /* Tier 1.5 hit */
     }
@@ -2158,12 +2350,18 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     if (n_cand <= 0) {
       log_error("no healthy prefill candidates (n_eps=%d excluded_mask=0x%x)\n",
                 tepval->n_eps, excluded_mask);
-      return -1;
+      /* A failed reservation is capacity exhaustion, not an invitation to
+       * bypass admission through normal-mode fallback. */
+      return (reserve && rejected) ? PD_PREFILL_NO_CAPACITY : -1;
     }
     /* Bug5-fix: only advance RR counter on genuine tie (n_cand > 1); advancing
      * unconditionally biases even-numbered calls toward candidates[0] */
     uint32_t rr = (n_cand > 1) ? atomic_fetch_add(&tepval->pd_tier2_rr, 1) : 0;
     best_ep = candidates[rr % (uint32_t)n_cand];
+    if (reserve && !pd_load_try_reserve(tepval, best_ep, pd_max_inflight_per_ep())) {
+      rejected |= 1u << (unsigned)(best_ep);
+      goto select_again;
+    }
     *ep_out = best_ep;
     pd_record_tier_selected(pfe, 2);
 
@@ -2181,25 +2379,51 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
   return 0;
 }
 
+/* Selection-only API retained for routing callers/tests. Production P creators
+ * must use pd_reserve_prefill: a successful selection alone owns no unit. */
+int pd_select_prefill(proxy_epval_t *t, proxy_fd_ent_t *p, int *ep, uint32_t excluded)
+{
+  return pd_select_prefill_impl(t, p, ep, excluded, 0, 1);
+}
+
+int pd_reserve_prefill(proxy_epval_t *t, proxy_fd_ent_t *p, int *ep, uint32_t excluded,
+                       int allow_park)
+{
+  if (!p || !t || !ep)
+    return -1;
+  return pd_select_prefill_impl(t, p, ep, excluded, 1, allow_park);
+}
+
+/* What one decode selection resolved to, for the recorder (plan A4). */
+typedef struct pd_decode_pick {
+  int path;     /* PD_DEC_PATH_* */
+  int kv_fill;  /* 1 = W>0 and a scored candidate took the neutral kv fill */
+} pd_decode_pick_t;
+
 /*
- * pd_select_decode() - Select decode EP using session hint or min-load.
+ * pd_select_decode_impl() - Select decode EP using session hint or min-load.
  *
  * If pd_select_prefill set pd_decode_ep_idx (from Tier 0 session hit),
  * use that if healthy. Otherwise min-load among healthy decode EPs.
+ * `pick`, when given, receives how the selection resolved; the two public
+ * wrappers below decide whether that is recorded.
  *
  * Returns 0 on success (*ep_out set), -1 if no healthy decode EP found.
  */
-int
-pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
+static int
+pd_select_decode_impl(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
+                      uint32_t excluded, pd_decode_pick_t *pick)
 {
   /* Session-pinned decode EP from Tier 0 */
   if (pfe->pd_decode_ep_idx >= 0 &&
       pfe->pd_decode_ep_idx < tepval->n_eps &&
+      !(excluded & (UINT32_C(1) << pfe->pd_decode_ep_idx)) &&
       tepval->ep_role[pfe->pd_decode_ep_idx] == 2 &&
       !tepval->eps[pfe->pd_decode_ep_idx].inv &&
       !(tepval->cb_enabled &&
         tepval->circuit_breakers[pfe->pd_decode_ep_idx].state == CB_STATE_OPEN)) {
     *ep_out = pfe->pd_decode_ep_idx;
+    if (pick) { pick->path = PD_DEC_PATH_HINT; pick->kv_fill = 0; }
     return 0;
   }
 
@@ -2212,23 +2436,64 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
   uint64_t q_now_sec = pd_now_ns() / 1000000000ULL;
   uint64_t fresh_q_sum = 0;
   int fresh_q_n = 0;
+  /* Decode KV pressure (plan A3): off by default. With kv_w == 0 the two
+   * loops below are the shipped min-load scorer and kv_usage_enc is never
+   * loaded; with kv_w > 0 the fresh-and-reported readings are averaged in the
+   * same pass as the queue fill, and each candidate's score gains
+   * (kv_eff * kv_w) / 100 where kv_eff is its own reading or that mean. */
+  uint32_t kv_w = pd_decode_kv_weight();
+  uint64_t fresh_kv_sum = 0;
+  int fresh_kv_n = 0;
   for (int i = 0; i < tepval->n_eps; i++) {
-    if (tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
+    if ((excluded & (UINT32_C(1) << i)) ||
+        tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
     if (tepval->cb_enabled &&
         tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
     if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec, tepval->fc.cfg.telemetry_stale_ms)) continue;
     fresh_q_sum += atomic_load(&tepval->pd_ep_loads[i].queued_requests);
     fresh_q_n++;
+    if (kv_w) {
+      uint32_t kv_pct;
+      if (pd_kv_usage_fresh(&tepval->pd_ep_loads[i], q_now_sec,
+                            tepval->fc.cfg.telemetry_stale_ms, &kv_pct)) {
+        fresh_kv_sum += kv_pct;
+        fresh_kv_n++;
+      }
+    }
   }
   uint32_t stale_fill = fresh_q_n ? (uint32_t)(fresh_q_sum / (uint64_t)fresh_q_n) : 0;
+  /* Neutral kv term for an unknown/stale candidate: the fleet mean of the
+   * fresh readings, 0 when nobody reports (then the kv term is 0 for every
+   * candidate and the pick is the shipped one, exactly as with kv_w == 0). */
+  uint32_t kv_fill = fresh_kv_n ? (uint32_t)(fresh_kv_sum / (uint64_t)fresh_kv_n) : 0;
+  /* Plan A4 (W>0 only): the shipped score's own best set, to classify the
+   * pick as score vs score_kv; how many candidates took the fill. */
+  uint64_t base_best = UINT64_MAX;
+  uint32_t base_mask = 0;
+  int n_fill = 0;
+  int n_scored = 0;
   for (int i = 0; i < tepval->n_eps; i++) {
-    if (tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
+    if ((excluded & (UINT32_C(1) << i)) ||
+        tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
     if (tepval->cb_enabled &&
         tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
     uint32_t conns = atomic_load(&tepval->pd_ep_loads[i].active_conns);
     uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill,
                                         tepval->fc.cfg.telemetry_stale_ms);
     uint64_t score = (uint64_t)conns + (uint64_t)queued;
+    if (kv_w) {
+      uint32_t kv_eff = kv_fill;
+      int fresh = pd_kv_usage_fresh(&tepval->pd_ep_loads[i], q_now_sec,
+                                    tepval->fc.cfg.telemetry_stale_ms, &kv_eff);
+      if (score < base_best) { base_best = score; base_mask = 0; }
+      if (score == base_best) base_mask |= UINT32_C(1) << i;
+      if (!fresh) n_fill++;
+      n_scored++;
+      score += ((uint64_t)kv_eff * (uint64_t)kv_w) / 100ULL;
+      log_debug("[PD_DEC] fd=%d ep=%d conns=%u queued=%u kv=%u(%s) score=%llu",
+                pfe->fd, i, conns, queued, kv_eff, fresh ? "ep" : "fill",
+                (unsigned long long)score);
+    }
     if (score < best_score) { best_score = score; n_cand = 0; }
     if (score == best_score) candidates[n_cand++] = i;
   }
@@ -2237,7 +2502,47 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
   int best_ep = candidates[rr % n_cand];
   *ep_out = best_ep;
   pfe->pd_decode_ep_idx = best_ep;
+  if (kv_w) {
+    /* score_kv = the kv term changed the SET of minimum-score candidates, so
+     * the pick is one the shipped scorer would not have made (a changed RR
+     * draw within the same set is still `score`). */
+    uint32_t best_mask = 0;
+    for (int k = 0; k < n_cand; k++) best_mask |= UINT32_C(1) << candidates[k];
+    int changed = best_mask != base_mask;
+    log_debug("[PD_DEC] fd=%d winner ep=%d score=%llu path=%s fill=%d/%d W=%u",
+              pfe->fd, best_ep, (unsigned long long)best_score,
+              changed ? "score_kv" : "score", n_fill, n_scored, kv_w);
+    pd_kv_fill_transition(tepval, pfe->fd, n_fill, n_scored, kv_fill, kv_w);
+    if (pick) {
+      pick->path = changed ? PD_DEC_PATH_SCORE_KV : PD_DEC_PATH_SCORE;
+      pick->kv_fill = n_fill > 0;
+    }
+  } else if (pick) {
+    pick->path = PD_DEC_PATH_SCORE;
+    pick->kv_fill = 0;
+  }
   return 0;
+}
+
+/* The connect-time variant (pd_connect_decode): re-reads the admission
+ * choice, or re-picks around a refused EP. Not a selection event — nothing
+ * is recorded (llb_ai_pd_decode_selected's contract). */
+int
+pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
+                           uint32_t excluded)
+{
+  return pd_select_decode_impl(tepval, pfe, ep_out, excluded, NULL);
+}
+
+/* The selection entry (admission, mid-cycle prefill-connect failover, SGLang
+ * pair retry): one record per successful pick. */
+int
+pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
+{
+  pd_decode_pick_t pick;
+  int rc = pd_select_decode_impl(tepval, pfe, ep_out, 0, &pick);
+  if (rc == 0) pd_record_decode_selected(pfe, pick.path, pick.kv_fill);
+  return rc;
 }
 
 /**

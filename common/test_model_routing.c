@@ -17,6 +17,15 @@ add_pool(proxy_map_ent_t *service, proxy_epval_t *pool, const char *key,
   pool->_id = id;
   strncpy(pool->ephash_key, key, sizeof(pool->ephash_key) - 1);
   HASH_ADD_STR(service->val.ephash, ephash_key, pool);
+  /* Lookups read the published index, as the workers do. */
+  assert(sp_pool_index_publish(service) == 0);
+}
+
+static void
+del_pool(proxy_map_ent_t *service, proxy_epval_t *pool)
+{
+  HASH_DEL(service->val.ephash, pool);
+  assert(sp_pool_index_publish(service) == 0);
 }
 
 static void
@@ -33,7 +42,7 @@ test_hostname_only_model_pool(void)
       "Qwen/Qwen2.5-7B-Instruct");
   assert(got == &model_pool);
 
-  HASH_DEL(service.val.ephash, &model_pool);
+  del_pool(&service, &model_pool);
 }
 
 static void
@@ -50,8 +59,8 @@ test_model_pool_precedes_wildcard_path(void)
       &service, "inference.example", "/v1/completions", "model-a");
   assert(got == &model_pool);
 
-  HASH_DEL(service.val.ephash, &model_pool);
-  HASH_DEL(service.val.ephash, &wildcard_path);
+  del_pool(&service, &model_pool);
+  del_pool(&service, &wildcard_path);
 }
 
 static void
@@ -66,7 +75,7 @@ test_unknown_model_uses_wildcard_path(void)
       &service, "inference.example", "/v1/completions", "unknown-model");
   assert(got == &wildcard_path);
 
-  HASH_DEL(service.val.ephash, &wildcard_path);
+  del_pool(&service, &wildcard_path);
 }
 
 /* An exact pool may win the full path, never an ancestor candidate. */
@@ -82,9 +91,9 @@ test_exact_path_does_not_match_children(void)
   assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact", "model-a") == &exact);
   assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact?probe=1", "model-a") == &exact);
   assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact/child", "model-a") == &root);
-  HASH_DEL(service.val.ephash, &root);
+  del_pool(&service, &root);
   assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact/child", "model-a") == NULL);
-  HASH_DEL(service.val.ephash, &exact);
+  del_pool(&service, &exact);
 }
 
 static void
@@ -105,9 +114,9 @@ test_wildcard_exact_and_root_are_exact(void)
   assert(find_endpoint_lpm(&service, "inference.example", "/?probe=1", "unknown") == &root);
   assert(find_endpoint_lpm(&service, "inference.example", "/other", "unknown") == NULL);
   assert(find_endpoint_lpm(&service, "inference.example", "/other", "") == NULL);
-  HASH_DEL(service.val.ephash, &exact);
-  HASH_DEL(service.val.ephash, &prefix);
-  HASH_DEL(service.val.ephash, &root);
+  del_pool(&service, &exact);
+  del_pool(&service, &prefix);
+  del_pool(&service, &root);
 }
 
 static void
@@ -130,9 +139,9 @@ test_listener_model_root_and_longest_path(void)
   assert(find_endpoint_lpm(&service, "floating.example", "/v1/other", "model-a") == &prefix);
   assert(find_endpoint_lpm(&service, "floating.example", "/other", "model-a") == &root);
   assert(find_endpoint_lpm(&service, "floating.example", "/v1/chat", "wrong-model") == NULL);
-  HASH_DEL(service.val.ephash, &longer);
-  HASH_DEL(service.val.ephash, &prefix);
-  HASH_DEL(service.val.ephash, &root);
+  del_pool(&service, &longer);
+  del_pool(&service, &prefix);
+  del_pool(&service, &root);
 }
 
 static void
@@ -148,7 +157,7 @@ test_listener_exact_query_and_wrong_path(void)
   assert(find_endpoint_lpm(&service, "client.example", "/v1/exact/child", "model-a") == NULL);
   assert(find_endpoint_lpm(&service, "client.example", "/other", "model-a") == NULL);
   assert(find_endpoint_lpm(&service, "client.example", "/v1/exact", "wrong-model") == NULL);
-  HASH_DEL(service.val.ephash, &exact);
+  del_pool(&service, &exact);
 }
 
 static void
@@ -164,9 +173,9 @@ test_listener_wildcard_path_and_host_precedence(void)
   assert(find_endpoint_lpm(&service, "other.example", "/v1/chat/completions", "unknown") == &wildcard);
   assert(find_endpoint_lpm(&service, "other.example", "/outside", "unknown") == NULL);
   assert(find_endpoint_lpm(&service, "client.example", "/v1/chat/completions", "model-a") == &explicit_host);
-  HASH_DEL(service.val.ephash, &explicit_host);
-  HASH_DEL(service.val.ephash, &wildcard);
-  HASH_DEL(service.val.ephash, &model);
+  del_pool(&service, &explicit_host);
+  del_pool(&service, &wildcard);
+  del_pool(&service, &model);
 }
 
 static void
@@ -179,13 +188,98 @@ test_listener_without_path_remains_supported(void)
   add_pool(&service, &wildcard, "127.0.0.1:2086", 902);
   assert(find_endpoint_lpm(&service, "client.example", "/any", "model-a") == &model);
   assert(find_endpoint_lpm(&service, "client.example", "/any", "unknown") == &wildcard);
-  HASH_DEL(service.val.ephash, &wildcard);
-  HASH_DEL(service.val.ephash, &model);
+  del_pool(&service, &wildcard);
+  del_pool(&service, &model);
+}
+
+/* The admission gate asks for the default reservation of the rule a request
+ * routes to: the pool this lookup selects, whichever was installed first. */
+static void
+test_default_reservation_is_the_routed_pools(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t first_off, model_on, model_third, wildcard;
+
+  add_pool(&service, &first_off, "inference.example||model-off", 901);
+  add_pool(&service, &model_on, "inference.example||model-on", 902);
+  add_pool(&service, &model_third, "inference.example||model-third", 903);
+  model_on.ai_default_tokens = 800;
+  model_third.ai_default_tokens = 300;
+
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-off") == 0);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-on") == 800);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-third") == 300);
+  /* no pool for the model and no wildcard: no rule, nothing reserved by default */
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-none") == 0);
+  assert(sp_resv_default_tokens_route(&service, "other.example", "/", "model-on") == 0);
+  /* a wildcard pool takes the models that have none of their own */
+  add_pool(&service, &wildcard, "inference.example|/", 904);
+  wildcard.ai_default_tokens = 64;
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-none") == 64);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "") == 64);
+  assert(sp_resv_default_tokens_route(&service, "inference.example", "/v1/chat/completions", "model-on") == 800);
+  /* no usable Host: dispatch takes the pool that names the model, and so
+   * does this; a request that names none is refused, nothing reserved */
+  first_off.ai_default_tokens = 5;
+  assert(sp_resv_default_tokens_route(&service, NULL, "/", "model-on") == 800);
+  assert(sp_resv_default_tokens_route(&service, NULL, NULL, NULL) == 0);
+  assert(sp_resv_default_tokens_route(&service, NULL, "/", "model-none") == 0);
+  assert(sp_resv_default_tokens_route(NULL, "inference.example", "/", "model-on") == 0);
+
+  HASH_CLEAR(hh, service.val.ephash);
+  /* As the last delete does: an empty index retires the published one. */
+  assert(sp_pool_index_publish(&service) == 0);
+}
+
+/* A request with no usable Host (ROUTE-01's second defence): on a listener
+ * whose pools name models, the pool that names the request's model, or a
+ * refusal; never the first pool. A listener with no model pool keeps the
+ * first pool. */
+static void
+test_hostless_route(void)
+{
+  proxy_map_ent_t service = {0}, plain = {0}, empty = {0};
+  proxy_epval_t a, b, b2, c, w, p1, p2;
+  proxy_epval_t *got = (proxy_epval_t *)1;
+
+  add_pool(&service, &a, "inference.example||model-a", 1001);
+  add_pool(&service, &b, "inference.example||model-b", 1002);
+  add_pool(&service, &w, "inference.example|/", 1003);
+  add_pool(&service, &b2, "other.example||model-b", 1004);
+  add_pool(&service, &c, "inference.example|/v1|Qwen/Qwen2.5-7B", 1005);
+  assert(sp_route_hostless(&service, "model-b", &got) == SP_HOSTLESS_MODEL && got == &b);
+  assert(sp_route_hostless(&service, "model-a", &got) == SP_HOSTLESS_MODEL && got == &a);
+  /* a pool keyed with a path, and a model name with a slash */
+  assert(sp_route_hostless(&service, "Qwen/Qwen2.5-7B", &got) == SP_HOSTLESS_MODEL && got == &c);
+  /* a model no pool names, or none at all: refused, even with a wildcard pool */
+  assert(sp_route_hostless(&service, "model-z", &got) == SP_HOSTLESS_REFUSE && got == NULL);
+  got = (proxy_epval_t *)1;
+  assert(sp_route_hostless(&service, "", &got) == SP_HOSTLESS_REFUSE && got == NULL);
+  assert(sp_route_hostless(&service, NULL, &got) == SP_HOSTLESS_REFUSE && got == NULL);
+  /* the reservation mirrors follow the same decision */
+  b.ai_objective_strict = 1;
+  assert(sp_resv_objective_strict_route(&service, NULL, "/", "model-b") == 1);
+  assert(sp_resv_objective_strict_route(&service, NULL, "/", "model-z") == 0);
+
+  /* every pool a wildcard: the first pool, as before */
+  add_pool(&plain, &p1, "plain.example|/v1", 1101);
+  add_pool(&plain, &p2, "plain.example|/", 1102);
+  assert(sp_route_hostless(&plain, "model-a", &got) == SP_HOSTLESS_FIRST && got == &p1);
+  assert(sp_route_hostless(&plain, NULL, &got) == SP_HOSTLESS_FIRST && got == &p1);
+  /* no pool at all */
+  got = (proxy_epval_t *)1;
+  assert(sp_route_hostless(&empty, "model-a", &got) == SP_HOSTLESS_FIRST && got == NULL);
+
+  HASH_CLEAR(hh, service.val.ephash);
+  assert(sp_pool_index_publish(&service) == 0);
+  HASH_CLEAR(hh, plain.val.ephash);
+  assert(sp_pool_index_publish(&plain) == 0);
 }
 
 int
 main(void)
 {
+  test_hostless_route();
   test_exact_path_does_not_match_children();
   test_wildcard_exact_and_root_are_exact();
   test_hostname_only_model_pool();
@@ -195,6 +289,7 @@ main(void)
   test_listener_exact_query_and_wrong_path();
   test_listener_wildcard_path_and_host_precedence();
   test_listener_without_path_remains_supported();
+  test_default_reservation_is_the_routed_pools();
   puts("test_model_routing: ALL PASS");
   return 0;
 }

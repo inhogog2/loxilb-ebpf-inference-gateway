@@ -89,6 +89,7 @@ typedef struct {
   int ep_available;
   _Atomic uint32_t num_gpu_blocks;   /* capacity-weighted scorer input */
   _Atomic uint32_t swap_pressure;    /* capacity-weighted scorer input */
+  _Atomic uint8_t  kv_usage_enc;     /* decode KV pressure: 0 = unknown, 1..101 = pct + 1 */
 } ep_load_tracker_t;
 
 typedef struct llm_prefix_key {
@@ -147,6 +148,7 @@ typedef struct proxy_epval {
   uint8_t  kv_exact_mode;  /* .1 Plan 02: KV exact routing mode (0=off, 1=zmq) */
   _Atomic uint32_t pd_tier2_rr;
   _Atomic uint32_t pd_decode_rr;  /* .1 Plan 02: sync with sockproxy.h:377 (P2 TB3/TB4) */
+  _Atomic uint8_t  pd_kv_fill_state;  /* plan A4: [PD_DEC] fill transition state (sockproxy.h) */
   uint32_t pd_session_ttl_sec;
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP];
 
@@ -1140,7 +1142,443 @@ static int test_cap_under_cap_normal(void) {
   return 1;
 }
 
+/* ===== Suite E: Decode KV-pressure scoring (plan A3, LLB_PD_DECODE_KV_WEIGHT) =====
+ *
+ * Default run: the env is unset, pd_decode_kv_weight() == 0, the selector is the
+ * shipped min-load scorer — test_kv_w0_identity pins that with mixed KV values.
+ * "kv" run (Makefile: LLB_PD_DECODE_KV_WEIGHT=8 ./test_pd_cache_aware kv): the
+ * weight is read once at the first selection, so the whole kv suite runs at W=8.
+ *
+ * Topology: init_cache_aware_epval(&ev, 2, 3) → EP0/EP1 prefill, EP2/EP3/EP4
+ * decode. kv_usage_enc is the production encoding (pct + 1, 0 = unknown).
+ * Freshness is the queue-depth stamp: kv_stamp_fresh() writes "now" in
+ * CLOCK_MONOTONIC seconds (the production clock), kv_stamp_stale() a stamp
+ * older than the default telemetry window (memset-0 fc.cfg → the default). */
+
+static uint64_t kv_now_sec(void) { return pd_now_ns() / 1000000000ULL; }
+
+static void kv_set(proxy_epval_t *ev, int ep, uint32_t conns, int kv_pct /* -1 = unknown */) {
+  atomic_store(&ev->pd_ep_loads[ep].active_conns, conns);
+  atomic_store(&ev->pd_ep_loads[ep].kv_usage_enc,
+               kv_pct < 0 ? (uint8_t)0 : (uint8_t)(kv_pct + 1));
+}
+static void kv_stamp_fresh(proxy_epval_t *ev, int ep) {
+  /* plain store: the test mirror declares last_update_ts non-atomic (as the
+   * other suites do); the selector's atomic_load is a plain read here. */
+  ev->pd_ep_loads[ep].last_update_ts = kv_now_sec();
+}
+static void kv_stamp_stale(proxy_epval_t *ev, int ep) {
+  /* 1 s after boot: older than FC_TELEMETRY_STALE_MS_DEFAULT on any host that
+   * has been up longer than the window (the unit bed always has). */
+  ev->pd_ep_loads[ep].last_update_ts = (uint64_t)1;
+}
+
+/* E0 (default run, W=0): mixed KV values change nothing — the pick is the
+ * pre-change expectation, min active_conns, even though EP2 is at 92 %. */
+static int test_kv_w0_identity(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+  ASSERT_EQ(pd_decode_kv_weight(), 0, "W unset reads 0");
+
+  kv_set(&ev, 2, 10, 92); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 11, 40); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 11, 50); kv_stamp_fresh(&ev, 4);
+
+  for (int round = 0; round < 8; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "W=0: rc ok");
+    ASSERT_EQ(ep, 2, "W=0: min active_conns wins regardless of KV");
+  }
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E1 (kv run): the plan §2 example. conns 10/11/11, KV 92/40/50 → with W=8
+ * the scores are 17 / 14 / 15, so EP3 wins over the lightly-connected EP2. */
+static int test_kv_pressure_ordering(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+  ASSERT_EQ(pd_decode_kv_weight(), 8, "kv run: W=8 cached");
+
+  kv_set(&ev, 2, 10, 92); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 11, 40); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 11, 50); kv_stamp_fresh(&ev, 4);
+
+  for (int round = 0; round < 8; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "ordering: rc ok");
+    ASSERT_EQ(ep, 3, "ordering: lowest conns + kv term wins");
+    ASSERT_EQ(pfe.pd_decode_ep_idx, 3, "ordering: hint written by the score path");
+  }
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E2 (kv run): an EP that never reported (enc 0) is neutralized to the fleet
+ * mean, never read as 0 %. conns 11/10/10, KV unknown/90/90: with the mean
+ * (90) EP2 scores 18 against 17/17 and loses; read as 0 % it would score 11
+ * and win — the §3.3 row-1 failure. */
+static int test_kv_unknown_neutralised(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 11, -1); kv_stamp_fresh(&ev, 2);   /* queue reported, usage family absent */
+  kv_set(&ev, 3, 10, 90); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 90); kv_stamp_fresh(&ev, 4);
+
+  for (int round = 0; round < 8; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "unknown: rc ok");
+    ASSERT_TRUE(ep == 3 || ep == 4, "unknown: EP2 is not read as idle");
+  }
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E3 (kv run): a reading older than the telemetry window is neutralized the
+ * same way as unknown (mirrors the H-17 rule for queued). Same numbers as E2
+ * but EP2 reported 0 % — with a stale stamp. */
+static int test_kv_stale_neutralised(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 11, 0);  kv_stamp_stale(&ev, 2);   /* 0 % but stale → fill */
+  kv_set(&ev, 3, 10, 90); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 90); kv_stamp_fresh(&ev, 4);
+
+  for (int round = 0; round < 8; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "stale: rc ok");
+    ASSERT_TRUE(ep == 3 || ep == 4, "stale: a stale 0 % does not attract load");
+  }
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E4 (kv run): "reported 0 %" (enc 1) is a reading, scored as 0 — not unknown.
+ * conns 11/10/10, KV 0/90/90 all fresh: EP2 = 11, EP3/EP4 = 17 → EP2. Treated
+ * as unknown it would be neutralized to 90 (score 18) and lose. */
+static int test_kv_zero_reported_is_zero(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 11, 0);  kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 10, 90); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 90); kv_stamp_fresh(&ev, 4);
+
+  for (int round = 0; round < 8; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "zero: rc ok");
+    ASSERT_EQ(ep, 2, "zero: a fresh 0 % reading scores 0");
+  }
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E5 (kv run): the session hint (branch [1]) is returned as-is whatever the
+ * pressure — D8. EP2 at 100 % with the hint on it stays the answer. */
+static int test_kv_hint_precedence(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 50, 100); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 0, 0);    kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 0, 0);    kv_stamp_fresh(&ev, 4);
+
+  pfe.pd_decode_ep_idx = 2;
+  int ep = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "hint: rc ok");
+  ASSERT_EQ(ep, 2, "hint: pinned EP kept under pressure");
+  ASSERT_EQ(pfe.pd_decode_ep_idx, 2, "hint: not rewritten");
+
+  /* The same hint on an excluded EP falls through to the score path. */
+  ASSERT_EQ(pd_select_decode_excluding(&ev, &pfe, &ep, 1u << 2), 0, "hint excluded: rc ok");
+  ASSERT_TRUE(ep == 3 || ep == 4, "hint excluded: scored among the rest");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E6 (kv run): the excluded mask composes with the kv term. KV 90/10/50 at
+ * equal conns → EP3 wins; excluding EP3 → EP4 (score 4) over EP2 (score 7). */
+static int test_kv_excluded_with_pressure(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 10, 90); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 10, 10); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 50); kv_stamp_fresh(&ev, 4);
+
+  int ep = -1;
+  ASSERT_EQ(pd_select_decode_excluding(&ev, &pfe, &ep, 0), 0, "excl: rc ok");
+  ASSERT_EQ(ep, 3, "excl: unconstrained pick");
+  pfe.pd_decode_ep_idx = -1;
+  ASSERT_EQ(pd_select_decode_excluding(&ev, &pfe, &ep, 1u << 3), 0, "excl: rc ok with mask");
+  ASSERT_EQ(ep, 4, "excl: next-best under the mask");
+  pfe.pd_decode_ep_idx = -1;
+  ASSERT_EQ(pd_select_decode_excluding(&ev, &pfe, &ep, (1u << 2) | (1u << 3) | (1u << 4)), -1,
+            "excl: empty candidate set still returns -1");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E7 (kv run): nobody reports → every kv term is 0 → the pick is the W=0
+ * pick (min active_conns), in every round. Mirrors a TRT-LLM pool or a
+ * scraper that is off (the zero-filled pool). */
+static int test_kv_all_unknown_equals_w0(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 10, -1);
+  kv_set(&ev, 3, 11, -1);
+  kv_set(&ev, 4, 11, -1);
+
+  for (int round = 0; round < 8; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "all-unknown: rc ok");
+    ASSERT_EQ(ep, 2, "all-unknown: identical to the W=0 pick");
+  }
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E8 (kv run): ties on the full score still rotate through pd_decode_rr —
+ * equal conns and equal KV give every decode EP its turn. */
+static int test_kv_tie_rotates(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+  int seen[MAX_PROXY_EP] = {0};
+
+  for (int ep_i = 2; ep_i <= 4; ep_i++) { kv_set(&ev, ep_i, 5, 60); kv_stamp_fresh(&ev, ep_i); }
+  for (int round = 0; round < 9; round++) {
+    int ep = -1;
+    pfe.pd_decode_ep_idx = -1;
+    ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "tie: rc ok");
+    ASSERT_TRUE(ep >= 2 && ep <= 4, "tie: a decode EP");
+    seen[ep]++;
+  }
+  ASSERT_EQ(seen[2], 3, "tie: EP2 three of nine");
+  ASSERT_EQ(seen[3], 3, "tie: EP3 three of nine");
+  ASSERT_EQ(seen[4], 3, "tie: EP4 three of nine");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* ----- Suite E, plan A4: what the recorder is told (PR-3) -----
+ * The unit build's pd_record_decode_selected parks the last (path, kv_fill)
+ * in pd_test_last_decode_path / pd_test_last_decode_kv_fill; -1 = nothing
+ * recorded since the reset. pd_kv_fill_state is the one-shot transition
+ * state the production log_info keys on (a no-op macro here). */
+static void kv_record_reset(void) {
+  pd_test_last_decode_path = -1;
+  pd_test_last_decode_kv_fill = -1;
+}
+
+/* E9 (kv run): the plan §2 shape at equal conns (92/40/40, all fresh) is a
+ * score_kv pick — the kv term removed EP2 from the best set — with no fill. */
+static int test_kv_record_score_kv(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 10, 92); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 10, 40); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 40); kv_stamp_fresh(&ev, 4);
+
+  kv_record_reset();
+  int ep = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "score_kv: rc ok");
+  ASSERT_TRUE(ep == 3 || ep == 4, "score_kv: EP2 avoided");
+  ASSERT_EQ(pd_test_last_decode_path, PD_DEC_PATH_SCORE_KV, "score_kv: path recorded");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 0, "score_kv: no fill");
+  ASSERT_EQ(atomic_load(&ev.pd_kv_fill_state), 0, "score_kv: fill state untouched");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E10 (kv run): a kv term that leaves the shipped best set as it was is
+ * `score`, not score_kv — conns 10/11/11 at equal KV keeps {EP2}. */
+static int test_kv_record_score_when_set_unchanged(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 10, 40); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 11, 40); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 11, 40); kv_stamp_fresh(&ev, 4);
+
+  kv_record_reset();
+  int ep = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "score: rc ok");
+  ASSERT_EQ(ep, 2, "score: the shipped pick");
+  ASSERT_EQ(pd_test_last_decode_path, PD_DEC_PATH_SCORE, "score: path recorded");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 0, "score: no fill");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E11 (kv run): the session hint records `hint`, never a fill, and leaves
+ * the fill state alone — nothing was scored. */
+static int test_kv_record_hint(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 50, 100); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 0, -1);
+  kv_set(&ev, 4, 0, -1);
+
+  pfe.pd_decode_ep_idx = 2;
+  kv_record_reset();
+  int ep = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "hint: rc ok");
+  ASSERT_EQ(ep, 2, "hint: pinned EP kept");
+  ASSERT_EQ(pd_test_last_decode_path, PD_DEC_PATH_HINT, "hint: path recorded");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 0, "hint: never a fill");
+  ASSERT_EQ(atomic_load(&ev.pd_kv_fill_state), 0, "hint: fill state untouched");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E12 (kv run): fill accounting and the one-shot transition state. One
+ * unknown candidate → kv_fill 1 and the state goes 0→1 (its fill is the mean
+ * of the other two, so the best set is unchanged: `score`); every candidate
+ * fresh again → kv_fill 0 and the state goes 1→0; nobody reporting → kv_fill
+ * 1 with a fill of 0 (the all-unknown == W=0 case still counts as a broken
+ * signal). */
+static int test_kv_record_fill_and_transition(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+  int ep = -1;
+
+  kv_set(&ev, 2, 10, -1); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 10, 90); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 90); kv_stamp_fresh(&ev, 4);
+  kv_record_reset();
+  pfe.pd_decode_ep_idx = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "fill: rc ok");
+  ASSERT_EQ(pd_test_last_decode_path, PD_DEC_PATH_SCORE, "fill: best set unchanged -> score");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 1, "fill: one candidate took the fill");
+  ASSERT_EQ(atomic_load(&ev.pd_kv_fill_state), 1, "fill: state 0 -> 1 (log edge)");
+
+  kv_set(&ev, 2, 10, 90); kv_stamp_fresh(&ev, 2);
+  kv_record_reset();
+  pfe.pd_decode_ep_idx = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "recover: rc ok");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 0, "recover: nobody took the fill");
+  ASSERT_EQ(atomic_load(&ev.pd_kv_fill_state), 0, "recover: state 1 -> 0 (log edge)");
+
+  kv_set(&ev, 2, 10, -1);
+  kv_set(&ev, 3, 11, -1);
+  kv_set(&ev, 4, 11, -1);
+  kv_record_reset();
+  pfe.pd_decode_ep_idx = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "all-unknown: rc ok");
+  ASSERT_EQ(ep, 2, "all-unknown: the W=0 pick");
+  ASSERT_EQ(pd_test_last_decode_path, PD_DEC_PATH_SCORE, "all-unknown: score");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 1, "all-unknown: every candidate took the (0) fill");
+  ASSERT_EQ(atomic_load(&ev.pd_kv_fill_state), 1, "all-unknown: state 0 -> 1 again");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E13 (kv run): the connect-time variant is not a selection event — the
+ * recorder is not called, whether the hint is kept or scored around. */
+static int test_kv_record_excluding_is_silent(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+
+  kv_set(&ev, 2, 10, 92); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 10, 40); kv_stamp_fresh(&ev, 3);
+  kv_set(&ev, 4, 10, 40); kv_stamp_fresh(&ev, 4);
+
+  int ep = -1;
+  pfe.pd_decode_ep_idx = 2;
+  kv_record_reset();
+  ASSERT_EQ(pd_select_decode_excluding(&ev, &pfe, &ep, 0), 0, "silent hint: rc ok");
+  ASSERT_EQ(ep, 2, "silent hint: pinned EP kept");
+  ASSERT_EQ(pd_test_last_decode_path, -1, "silent hint: nothing recorded");
+  ASSERT_EQ(pd_select_decode_excluding(&ev, &pfe, &ep, 1u << 2), 0, "silent scored: rc ok");
+  ASSERT_TRUE(ep == 3 || ep == 4, "silent scored: picked around the exclusion");
+  ASSERT_EQ(pd_test_last_decode_path, -1, "silent scored: nothing recorded");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, -1, "silent scored: no fill recorded");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
+/* E14 (default run, W=0): every scored pick is `score` with no fill, and the
+ * fill state is never written, whatever the KV values. */
+static int test_kv_w0_record_score(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 2, 3);
+  init_test_pfe(&pfe);
+  ASSERT_EQ(pd_decode_kv_weight(), 0, "W unset reads 0");
+
+  kv_set(&ev, 2, 10, 92); kv_stamp_fresh(&ev, 2);
+  kv_set(&ev, 3, 11, -1);
+  kv_set(&ev, 4, 11, 40); kv_stamp_stale(&ev, 4);
+
+  kv_record_reset();
+  int ep = -1;
+  ASSERT_EQ(pd_select_decode(&ev, &pfe, &ep), 0, "W=0: rc ok");
+  ASSERT_EQ(ep, 2, "W=0: the shipped pick");
+  ASSERT_EQ(pd_test_last_decode_path, PD_DEC_PATH_SCORE, "W=0: score");
+  ASSERT_EQ(pd_test_last_decode_kv_fill, 0, "W=0: never a fill");
+  ASSERT_EQ(atomic_load(&ev.pd_kv_fill_state), 0, "W=0: fill state never written");
+  cleanup_cache_aware_epval(&ev);
+  return 1;
+}
+
 int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "kv") == 0) {
+    printf("\n=== P/D Decode KV-Pressure Tests (LLB_PD_DECODE_KV_WEIGHT=8) ===\n\n");
+    RUN_TEST(test_kv_pressure_ordering);
+    RUN_TEST(test_kv_unknown_neutralised);
+    RUN_TEST(test_kv_stale_neutralised);
+    RUN_TEST(test_kv_zero_reported_is_zero);
+    RUN_TEST(test_kv_hint_precedence);
+    RUN_TEST(test_kv_excluded_with_pressure);
+    RUN_TEST(test_kv_all_unknown_equals_w0);
+    RUN_TEST(test_kv_tie_rotates);
+    RUN_TEST(test_kv_record_score_kv);
+    RUN_TEST(test_kv_record_score_when_set_unchanged);
+    RUN_TEST(test_kv_record_hint);
+    RUN_TEST(test_kv_record_fill_and_transition);
+    RUN_TEST(test_kv_record_excluding_is_silent);
+    printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
+    return tests_passed != tests_run;
+  }
   if (argc > 1 && strcmp(argv[1], "cap") == 0) {
     printf("\n===: P/D Admission-Cap Tests (LLB_PD_MAX_INFLIGHT_PER_EP=4) ===\n\n");
     RUN_TEST(test_cap_spill_from_over_cap_owner);
@@ -1183,6 +1621,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_select_prefill_tier2_minload);
   RUN_TEST(test_select_prefill_load_imbalance_guard);
   RUN_TEST(test_select_decode_session_hint);
+  RUN_TEST(test_kv_w0_identity);
+  RUN_TEST(test_kv_w0_record_score);
 
   printf("\nSuite D: Concurrent Cleanup Recursive-Lock Test (.1)\n");
   RUN_TEST(test_concurrent_cleanup_recursive_lock);

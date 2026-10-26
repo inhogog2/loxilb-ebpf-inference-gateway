@@ -71,6 +71,36 @@ int estimate_prompt_tokens(const char *body, size_t len);
  */
 int extract_max_tokens(const char *body, size_t len);
 
+/* The body's top-level "service_tier" read as a class hint. With the key
+ * more than once, the LAST occurrence is read (what a parser that keeps the
+ * last duplicate reads). Key and value are read DECODED, as a parser reads
+ * them: "service\u005ftier" is the key and "priorit\u0079" is "priority".
+ * Returns AI_TIER_FLEX, AI_TIER_PRIORITY or
+ * AI_TIER_FAST when that value is exactly that string, and then sets
+ * [*off, *off + *vlen) to it in the body, quotes included. Returns AI_TIER_NONE for any other value, an
+ * absent key, or a body that is not a complete JSON object. The AI_TIER_*
+ * values are in sockproxy_ai_gw.h, beside the export they are handed to. */
+int extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen);
+
+/* Overwrite a JSON value of at least four bytes in place with null, padded
+ * with spaces to the same length: the document keeps its size. */
+void json_null_value(char *body, size_t body_len, size_t off, size_t vlen);
+
+/* Overwrite with null, in place and at the same length, the value of EVERY
+ * top-level occurrence of key whose value is at least four bytes long.
+ * Returns how many were overwritten. Keys are matched decoded: an escaped
+ * spelling of key ("service\u005ftier") is key, and is overwritten too. */
+int json_null_top_key(char *body, size_t body_len, const char *key, size_t klen);
+
+/* Rename, in place and at the same length, EVERY top-level occurrence of
+ * key to `to` (tolen <= klen bytes; the bytes of a longer raw spelling past
+ * it become '_'): the document keeps its size and the value stays where it
+ * was, under a key no engine reads. Keys are matched decoded, as
+ * json_null_top_key matches them; a nested occurrence is left as sent.
+ * Returns how many were renamed. */
+int json_rename_top_key(char *body, size_t body_len, const char *key, size_t klen,
+                        const char *to, size_t tolen);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *

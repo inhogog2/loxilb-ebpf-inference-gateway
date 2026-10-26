@@ -755,7 +755,7 @@ proxy_ep_connect_deadline_ms(proxy_fd_ent_t *pfe)
   int connect_to_ms = 500;
   proxy_map_ent_t *cnode = pfe ? (proxy_map_ent_t *)pfe->head : NULL;
 
-  if (cnode && cnode->has_l7_policy && cnode->arg_ptr &&
+  if (cnode && l7_policy_on(cnode) && cnode->arg_ptr &&
       cnode->arg_ptr->timeout_member_connect_ms > 0) {
     connect_to_ms = (int)cnode->arg_ptr->timeout_member_connect_ms;
   }
@@ -1331,6 +1331,9 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   /* Every connection's shell comes back here, whichever path tore it down,
    * so a hold is counted here exactly once. */
   sp_hold_retire(pfe);
+  /* Likewise the pools the connection holds (sockproxy_pool.h): a pooled
+   * shell keeps no pool alive until its next use. */
+  sp_pool_release_conn(pfe);
   pfe_trace_op("rec", pfe->head, pfe);
   if (pfe->fdlist_rule) {
     /* Every release unlinks before it recycles; a shell that reaches the
@@ -1346,6 +1349,12 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   /* A connection that ended on its own before the sweep reached it must not
    * leave the pending count raised, or the fast tick keeps walking for nothing. */
   proxy_defer_close_clear(pfe);
+
+  /* A P/D decode stream's finish evidence (allocated on its first body
+   * bytes): only the shell's last user can have it, and that user is gone. */
+  free(pfe->pd_client_finish);
+  pfe->pd_client_finish = NULL;
+  atomic_store_explicit(&pfe->pd_client_finished, 0, memory_order_relaxed);
 
   /* Release the per-connection buffer to the cache with the span this user
    * wrote, so its next user gets exactly that zeroed. The shell is NEVER
@@ -1491,6 +1500,44 @@ proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe)
   proxy_free_fd_ctx(pfe);
 }
 
+static void
+proxy_pool_clear_sessions(proxy_epval_t *tepval)
+{
+  pd_session_mapping_t *sm, *sm_tmp;
+
+  pthread_rwlock_wrlock(&tepval->pd_session_lock);
+  HASH_ITER(hh, tepval->pd_session_map, sm, sm_tmp) {
+    HASH_DEL(tepval->pd_session_map, sm);
+    free(sm);
+  }
+  tepval->pd_session_map = NULL;
+  pthread_rwlock_unlock(&tepval->pd_session_lock);
+}
+
+/* The last release of a deleted pool, on the reclaimer (sockproxy_pool.h).
+ * Under the write lock: a thread that read a holder's pointer under the
+ * lock (the drain checker walks other workers' connections) is done with it
+ * before the pool goes. Nothing else can reach the pool any more. */
+void
+proxy_pool_finalize(proxy_epval_t *tepval)
+{
+  PROXY_LOCK();
+#ifdef HAVE_DP_GPU_ROUTING
+  chwbl_release_runtime(tepval);
+#endif
+  proxy_pool_clear_sessions(tepval);
+  pthread_rwlock_destroy(&tepval->pd_session_lock);
+  if (tepval->pd_trie) {
+    pd_trie_free(tepval->pd_trie);
+    tepval->pd_trie = NULL;
+    pthread_rwlock_destroy(&tepval->pd_trie_lock);
+  }
+  pthread_rwlock_destroy(&tepval->chwbl_state_lock);
+  pthread_mutex_destroy(&tepval->pd_parked_lock);
+  fc_state_destroy(&tepval->fc);
+  PROXY_UNLOCK();
+}
+
 int
 proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
                      void **ssl_ctx, void **ssl_epctx)
@@ -1540,34 +1587,22 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
     chwbl_release_runtime(&retired_chwbl);
 #endif /* HAVE_DP_GPU_ROUTING */
 
-    // P/D Session stickiness cleanup
-    {
-      pd_session_mapping_t *sm, *sm_tmp;
-      pthread_rwlock_wrlock(&tepval->pd_session_lock);
-      HASH_ITER(hh, tepval->pd_session_map, sm, sm_tmp) {
-        HASH_DEL(tepval->pd_session_map, sm);
-        free(sm);
-      }
-      tepval->pd_session_map = NULL;
-      pthread_rwlock_unlock(&tepval->pd_session_lock);
-      pthread_rwlock_destroy(&tepval->pd_session_lock);
-    }
-
-    /* cleanup radix trie */
-    if (tepval->pd_trie) {
-      pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-      pd_trie_free(tepval->pd_trie);
-      tepval->pd_trie = NULL;
-      pthread_rwlock_unlock(&tepval->pd_trie_lock);
-      pthread_rwlock_destroy(&tepval->pd_trie_lock);
-    }
+    /* The rule's sessions go with it. Requests still running on the pool
+     * may add to the map: the final free clears it again. */
+    proxy_pool_clear_sessions(tepval);
 
     /* Requests waiting in the pool's capacity queue are ended before the
      * pool goes: a wait for a unit that will never be released is not a
-     * wait. The ring goes with it. */
+     * wait. */
     sp_fc_drain_pool(tepval, SP_REAP_FC_DRAINED, 1);
-    fc_state_destroy(&tepval->fc);
-    HASH_DEL(node->val.ephash, tepval);
+    /* New requests no longer find the pool. The ones that hold it keep it
+     * until their last release; its locks, capacity state and trie go then
+     * (proxy_pool_finalize). Should the index not be rebuilt, the pool
+     * stays reachable through the old one until the next index goes out. */
+    if (sp_pool_unlink(node, tepval) != 0) {
+      log_error("sockproxy: %s:%u (%s) out of the table, still in the readers' index until the next change",
+                inet_ntoa(*(struct in_addr *)&ent->xip), ntohs(ent->xport), ephash_key);
+    }
 
     epcount = HASH_COUNT(node->val.ephash);
     if (epcount > 0) {
@@ -1691,6 +1726,8 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   fd_ent->has_conv_id = 0;  // P0.3: Reset conversation ID flag
   memset(fd_ent->conversation_id, 0, sizeof(fd_ent->conversation_id));  // P0.3: Clear conversation ID
   fd_ent->x_model_header[0] = '\0';  // Reset X-Model header
+  sp_obj_hint_reset(&fd_ent->obj_hint);
+  sp_ttl_hint_reset(&fd_ent->ttl_hint);
 
   // Reset vLLM request ID state
   fd_ent->vllm_request_id[0] = '\0';

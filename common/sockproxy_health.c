@@ -64,6 +64,7 @@ static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
  * Included AFTER the headers that define `struct proxy_fd_ent` and
  * notify_delete_ent so the helper's pfe* signature resolves here. */
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_end_cause.h"
 
 /* Forward declaration for internal use (defined later in this file) */
 static void check_draining_endpoints(void);
@@ -111,12 +112,75 @@ static void reap_pending_connects(uint64_t now_ms);
  * -ENOENT the worker owns proxy_pdestroy()+free for that fd — skip our free. We
  * still detach the cross-references first so the worker's proxy_release_rfd_ctx
  * cannot cascade back into the client. */
+/* Is this entry part of an HTTP/2 connection (its client, or one of its
+ * legs, bridge or HTTP/2)? Read under PROXY_LOCK; a worker sets h2_session
+ * without it, so a client switching right now reads as HTTP/1.1, the same
+ * exposure every HTTP/1.1 client has under the inline teardown below. */
+static int
+pd_h2_conn(const proxy_fd_ent_t *e)
+{
+  return e && (e->h2_session || (e->odir == 1 && e->backend_h2_session));
+}
+
+/* The active-streams gauge side of a client this thread frees. The inline
+ * free skips proxy_pdestroy, whose settle ends a stream still open, so a
+ * reaper that reaches an active stream (ERR-01 or the idle reaper, when the
+ * decode idle cap is at or above the stream timeout) left the gauge counting
+ * it until the process restarts. Every ender clears sse_active, so a stream
+ * ends once. Called under PROXY_LOCK, as the health thread's other enders. */
 static void
+pd_teardown_stream_end(proxy_fd_ent_t *e)
+{
+  if (e && e->odir == 0 && e->sse_active) {
+    llb_ai_stream_end("", (char *)proxy_effective_model(e));
+    e->sse_active = 0;
+    e->stream_end_ts = time(NULL);
+  }
+}
+
+static int
 pd_teardown_conn(proxy_fd_ent_t *client)
 {
   if (client == NULL) {
-    return;
+    return 1;
   }
+
+  /* Any entry of an HTTP/2 connection (the client, or one of its legs) is
+   * ended by its own worker, never here. That worker walks the client's
+   * HTTP/2 session with no lock held, so a teardown from this thread races
+   * it; and the inline free below knows nothing of the session: it skipped
+   * the streams' settles and left the session allocated. The shutdown wakes
+   * the owner with a hangup: a leg answers its streams and is detached from
+   * its client (the client goes on), a client goes through its own full
+   * teardown. Safe under PROXY_LOCK: the fd is closed only by that teardown,
+   * which needs the lock.
+   *
+   * Returns 1 when the entry passed in was freed here (the caller's list
+   * changed under it), 0 when it was not: handed off, or already claimed by
+   * a worker blocked on our lock, which frees it once we let go.
+   *
+   * The cause is recorded before the hangup, which the owner reads as the
+   * client leaving. A leg records nothing: its client goes on. */
+  if (pd_h2_conn(client)) {
+    proxy_h2_client_end_mark(client, SP_H2_END_TEARDOWN, 0, NULL);
+    if (client->fd > 0) {
+      shutdown(client->fd, SHUT_RDWR);
+    }
+    return 0;
+  }
+  /* Nor through a peer: an HTTP/1.1 leg whose client switched to HTTP/2 (the
+   * prior-knowledge preface after an HTTP/1.1 request) would free that
+   * client below. Its own worker tears the pair down instead. */
+  for (int i = 0; i < client->n_rfd && i < MAX_PROXY_EP; i++) {
+    if (pd_h2_conn(client->rfd_ent[i])) {
+      proxy_h2_client_end_mark(client->rfd_ent[i], SP_H2_END_TEARDOWN, 0, client);
+      if (client->fd > 0) {
+        shutdown(client->fd, SHUT_RDWR);
+      }
+      return 0;
+    }
+  }
+  proxy_h2_client_end_mark(client, SP_H2_END_TEARDOWN, 0, NULL);
 
   for (int i = 0; i < client->n_rfd && i < MAX_PROXY_EP; i++) {
     proxy_fd_ent_t *be = client->rfd_ent[i];
@@ -142,7 +206,15 @@ pd_teardown_conn(proxy_fd_ent_t *client)
       be->n_rfd = 0;
       client->rfd_ent[i] = NULL;
 
+      /* Called with a backend leg (the force-close matches legs by endpoint
+       * too): the connection ending with it is the client on the other side. */
+      if (client->odir) {
+        proxy_h2_client_end_mark(be, SP_H2_END_TEARDOWN, 0, client);
+        if (be_owned)
+          proxy_h2_client_end_log(be);
+      }
       if (be_owned) {
+        pd_teardown_stream_end(be);    /* the client, when called with a leg */
         proxy_release_fd_ctx(be, 1);   /* reset: unlink fdlist + close be->fd */
         proxy_try_free_fd_ctx(be);     /* used-- -> free (single owner) */
       }
@@ -157,10 +229,14 @@ pd_teardown_conn(proxy_fd_ent_t *client)
     client_owned = (notify_deregister_ent(proxy_struct->ns, client->fd) == 0);
   }
   if (client_owned) {
+    /* This thread frees it, so proxy_pdestroy never runs: log its end here. */
+    proxy_h2_client_end_log(client);
+    pd_teardown_stream_end(client);
     proxy_release_fd_ctx(client, 1);   /* reset: unlink fdlist + close client->fd */
     proxy_try_free_fd_ctx(client);     /* used-- -> free (single owner) */
   }
   /* else: a notify worker owns the client's proxy_pdestroy()+free — skip. */
+  return client_owned;
 }
 
 /* The text of every response this thread owes a client it ends, by kind
@@ -213,9 +289,9 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"pd_idle_timeout\"}", 1, 0),
-  /* The two capacity-queue endings are formatted on the owner worker with
-   * the wait and the admission headers (sp_reap_finish); these are the
-   * plain fallbacks for a socket the reaper has to end itself. */
+  /* The capacity-queue endings are formatted on the owner worker with the
+   * wait and the admission headers (sp_reap_finish); these are the plain
+   * fallbacks for a socket the reaper has to end itself. */
   [SP_REAP_FC_QUEUE_TIMEOUT] =
       SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
                    "Content-Type: application/json\r\n"
@@ -245,7 +321,50 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
   [SP_REAP_EPP_EVICT_CUT] = { NULL, 0, 1, 0 },
   [SP_REAP_SSE_STALL] =
       SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
+  [SP_REAP_FC_SHED] =
+      SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Retry-After: 1\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"admission_shed\"}", 1, 0),
+  [SP_REAP_FC_TTL] =
+      SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Retry-After: 1\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"admission_ttl_expired\"}", 1, 0),
 };
+
+/* Whether the answer this client is being sent is chunked, read from the
+ * client's own response framer: its parser's flags while it is inside that
+ * answer. Never from a backend leg. A P/D client's prefill leg sits in slot 0
+ * and its decode leg in a later slot, and either may already be unlinked, so
+ * the first leg's flag left the terminator unframed inside a chunked body
+ * (the client never decoded it and saw the body cut). */
+static int
+sp_reap_client_chunked(proxy_fd_ent_t *pfe)
+{
+  return atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed) &&
+         (pfe->cresp_parser.flags & F_CHUNKED) != 0;
+}
+
+/* The bytes a body kind (an SSE event, the synthesised [DONE]) is written as:
+ * on a chunked answer, its last chunk followed by the terminator, or the
+ * client decodes neither. Returns the framed length in `out`, 0 to write the
+ * text as it is. */
+static size_t
+sp_reap_body_frame(proxy_fd_ent_t *pfe, const sp_reap_text_t *t, char *out,
+                   size_t cap)
+{
+  int n;
+
+  if (!t->text || !t->body || !sp_reap_client_chunked(pfe))
+    return 0;
+  n = snprintf(out, cap, "%zx\r\n%s\r\n0\r\n\r\n", t->len, t->text);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
 
 /* End a client this thread decided against, answering it first.
  *
@@ -265,11 +384,42 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
  * The caller has already moved the connection out of every pass of this
  * thread (pd_phase ERROR or COMPLETE, or sse_active cleared), so the worker
  * owing the response is never reaped a second time. */
+_Static_assert(PD_PHASE_PREFILL_SENDING == 1 && PD_PHASE_PREFILL_DONE == 3 &&
+               PD_PHASE_DECODE_SENDING == 4 && PD_PHASE_DECODE_STREAMING == 5,
+               "pd_reap_error_phase (sockproxy_pd_leak.h) reads these numbers");
+
+/* The lifecycle record of a P/D request a reaper ends, made once. The request
+ * then moves to ERROR, outside every in-flight phase, so no later pass (the
+ * sweep, ERR-01, the generic reaper) and no decode EOF records it again. A
+ * connection with no P/D request in flight has nothing to record. The decode
+ * duration is not sampled: it would run to the reap, idle wait included. The
+ * prefill duration is known once decode was dispatched. */
+static void
+pd_reap_lifecycle(proxy_fd_ent_t *pfe, int error_phase)
+{
+  int64_t prefill_ms = 0;
+
+  if (pd_reap_error_phase(pfe->pd_phase) < 0) {
+    return;
+  }
+  if (pfe->pd_prefill_start_ns > 0 &&
+      pfe->pd_decode_start_ns > pfe->pd_prefill_start_ns) {
+    prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
+                            pfe->pd_prefill_start_ns) / 1000000ULL);
+  }
+  sp_pd_record(pfe, proxy_effective_model(pfe), prefill_ms, 0,
+                   (pfe->pd_kv_params_len > 0) ? 1 : 0, error_phase);
+  pfe->pd_phase = PD_PHASE_ERROR;
+}
+
 static void
 pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
 {
   const sp_reap_text_t *t = &sp_reap_texts[kind];
 
+  /* Recorded before either path: the owner that finishes the hand-off sees
+   * only its own shutdown and the hangup, which would name the wrong actor. */
+  proxy_h2_client_end_mark(pfe, SP_H2_END_REAPER, 0, NULL);
   if (pfe->fd > 0 && proxy_struct->ns) {
     int owner = notify_owner_thr(proxy_struct->ns, pfe->fd);
 
@@ -285,12 +435,30 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
     }
   }
 
+  /* The end is this thread's. A teardown kind frees the client inline, so
+   * the record sp_reap_record writes on the owner path is not written: a
+   * dispatch of this fd that passed its lookup before pd_teardown_conn's
+   * deregistration may still be running on the owner worker, with no lock,
+   * and record the request itself (the relay's completion and [DONE]
+   * records), so a record from here could be the request's second. A
+   * shutdown kind is recorded by the event loop's teardown, as on the owner
+   * path. Every end taken here is counted. */
+  atomic_fetch_add(&global_stats.reap_fallback, 1);
+
   if (pfe->fd > 0 && t->text) {
-    if (pfe->ssl) {
+    if (!t->body && sp_answer_started(pfe)) {
+      /* An answer is in progress: a status line would land in its body. */
+      log_warn("[REAPER] fd=%d: answer in progress, closed without the "
+               "status line (no owner hand-off)", pfe->fd);
+    } else if (pfe->ssl) {
       log_warn("[REAPER] fd=%d: TLS client ended without the response body "
                "(no owner hand-off)", pfe->fd);
     } else {
-      send(pfe->fd, t->text, t->len, MSG_DONTWAIT | MSG_NOSIGNAL);
+      char framed[512];
+      size_t fl = sp_reap_body_frame(pfe, t, framed, sizeof(framed));
+
+      send(pfe->fd, fl ? framed : t->text, fl ? fl : t->len,
+           MSG_DONTWAIT | MSG_NOSIGNAL);
     }
   }
   if (t->teardown) {
@@ -315,69 +483,195 @@ sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind)
  * thread would have ended it: the single-owner teardown under PROXY_LOCK for
  * a request, a shutdown for a stream the event loop cleans up. The kind is
  * cleared first, so a second wake for the same fd finds nothing to do. */
-/* Whether the response this client is reading arrives chunked: the framing
- * is the backend leg's, detected on its response headers. */
-static int
-sp_reap_client_chunked(proxy_fd_ent_t *pfe)
-{
-  proxy_fd_ent_t *leg;
-
-  if (pfe->n_rfd <= 0)
-    return 0;
-  leg = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
-  return leg && leg->is_chunked_response;
-}
-
-/* A request ended while it waited in the capacity queue (the deadline, or
- * a drain): the response says how long it waited and what the pool looks
- * like, and the refusal is recorded on the trail like every other decision
- * of the gate. Returns the length written into `out`, 0 to use the plain
- * text. */
+/* A request ended while it waited in the capacity queue (the deadline, a
+ * drain, or an eviction for a higher band): the response says how long it
+ * waited and what the pool looks like, and the refusal is recorded on the
+ * trail like every other decision of the gate. An eviction is answered
+ * like any shed, 429 admission_shed with its body shape and the wait. The
+ * response is framed with its length; `keep` says whether the connection
+ * stays open for its next request (only an eviction answered by the
+ * request's own worker keeps it, sp_fc_shed_answer_kept). Returns the
+ * length written into `out`, 0 to use the plain text. */
 static size_t
-sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
+sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
+                  size_t cap)
 {
   char svc_ident[64];
+  char body[160];
   fc_state_t *fc = pfe->fc.fc;
   struct timespec ts;
   uint64_t now_ns, queued_ms = 0;
   uint32_t inflight = fc_inflight(fc), queued = fc_queued(fc);
   uint32_t limit = fc ? fc_svc_cap(fc) : 0;
   uint32_t retry_after = kind == SP_REAP_FC_DRAINED ? 5 : fc_retry_after_s(fc);
-  int status = kind == SP_REAP_FC_DRAINED ? 503 : 504;
+  int status = kind == SP_REAP_FC_DRAINED ? 503
+             : (kind == SP_REAP_FC_SHED || kind == SP_REAP_FC_TTL) ? 429 : 504;
   const char *code = kind == SP_REAP_FC_DRAINED ? "admission_drained"
-                                                : "admission_queue_timeout";
-  int n;
+                   : kind == SP_REAP_FC_SHED ? "admission_shed"
+                   : kind == SP_REAP_FC_TTL ? "admission_ttl_expired"
+                   : "admission_queue_timeout";
+  const char *reason = fc && fc->cfg.llmd_headers ? sp_llmd_reason_of(code) : NULL;
+  char reason_hdr[64] = "";
+  const char *status_line = status == 503 ? "503 Service Unavailable"
+                          : status == 429 ? "429 Too Many Requests"
+                          : "504 Gateway Timeout";
+  char band_hdrs[128] = "";
+  int blen, n;
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
   now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
   if (pfe->fc.q_enqueue_ns > 0 && now_ns > pfe->fc.q_enqueue_ns) {
     queued_ms = (now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL;
   }
-  n = snprintf(out, cap,
-               "HTTP/1.1 %s\r\n"
-               "Content-Type: application/json\r\n"
-               "Retry-After: %u\r\n"
-               "X-Loxilb-Admission-Inflight: %u\r\n"
-               "X-Loxilb-Admission-Queued: %u\r\n"
-               "X-Loxilb-Admission-Limit: %u\r\n"
-               "Connection: close\r\n"
-               "\r\n"
-               "{\"error\":\"%s\",\"queued_ms\":%llu,\"retry_after\":%u}\r\n",
-               status == 503 ? "503 Service Unavailable" : "504 Gateway Timeout",
-               retry_after, inflight, queued, limit, code,
-               (unsigned long long)queued_ms, retry_after);
+  if (pfe->adm_class_set)
+    snprintf(band_hdrs, sizeof(band_hdrs),
+             "X-Loxilb-Admission-Class: %s\r\n"
+             "X-Loxilb-Admission-Band-Wait-Ms: %u\r\n",
+             sp_class_name(pfe->adm_class), fc_band_wait_ms(fc, pfe->fc.band));
+  if (reason)
+    snprintf(reason_hdr, sizeof(reason_hdr), SP_LLMD_REASON_HDR ": %s\r\n", reason);
+  if (status == 429)
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"retry_after\":%u,\"jitter_hint_ms\":250,"
+                    "\"queued_ms\":%llu}\r\n",
+                    code, retry_after, (unsigned long long)queued_ms);
+  else
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"queued_ms\":%llu,\"retry_after\":%u}\r\n",
+                    code, (unsigned long long)queued_ms, retry_after);
+  if (blen < 0 || blen >= (int)sizeof(body))
+    n = 0;
+  else
+    n = snprintf(out, cap,
+                 "HTTP/1.1 %s\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %d\r\n"
+                 "Retry-After: %u\r\n"
+                 "X-Loxilb-Admission-Inflight: %u\r\n"
+                 "X-Loxilb-Admission-Queued: %u\r\n"
+                 "X-Loxilb-Admission-Limit: %u\r\n"
+                 "%s%s"
+                 "Connection: %s\r\n"
+                 "\r\n"
+                 "%s",
+                 status_line, blen, retry_after, inflight, queued, limit,
+                 band_hdrs, reason_hdr, keep ? "keep-alive" : "close", body);
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
   ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
                              svc_ident, proxy_effective_model(pfe),
                              pfe->tenant_id, pfe->auth_key_id,
                              pfe->auth_user_id, status, code,
                              pfe->l7_peer_ip, proxy_origin_ip(pfe),
-                             (int)proxy_origin_trusted_hops(pfe));
+                             (int)proxy_origin_trusted_hops(pfe),
+                             (int)pfe->auth_src, pfe->auth_net_identity,
+                             (int)pfe->adm_priority,
+                             AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
+                                              pfe->adm_objective_denied,
+                                              pfe->adm_hint_not_applied),
+                             pfe->adm_objective);
   log_info("[AIGateway] fd=%d ended while queued: status=%d code=%s "
-           "queued_ms=%llu inflight=%u queued=%u tenant=%s model=%s",
+           "queued_ms=%llu inflight=%u queued=%u tenant=%s model=%s%s",
            pfe->fd, status, code, (unsigned long long)queued_ms, inflight,
-           queued, pfe->tenant_id, proxy_effective_model(pfe));
+           queued, pfe->tenant_id, proxy_effective_model(pfe),
+           keep ? " (connection kept)" : "");
   return (n > 0 && n < (int)cap) ? (size_t)n : 0;
+}
+
+/* The records of a reaper answer that is a whole response, as for every
+ * answer the gateway writes itself (sockproxy_http.c, "responses the gateway
+ * writes itself"). A request still queued or parked never reached a backend:
+ * its ending is a capacity refusal. A P/D request that timed out on its legs
+ * was dispatched: its ending is a completion with the status written, unless
+ * a response had already begun (the guards make that a no-op, and the answer
+ * begun is recorded below). The SSE events are body bytes inside a response in
+ * progress, not a response; their connection is shut, not freed here, and its
+ * teardown writes what it owes. */
+static int
+sp_reap_end(uint8_t kind)
+{
+  switch (kind) {
+  case SP_REAP_PD_STREAM_TIMEOUT:
+    return SP_END_STREAM_TIMEOUT;
+  case SP_REAP_PD_IDLE_TIMEOUT:
+    return SP_END_IDLE_TIMEOUT;
+  default:      /* the sweep's clean end; the rest end no answer in progress */
+    return SP_END_NONE;
+  }
+}
+
+static void
+sp_reap_record(proxy_fd_ent_t *pfe, uint8_t kind)
+{
+  switch (kind) {
+  case SP_REAP_FC_QUEUE_TIMEOUT:      /* deny record: sp_reap_fc_format */
+    proxy_note_local_refusal(pfe, 504);
+    break;
+  case SP_REAP_FC_DRAINED:            /* deny record: sp_reap_fc_format */
+    proxy_note_local_refusal(pfe, 503);
+    break;
+  case SP_REAP_FC_SHED:               /* deny record: sp_reap_fc_format */
+  case SP_REAP_FC_TTL:
+    proxy_note_local_refusal(pfe, 429);
+    break;
+  case SP_REAP_PD_PARK_TIMEOUT:
+    proxy_note_local_refusal(pfe, 504);
+    proxy_record_local_deny(pfe, AI_GW_STAGE_CAPACITY, 504,
+                            "pd_admission_park_timeout");
+    break;
+  case SP_REAP_PD_PREFILL_TIMEOUT:
+  case SP_REAP_PD_DECODE_TIMEOUT:
+  case SP_REAP_PD_IDLE_TIMEOUT:
+    proxy_record_local_completion(pfe, 504);
+    break;
+  case SP_REAP_PD_STREAM_TIMEOUT:
+    proxy_record_local_completion(pfe, 502);
+    break;
+  default:
+    break;
+  }
+  /* A teardown kind frees the client inline (pd_teardown_conn), so the record
+   * a teardown owes is never written there. An answer the client was already
+   * receiving is recorded here, once, with the status the client received:
+   * completed after the sweep's terminator, aborted by the gateway after a
+   * stream-silence or idle cut. Anything recorded above owes nothing more. */
+  if (sp_reap_texts[kind].teardown) {
+    proxy_record_reaped_answer(pfe, sp_reap_end(kind));
+  }
+}
+
+/* An evicted request answered by its own worker (pd_resume_parked) on a
+ * connection that may carry its next request: the 429 admission_shed goes
+ * out with Connection: keep-alive, as the queue-full 429 does. A 429 is a
+ * retry signal; closing on it would make every shed client reconnect while
+ * the gateway is shedding. Returns 0 when the whole answer went out and the
+ * connection is kept. Otherwise the client was answered with a close (or
+ * the write was cut short) and the connection is ended here, as
+ * sp_reap_finish ends it. */
+int
+sp_fc_shed_answer_kept(proxy_fd_ent_t *pfe)
+{
+  const sp_reap_text_t *t = &sp_reap_texts[SP_REAP_FC_SHED];
+  char framed[512];
+  size_t len = sp_reap_fc_format(pfe, SP_REAP_FC_SHED, 1, framed, sizeof(framed));
+
+  /* Both answers below are the 429; the deny record is the formatter's. */
+  proxy_note_local_refusal(pfe, 429);
+  if (len > 0 && proxy_send_local_response(pfe, framed, len) == 0)
+    return 0;
+  if (len == 0) {
+    if (proxy_send_local_response_and_shutdown(pfe, t->text, t->len) != 0)
+      log_error("[AIGateway] fd=%d failed to send complete bounded shed "
+                "answer", pfe->fd);
+  } else {
+    log_error("[AIGateway] fd=%d failed to send complete bounded shed "
+              "answer", pfe->fd);
+    shutdown(pfe->fd, SHUT_RDWR);
+  }
+  pfe->pd_phase = PD_PHASE_ERROR;
+  PROXY_LOCK();
+  pd_teardown_conn(pfe);
+  PROXY_UNLOCK();
+  return -1;
 }
 
 void
@@ -396,26 +690,31 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
   t = &sp_reap_texts[kind];
   buf = t->text;
   len = t->len;
-  if (kind == SP_REAP_FC_QUEUE_TIMEOUT || kind == SP_REAP_FC_DRAINED) {
-    size_t fl = sp_reap_fc_format(pfe, kind, framed, sizeof(framed));
+  if (kind == SP_REAP_FC_QUEUE_TIMEOUT || kind == SP_REAP_FC_DRAINED ||
+      kind == SP_REAP_FC_SHED || kind == SP_REAP_FC_TTL) {
+    size_t fl = sp_reap_fc_format(pfe, kind, 0, framed, sizeof(framed));
     if (fl > 0) {
       buf = framed;
       len = fl;
     }
   }
   /* An event written into a response in progress is body bytes: on a chunked
-   * relay the client decodes chunks, so the event goes out as the last chunk
+   * answer the client decodes chunks, so the event goes out as the last chunk
    * followed by the terminator, or the client never sees an event at all. */
-  if (buf && t->body && sp_reap_client_chunked(pfe)) {
-    int n = snprintf(framed, sizeof(framed), "%zx\r\n%s\r\n0\r\n\r\n",
-                     t->len, t->text);
-    if (n > 0 && n < (int)sizeof(framed)) {
+  if (buf) {
+    size_t fl = sp_reap_body_frame(pfe, t, framed, sizeof(framed));
+    if (fl > 0) {
       buf = framed;
-      len = (size_t)n;
+      len = fl;
     }
   }
   if (pfe->fd > 0 && buf) {
-    if (proxy_send_local_response_and_shutdown(pfe, buf, len) != 0) {
+    sp_reap_record(pfe, kind);
+    if (!t->body && sp_answer_started(pfe)) {
+      /* A whole response cannot follow the answer the client is reading:
+       * end that answer instead (sockproxy_answer.h). */
+      sp_end_started_answer(pfe, buf, len);
+    } else if (proxy_send_local_response_and_shutdown(pfe, buf, len) != 0) {
       log_error("[REAPER] fd=%d failed to send complete bounded response "
                 "(kind %u)", pfe->fd, kind);
     } else {
@@ -631,7 +930,7 @@ void
 force_close_endpoint_connections(proxy_map_ent_t *ent, int ep_index)
 {
   proxy_fd_ent_t *fd_ent;
-  uint32_t closed_count = 0;
+  uint32_t closed_count = 0, handed_count = 0;
 
   if (!ent) return;
 
@@ -651,15 +950,30 @@ restart:
       continue;
     }
 
+    /* An HTTP/2 client's ep_num is only where its latest stream went: the
+     * endpoint going away ends the client's legs to it, matched below, and
+     * the client goes on over its other legs. */
+    if (fd_ent->h2_session) {
+      continue;
+    }
+
     /* Single-owner teardown (no pdestroy, no PROXY_LOCK re-entry). Frees fd_ent
-     * and its peer legs and unlinks them from fdlist, so re-scan from the head. */
-    pd_teardown_conn(fd_ent);
+     * and its peer legs and unlinks them from fdlist, so re-scan from the head.
+     * When fd_ent was not freed (an HTTP/2 entry handed to its worker, or an
+     * entry a worker already claimed) it is still linked and would match
+     * again: the scan goes on past it instead, its neighbours kept by the
+     * unlinks under this lock. */
+    if (!pd_teardown_conn(fd_ent)) {
+      handed_count++;
+      continue;
+    }
     closed_count++;
     goto restart;
   }
 
-  if (closed_count > 0) {
-    log_info("[DRAIN] ep[%d]: force-closed %u connection(s)", ep_index, closed_count);
+  if (closed_count > 0 || handed_count > 0) {
+    log_info("[DRAIN] ep[%d]: force-closed %u connection(s), %u handed to their worker",
+             ep_index, closed_count, handed_count);
   }
 }
 
@@ -753,6 +1067,7 @@ finish_deferred_closes(uint64_t now_ms)
                 pfe->fd, pfe->odir, pfe->client_half_closed,
                 (unsigned long long)(now_ms - pfe->defer_close_ms));
       proxy_defer_close_clear(pfe);
+      proxy_h2_client_end_mark(pfe, SP_H2_END_DEFERRED, 0, NULL);
       if (pfe->fd > 0) {
         shutdown(pfe->fd, SHUT_RDWR);
       }
@@ -799,6 +1114,121 @@ reap_pending_connects(uint64_t now_ms)
       shutdown(pfe->fd, SHUT_RDWR);
     }
   }
+}
+
+/* One waiter of a capacity queue: its connection is waiting for its turn,
+ * not idle. Runs under the queue's lock (fc_queue_visit), so the anchor
+ * writes are ordered before the pop that ends the wait and before every
+ * write the connection's worker makes after its resume. The entry's
+ * generation names the connection that parked: a shell that has moved on
+ * since is left alone. */
+static void
+sp_fc_park_idle_visit(void *ctx, const fc_queue_ent_t *e)
+{
+  time_t now = *(const time_t *)ctx;
+  uint64_t reg_gen = 0;
+  proxy_fd_ent_t *pfe;
+
+  pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
+  if (!pfe || reg_gen != e->gen ||
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen) {
+    return;
+  }
+  pfe->idle_since = now;
+  if (pfe->last_activity > 0) {
+    pfe->last_activity = now;
+  }
+}
+
+/* The pools of every rule, for the deadline pass: one atomic read each
+ * (fc_queue_next_deadline); a queue is entered only once its earliest
+ * deadline has passed. PROXY_LOCK held by the caller. */
+static void
+sp_fc_deadline_pools(void *ctx, fc_pool_visit_fn visit, void *vctx)
+{
+  proxy_map_ent_t *node;
+  proxy_epval_t *ep, *tmp;
+
+  (void)ctx;
+  for (node = proxy_struct->head; node; node = node->next) {
+    HASH_ITER(hh, node->val.ephash, ep, tmp) {
+      visit(vctx, &ep->fc);
+    }
+  }
+}
+
+/* A waiting request whose deadline has passed, by its queue entry. The
+ * connection is found by its fd and must still be the one that parked (the
+ * generation the entry carries), still waiting in this pool. Whichever of
+ * the pop, the client's departure and this pass takes the entry out first
+ * owns what happens to the connection: the take fails when its turn or its
+ * cancellation came first, and then nothing is done. The 504 (429 when the
+ * client's own TTL ended the wait on a rule that speaks llm-d) and the
+ * teardown go through pd_reap_respond, written by the socket's owner
+ * worker. PROXY_LOCK held by the caller. */
+static void
+sp_fc_deadline_expire(void *ctx, fc_state_t *fc, const fc_queue_ent_t *e,
+                      uint64_t now_ns)
+{
+  proxy_fd_ent_t *pfe;
+  uint64_t reg_gen = 0;
+  int ttl_end;
+
+  (void)ctx;
+  if (!proxy_struct || !proxy_struct->ns || e->fd <= 0)
+    return;
+  pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
+  if (!pfe || pfe->fd != e->fd ||
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen)
+    return;                      /* the connection that parked is gone */
+  if (pfe->odir != 0 || pfe->fc.state != FC_P_QUEUED || pfe->fc.fc != fc ||
+      pfe->fc.q_deadline_ns == 0 || now_ns < pfe->fc.q_deadline_ns)
+    return;
+  if (!fc_queue_take(fc, &pfe->fc))
+    return;                      /* its turn or its cancellation came first */
+  ttl_end = pfe->fc.q_ttl_cut && fc->cfg.llmd_headers;
+  fc_count_band(fc, FC_R_QUEUE_TIMEOUT, pfe->fc.band);
+  fc_queue_wait_end(fc, &pfe->fc, now_ns);
+  log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
+           "with the pool still full (inflight=%u queued=%u) — %s",
+           pfe->fd,
+           (unsigned long long)((now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL),
+           fc_band_wait_ms(fc, pfe->fc.band), fc_inflight(fc), fc_queued(fc),
+           ttl_end ? "429 (the client's x-llm-d-inference-ttl)" : "504");
+  /* fc_queue_take moved the permit out of QUEUED (FC_P_ENDED) before it
+   * took the entry: a late resume of the owner does nothing. */
+  pfe->pd_phase = PD_PHASE_ERROR;
+  pd_reap_respond(pfe, ttl_end ? SP_REAP_FC_TTL : SP_REAP_FC_QUEUE_TIMEOUT);
+}
+
+/* The deadline thread: asleep on the timer until the earliest pending
+ * queue deadline (FC_DEADLINE_GRAIN_NS granularity), then one pass over the
+ * pools; never woken while nobody waits. The pass re-arms the timer. A
+ * timer that could not be opened leaves the deadlines to the 1 Hz pass
+ * (check_draining_endpoints). */
+void *
+proxy_fc_deadline_thread(void *arg)
+{
+  fc_deadline_t *d = fc_deadline_global();
+
+  (void)arg;
+  g_llb_proxy_worker = 1;
+  /* The timer was opened by proxy_main before this thread was created (the
+   * open and the drain checker's read of tfd must not race); no timer, no
+   * thread: the 1 Hz pass owes the deadlines then. */
+  if (d->tfd <= 0)
+    return NULL;
+  log_info("[AIGateway] queue deadline timer on: windows are enforced at %llu ms "
+           "granularity", (unsigned long long)(FC_DEADLINE_GRAIN_NS / 1000000ULL));
+  for (;;) {
+    if (fc_deadline_wait(d, -1) <= 0)
+      continue;
+    PROXY_LOCK();
+    (void)fc_deadline_pass(d, fc_now_ns(), sp_fc_deadline_pools,
+                           sp_fc_deadline_expire, NULL);
+    PROXY_UNLOCK();
+  }
+  return NULL;
 }
 
 static void
@@ -936,6 +1366,32 @@ check_draining_endpoints(void)
     }
   }
 
+  /* Capacity-queue idle guard — also BEFORE the idle reapers. A request
+   * parked in a pool's capacity queue has sent its request and waits for a
+   * unit: its reads are paused and its client sends nothing more, so its
+   * idle anchors stand still from its last byte. Left alone, the per-rule
+   * inactiveTimeout (and the L7 member-data deadline) shut it with no
+   * answer whenever the queue's wait window is longer than they are; the
+   * wait is bounded by the queue's own deadline, which answers 504. So each
+   * pass refreshes the anchors of every waiting request (the disarmed
+   * last_activity == 0 is kept), and a resumed request's idle clock starts
+   * at most one pass before its resume. The walk is over the queues, not
+   * the connections: a pool with nobody waiting costs one atomic read. A
+   * departed client is not kept: a parked connection keeps its hang-up
+   * events armed, and its teardown takes its entry out of the queue. Runs
+   * under the PROXY_LOCK already held by this pass. */
+  {
+    proxy_map_ent_t *fp_node;
+    proxy_epval_t *fp_ep, *fp_tmp;
+
+    for (fp_node = proxy_struct->head; fp_node; fp_node = fp_node->next) {
+      HASH_ITER(hh, fp_node->val.ephash, fp_ep, fp_tmp) {
+        if (fc_queued(&fp_ep->fc) > 0)
+          fc_queue_visit(&fp_ep->fc, sp_fc_park_idle_visit, &now);
+      }
+    }
+  }
+
   /* C-3: SSE max-duration enforcement — walk all live client connections and
    * force-terminate SSE streams that have exceeded their configured cap.
    *
@@ -967,10 +1423,16 @@ check_draining_endpoints(void)
             abandon_record(&global_stats.stream_abandon, ABANDON_STALL_ABORT,
                            pfe->stream_start_ts > 0 ? (long)(now - pfe->stream_start_ts) : 0);
             pfe->abandon_reason = ABANDON_STALL_ABORT + 1;
+            pfe->end_cause = SP_END_CLIENT_STALL;
             llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;
             pfe->bp_since = 0;
+            /* A P/D stream ended for its stalled client: the client's
+             * abort, not the engine's: aborted (9), as for a client that
+             * left. The request record (the event loop's teardown) names
+             * client_stall. */
+            pd_reap_lifecycle(pfe, 9 /*aborted*/);
             pd_reap_respond(pfe, SP_REAP_SSE_STALL);
             pfe = pfe_next;
             continue;
@@ -999,9 +1461,15 @@ check_draining_endpoints(void)
             llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;  /* Reset so eviction suppression no longer blocks cleanup */
+            /* The client did not get the whole answer: the event loop's
+             * teardown records it aborted, by the gateway's cap. */
+            pfe->end_cause = SP_END_DURATION_CAP;
             /* An error SSE event so the client can react, then both
              * directions shut; the event loop cleans up. Written by the
-             * socket's owner worker (pd_reap_respond). */
+             * socket's owner worker (pd_reap_respond). A P/D answer the
+             * duration cap ended: decode/truncated, the gateway's policy
+             * ended it, not the engine. */
+            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
             pd_reap_respond(pfe, SP_REAP_SSE_CAP);
           }
         }
@@ -1016,7 +1484,10 @@ check_draining_endpoints(void)
    * path evaluates the deadline only when a byte arrives, so a connection
    * that opened, sent part of its request headers and went silent would keep
    * its fd, epoll slot and buffers until the idle deadline, which only counts
-   * from an armed last_activity. Same deadline, evaluated on the clock. */
+   * from an armed last_activity. Same deadline, evaluated on the clock.
+   * The clock is armed only while a header block is open, on HTTP/1.1 and
+   * HTTP/2 alike, and it is published for this thread: it is all this pass
+   * reads of the connection's protocol state. */
   {
     proxy_map_ent_t *hd_node = proxy_struct->head;
     while (hd_node) {
@@ -1024,15 +1495,16 @@ check_draining_endpoints(void)
       proxy_fd_ent_t *pfe = hd_ms ? hd_node->val.fdlist : NULL;
       while (pfe) {
         proxy_fd_ent_t *pfe_next = pfe->next;
+        int64_t hdr_age;
         if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
-            pfe->l7_hdr_accum_start > 0 &&
-            (pfe->h2_session || !pfe->http_hdrs_done) &&
-            proxy_hdr_deadline_expired(hd_node, pfe, now)) {
+            proxy_hdr_deadline_expired(hd_node, pfe, now, &hdr_age)) {
           atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
           log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
                    "with no further client bytes — dropping connection", pfe->fd, hd_ms);
+          /* Recorded before the hangup the worker will see. */
+          proxy_h2_client_end_mark_deadline(pfe, SP_HDR_CHECK_CLOCK, hdr_age, hd_ms);
+          sp_hdr_disarm(&pfe->l7_hdr);   /* counted once; the close event tears it down */
           shutdown(pfe->fd, SHUT_RDWR);
-          pfe->l7_hdr_accum_start = 0;   /* counted once; the close event tears it down */
         }
         pfe = pfe_next;
       }
@@ -1059,7 +1531,7 @@ check_draining_endpoints(void)
        * finer than 1s here — documented). For the AI peer / un-configured listeners (has_l7_policy
  * ==0 or timeout_member_data_ms==0) behaviour is byte-for-byte unchanged. */
       uint32_t l7_data_to_s = 0;
-      if (ito_node->has_l7_policy && ito_node->arg_ptr &&
+      if (l7_policy_on(ito_node) && ito_node->arg_ptr &&
           ito_node->arg_ptr->timeout_member_data_ms > 0) {
         /* ms → seconds, rounded up so a sub-second deadline still expires after one tick */
         l7_data_to_s = (ito_node->arg_ptr->timeout_member_data_ms + 999) / 1000;
@@ -1094,6 +1566,7 @@ check_draining_endpoints(void)
           log_debug("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
                    pfe->fd, (long)idle_elapsed, idle_to_s,
                    (l7_data_to_s > 0) ? " (L7 timeoutMemberData)" : "");
+          proxy_h2_client_end_mark(pfe, SP_H2_END_IDLE, 0, NULL);
           if (pfe->fd > 0) {
             shutdown(pfe->fd, SHUT_RDWR);
           }
@@ -1120,8 +1593,8 @@ check_draining_endpoints(void)
             pfe->pd_phase_start_ts > 0) {
           time_t elapsed = now - pfe->pd_phase_start_ts;
           uint32_t timeout = pd_prefill_timeout_default(); /* 30s, env-overridable */
-          if (pfe->epv) {
-            proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+          if (epv) {
             if (epv->pd_prefill_timeout_sec > 0) {
               timeout = epv->pd_prefill_timeout_sec;
             }
@@ -1155,7 +1628,7 @@ check_draining_endpoints(void)
               int t_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
               log_info(" llb_ai_pd_record (prefill timeout): model=%s prefill=%lldms kv=%d",
                        pd_tmo_model, (long long)t_prefill_ms, t_kv);
-              llb_ai_pd_record((char *)pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
+              sp_pd_record(pfe, pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
             }
             /* single-owner teardown (see pd_teardown_conn). Mark ERROR,
              * then deregister+close+free each backend leg and the client exactly
@@ -1187,8 +1660,8 @@ check_draining_endpoints(void)
                  pfe->pd_decode_content_length == 0) {
           time_t dec_elapsed = now - pfe->pd_phase_start_ts;
           uint32_t dec_timeout = pd_prefill_timeout_default();
-          if (pfe->epv) {
-            proxy_epval_t *dec_epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *dec_epv = sp_pool_holder_peek(&pfe->epv);
+          if (dec_epv) {
             if (dec_epv->pd_prefill_timeout_sec > 0) {
               dec_timeout = dec_epv->pd_prefill_timeout_sec;
             }
@@ -1220,7 +1693,7 @@ check_draining_endpoints(void)
                  * an inherited default. SGLang never populates
                  * pd_kv_params_len (its KV handoff is engine-internal), so 0
                  * is the true kv answer here. */
-                llb_ai_pd_record((char *)dec_model, 0, 0, 0,
+                sp_pd_record(pfe, dec_model, 0, 0, 0,
                                  1 /*prefill timeout*/);
               } else {
                 /* The sequential machines wedged on the DECODE leg: prefill
@@ -1255,7 +1728,7 @@ check_draining_endpoints(void)
                                               pfe->pd_prefill_start_ns) /
                                              1000000ULL);
                 }
-                llb_ai_pd_record((char *)dec_model, dec_prefill_ms, 0, dec_kv,
+                sp_pd_record(pfe, dec_model, dec_prefill_ms, 0, dec_kv,
                                  3 /*decode timeout*/);
               }
             }
@@ -1319,8 +1792,8 @@ check_draining_endpoints(void)
              * pd_parked_lock; pd_parked_remove_fd is FIFO-order-safe. The fd may have
              * already been popped by a dequeue whose wake then failed — remove_fd then
              * simply returns "not found", which is fine. */
-            if (pfe->epv && pfe->park_ep_idx >= 0) {
-              proxy_epval_t *pev = (proxy_epval_t *)pfe->epv;
+            proxy_epval_t *pev = sp_pool_holder_peek(&pfe->epv);
+            if (pev && pfe->park_ep_idx >= 0) {
               if (pfe->park_ep_idx < pev->n_eps) {
                 pthread_mutex_lock(&pev->pd_parked_lock);
                 pd_parked_remove_fd(&pev->pd_parked[pfe->park_ep_idx], pfe->fd,
@@ -1378,46 +1851,13 @@ check_draining_endpoints(void)
     }
     epp_pending_reap(60ULL * 1000000000ULL);
   }
-
-  /* Capacity-queue deadlines. A request parked by the capacity gate sits
-   * in its pool's queue with an absolute deadline; nothing else on the
-   * request path times it, since its reads are paused and no backend leg
-   * exists. Whichever of the pop, the client's departure and this pass
-   * takes the entry out first owns what happens to the connection: the
-   * take here fails when its turn or its cancellation came first, and then
-   * nothing is done. The 504 and the teardown go through pd_reap_respond,
-   * written by the socket's owner worker. */
-  {
-    struct timespec _qts;
-    uint64_t q_now_ns;
-    proxy_map_ent_t *q_node = proxy_struct->head;
-
-    clock_gettime(CLOCK_MONOTONIC, &_qts);
-    q_now_ns = (uint64_t)_qts.tv_sec * 1000000000ULL + (uint64_t)_qts.tv_nsec;
-    while (q_node) {
-      proxy_fd_ent_t *pfe = q_node->val.fdlist;
-      while (pfe) {
-        proxy_fd_ent_t *pfe_next = pfe->next;
-
-        if (pfe->odir == 0 && pfe->fc.state == FC_P_QUEUED && pfe->fc.fc &&
-            pfe->fc.q_deadline_ns > 0 && q_now_ns >= pfe->fc.q_deadline_ns &&
-            fc_queue_take(pfe->fc.fc, &pfe->fc)) {
-          fc_count(pfe->fc.fc, FC_R_QUEUE_TIMEOUT);
-          log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
-                   "with the pool still full (inflight=%u queued=%u) — 504",
-                   pfe->fd,
-                   (unsigned long long)((q_now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL),
-                   pfe->fc.fc->cfg.max_queue_wait_ms, fc_inflight(pfe->fc.fc),
-                   fc_queued(pfe->fc.fc));
-          pfe->fc.state = FC_P_NONE;
-          pfe->pd_phase = PD_PHASE_ERROR;
-          pd_reap_respond(pfe, SP_REAP_FC_QUEUE_TIMEOUT);
-        }
-        pfe = pfe_next;
-      }
-      q_node = q_node->next;
-    }
-  }
+  /* Capacity-queue deadlines are met by the deadline thread
+   * (proxy_fc_deadline_thread), on a timer armed to the earliest pending
+   * deadline: this pass runs them only in a process whose timer could not
+   * be opened, at this pass's cadence, through the same pool-driven read. */
+  if (fc_deadline_global()->tfd <= 0)
+    (void)fc_deadline_pass(NULL, fc_now_ns(), sp_fc_deadline_pools,
+                           sp_fc_deadline_expire, NULL);
 
   /* Capacity-queue turns. A released unit wakes the oldest waiting request
    * at once; this pass gives a turn again when that wake was lost on the
@@ -1433,6 +1873,27 @@ check_draining_endpoints(void)
       HASH_ITER(hh, k_node->val.ephash, k_ep, k_tmp) {
         if (k_ep->ai_gw_mode && fc_queued(&k_ep->fc) > 0)
           fc_queue_wake_one(&k_ep->fc);
+      }
+    }
+  }
+
+  /* Evicted waiters (fc_shed_queue) whose owner never claimed the answer:
+   * the wake that carried it was lost (the resume ring was full, or the
+   * owner was gone). One pass after the eviction, the 429 goes out through
+   * pd_reap_respond like the deadline's 504, so an evicted client is
+   * always answered. A pool with nobody owed costs one atomic read. */
+  {
+    proxy_map_ent_t *e_node;
+    proxy_epval_t *e_ep, *e_tmp;
+    struct timespec e_ts;
+    uint64_t e_now_ns;
+
+    clock_gettime(CLOCK_MONOTONIC, &e_ts);
+    e_now_ns = (uint64_t)e_ts.tv_sec * 1000000000ULL + (uint64_t)e_ts.tv_nsec;
+    for (e_node = proxy_struct->head; e_node; e_node = e_node->next) {
+      HASH_ITER(hh, e_node->val.ephash, e_ep, e_tmp) {
+        if (fc_queue_evicted(&e_ep->fc) > 0 && e_now_ns > 1000000000ULL)
+          sp_fc_evicted_sweep(e_ep, e_now_ns - 1000000000ULL);
       }
     }
   }
@@ -1482,8 +1943,8 @@ check_draining_endpoints(void)
         proxy_fd_ent_t *pfe_next = pfe->next;
 
         uint32_t decode_idle_cap = PROXY_PD_DECODE_IDLE_CAP_SEC;
-        if (pfe->epv) {
-          proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+        proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+        if (epv) {
           if (epv->pd_decode_idle_cap_sec > 0) {
             decode_idle_cap = epv->pd_decode_idle_cap_sec;
           }
@@ -1493,9 +1954,16 @@ check_draining_endpoints(void)
                 pfe->pd_phase == PD_PHASE_DECODE_STREAMING,
                 pfe->sse_active, pfe->stream_end_ts, pfe->pd_last_decode_ts,
                 now, decode_idle_cap)) {
+          /* The stream's finish evidence (sockproxy_pd_terminal.h), written by
+           * the response framer: a finish event for every choice, followed only
+           * by choice-less events. With it the engine finished and lost only
+           * its terminator; without it the engine went silent mid-generation. */
+          int finished = atomic_load_explicit(&pfe->pd_client_finished,
+                                              memory_order_acquire);
           log_debug("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
-                   "synthesizing data: [DONE] (vLLM dropped terminator)",
-                   pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap);
+                   "synthesizing data: [DONE] (vLLM dropped terminator; %s)",
+                   pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap,
+                   finished ? "the stream had finished" : "no finish evidence");
 
           const char *gc_model = proxy_effective_model(pfe);
 
@@ -1509,7 +1977,12 @@ check_draining_endpoints(void)
           pfe->stream_end_ts = now;
           pfe->sse_active = 0;
 
-          /* 3) Record P/D metrics, mirroring the :1255 SSE_DONE success path. */
+          /* 3) Record P/D metrics. With finish evidence the lifecycle outcome
+           * is a completion (0): the generation finished and only its
+           * terminator was lost. Without it, decode/truncated (8), not a
+           * success: the engine went silent and the gateway ended the answer.
+           * Either way the client received a 200 stream, and the request
+           * record says so; the lifecycle record says how it ended. */
           {
             struct timespec _pdts;
             clock_gettime(CLOCK_MONOTONIC, &_pdts);
@@ -1525,12 +1998,15 @@ check_draining_endpoints(void)
                                     1000000ULL);
             }
             int pd_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)gc_model, prefill_ms, decode_ms, pd_kv, 0);
+            sp_pd_record(pfe, gc_model, prefill_ms, decode_ms, pd_kv,
+                             finished ? 0 /*complete: finish evidence*/
+                                      : 8 /*decode truncated*/);
           }
 
           /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as
  * (held under PROXY_LOCK; pfe_next-safe). */
           pfe->pd_phase = PD_PHASE_COMPLETE;
+          atomic_fetch_add(&global_stats.pd_terminator_synthesized, 1);
           pd_reap_respond(pfe, SP_REAP_PD_GRACEFUL_DONE);
         }
 
@@ -1568,8 +2044,8 @@ check_draining_endpoints(void)
           }
           time_t elapsed = now - basis;
           uint32_t timeout = 120; /* default 120s decode-stream SILENCE */
-          if (pfe->epv) {
-            proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+          if (epv) {
             if (epv->pd_decode_timeout_sec > 0) {
               timeout = epv->pd_decode_timeout_sec;
             }
@@ -1578,7 +2054,11 @@ check_draining_endpoints(void)
             log_error("ERR-01: P/D decode stream timeout — fd=%d idle=%lds",
                       pfe->fd, (long)elapsed);
             /* real two-leg teardown (see above), the 502 first; both
-             * written by the socket's owner worker (pd_reap_respond). */
+             * written by the socket's owner worker (pd_reap_respond). The
+             * engine went silent, the sweep's cause: decode/truncated. That
+             * this answer was cut rather than given a terminator is what
+             * pd_terminator_synthesized does not count. */
+            pd_reap_lifecycle(pfe, 8 /*decode truncated*/);
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_reap_respond(pfe, SP_REAP_PD_STREAM_TIMEOUT);
           }
@@ -1614,8 +2094,8 @@ check_draining_endpoints(void)
           uint32_t prefill_to = 30;  /* mirrors default */
           uint32_t decode_to = 120;  /* mirrors default */
           uint32_t idle_cap = 0;
-          if (pfe->epv) {
-            proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+          proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
+          if (epv) {
             if (epv->pd_prefill_timeout_sec > 0) {
               prefill_to = epv->pd_prefill_timeout_sec;
             }
@@ -1645,6 +2125,9 @@ check_draining_endpoints(void)
             log_error("generic P/D idle reaper — fd=%d pd_phase=%d "
                       "elapsed=%lds >= cap=%us",
                       pfe->fd, (int)pfe->pd_phase, (long)elapsed, idle_cap);
+            /* Named by the phase it wedged in (pd_reap_error_phase): a
+             * silent stream is decode/truncated, as at ERR-01. */
+            pd_reap_lifecycle(pfe, pd_reap_error_phase(pfe->pd_phase));
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_reap_respond(pfe, SP_REAP_PD_IDLE_TIMEOUT);
           }

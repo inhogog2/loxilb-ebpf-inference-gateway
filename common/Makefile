@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -139,7 +139,8 @@ sockproxy_http.o: sockproxy_http.c sockproxy_http.h sockproxy_internal.h \
                   sockproxy_stream_fallback.h \
                   sockproxy_trace.h sockproxy_cache.h sockproxy_lb.h \
                   sockproxy_health.h sockproxy_ssl.h sockproxy_conn.h \
-                  sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h
+                  sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h \
+                  sockproxy_creq_block.h sockproxy_h1_hdr.h
 	$(CC) $(CFLAGS) $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_LLAMAFIREWALL) -c -o $@ $<
 
 sockproxy_notifier.o: sockproxy_notifier.c sockproxy_notifier.h sockproxy_internal.h \
@@ -178,7 +179,13 @@ sockproxy_epp.o: sockproxy_epp.c sockproxy_epp.h sockproxy.h sockproxy_internal.
 sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-notify.o: notify.c notify.h
+notify.o: notify.c notify.h sockproxy_qsbr.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_qsbr.o: sockproxy_qsbr.c sockproxy_qsbr.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_pool.o: sockproxy_pool.c sockproxy_pool.h sockproxy_qsbr.h sockproxy.h sockproxy_fc.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 picohttpparser.o: picohttpparser.c picohttpparser.h
@@ -205,7 +212,7 @@ sockproxy_pd_core.o: sockproxy_pd_core.c sockproxy_pd.h sockproxy.h
 
 # P/D vLLM sequential dialect machine
 sockproxy_pd_vllm.o: sockproxy_pd_vllm.c sockproxy_pd.h sockproxy.h \
-                     sockproxy_internal.h sockproxy_ai_gw.h
+                     sockproxy_internal.h sockproxy_ai_gw.h sockproxy_pd_receipt.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # P/D SGLang dual-dispatch dialect machine
@@ -219,6 +226,9 @@ sockproxy_pd_trtllm.o: sockproxy_pd_trtllm.c sockproxy_pd.h sockproxy.h \
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_pd_trie.o: sockproxy_pd_trie.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_pd_terminal.o: sockproxy_pd_terminal.c sockproxy_pd_terminal.h jsmn.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Phase 70 — sockproxy HA state sync receiver
@@ -283,7 +293,7 @@ llhttp.a: llhttp.o llhttpapi.o http.o
 	$(AR) rcs -c $@ $^
 
 # US-501: Request-ID generation and injection unit tests (standalone)
-test_request_id: test_request_id.c
+test_request_id: test_request_id.c sockproxy_pd_receipt.h
 	$(CC) -Wall -Wextra -o $@ $< -I. -DTEST_REQUEST_ID
 
 .PHONY: test_rid
@@ -365,6 +375,26 @@ test_ai_admit_identity: test_ai_admit_identity.c sockproxy_ai_admit.c sockproxy_
 test_aiident: test_ai_admit_identity
 	./test_ai_admit_identity
 
+# Ingress interface of an accepted connection (network-identity bindings that
+# match on an interface): the read on a loopback connection, the socket left
+# as found, the control-buffer parse, the once-per-connection cache.
+# Header-only; needs loopback and nothing else.
+test_in_ifindex: test_in_ifindex.c sockproxy_in_ifindex.h
+	$(CC) -Wall -Wextra -o $@ test_in_ifindex.c -I.
+
+.PHONY: test_inif
+test_inif: test_in_ifindex
+	./test_in_ifindex
+
+# The operational log: per-thread rings and one writer thread. A log call
+# never waits for a sink; a full ring drops and counts.
+test_log_ring: test_log_ring.c log.c log.h
+	$(CC) -Wall -Wextra -o $@ test_log_ring.c log.c -I. -lpthread
+
+.PHONY: test_log
+test_log: test_log_ring
+	./test_log_ring
+
 # Capacity admission gate: ceilings hold under contention, units come back
 # exactly once, two legs of one request count one service unit, a moved leg
 # never over-admits, observe admits and counts, off touches nothing. Pure
@@ -384,13 +414,70 @@ test_fc_tenant: test_fc_tenant.c sockproxy_fc.c sockproxy_fc.h
 test_fc_expose: test_fc_expose.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_expose.c sockproxy_fc.c -I. -lpthread
 
+test_fc_tenant_slots: test_fc_tenant_slots.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -Wl,--wrap=calloc -o $@ test_fc_tenant_slots.c sockproxy_fc.c -I. -lpthread
+
+test_fc_visit: test_fc_visit.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_visit.c sockproxy_fc.c -I. -lpthread
+
+test_fc_priority: test_fc_priority.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_priority.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_cfg: test_fc_band_cfg.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_cfg.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_shed: test_fc_band_shed.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_shed.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_floor: test_fc_band_floor.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_floor.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_ttl: test_fc_band_ttl.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_ttl.c sockproxy_fc.c -I. -lpthread
+
+# A configured wait window is the enforced window: the deadline timer, the
+# per-pool earliest deadline, the pass that enters only expired queues, no
+# idle wake-ups (real timerfd, real time; ~12 s).
+test_fc_deadline: test_fc_deadline.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_fc_deadline.c sockproxy_fc.c -I. -lpthread
+
+test_fc_band_wrr: test_fc_band_wrr.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_band_wrr.c sockproxy_fc.c -I. -lpthread
+
+test_fc_settle: test_fc_settle.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_settle.c sockproxy_fc.c -I. -lpthread
+
+# The P/D role gates wait at a full role ceiling. The gate functions are the
+# production ones, taken from sockproxy_http.c (each from its return-type
+# line to its closing brace) into a generated file, so a change to them is
+# what the test runs; the extraction fails unless it finds all three.
+PD_ROLE_WAIT_FNS = sp_fc_h1_refuse|sp_fc_h1_gate_role|sp_fc_h1_gate_pd_roles
+test_pd_role_wait.gen.c: sockproxy_http.c
+	awk '/^($(PD_ROLE_WAIT_FNS))\(/ {print prev; on = 1} on {print} on && /^}/ {on = 0; n++; print ""} {prev = $$0} END {if (n != 3) exit 1}' \
+	  sockproxy_http.c > $@ || { rm -f $@; exit 1; }
+
+test_pd_role_wait: test_pd_role_wait.c test_pd_role_wait.gen.c sockproxy_fc.c sockproxy_fc.h sockproxy_llmd.h sockproxy_obj_hint.h
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -o $@ test_pd_role_wait.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose test_fc_tenant_slots test_fc_visit test_fc_priority test_fc_band_cfg test_fc_band_shed test_fc_band_floor test_fc_band_ttl test_fc_band_wrr test_fc_settle test_pd_role_wait test_fc_deadline
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
 	./test_fc_tenant
 	./test_fc_expose
+	./test_fc_tenant_slots
+	./test_fc_visit
+	./test_fc_priority
+	./test_fc_band_cfg
+	./test_fc_band_shed
+	./test_fc_band_floor
+	./test_fc_band_ttl
+	./test_fc_band_wrr
+	./test_fc_settle
+	./test_pd_role_wait
+	./test_fc_deadline
 
 # Half-close observation, the pure half: bucket edges, the sampling gate, the
 # TLS end classification, User-Agent families and the split header-name match.
@@ -421,6 +508,29 @@ check_notify_arm:
 .PHONY: check_client_eof_keep
 check_client_eof_keep:
 	sh ./check_client_eof_keep.sh
+
+# A P/D request reports the status its client received: both response-status
+# captures skip the sequential machine's prefill reply, and every path that
+# answers the client records the response through proxy_note_client_response.
+.PHONY: check_pd_status_sites
+check_pd_status_sites:
+	sh ./check_pd_status_sites.sh
+	sh ./check_pd_status_sites_mutations.sh
+	python3 test_pd_record.py
+
+# A response the gateway writes itself is recorded as the client receives it
+# (status and class, no TTFB sample), and once as a request: a staged
+# refusal, or an outage completion. Every local send records or is
+# allowlisted with its reason; each rule is mutation-tested.
+.PHONY: check_local_answers
+check_local_answers:
+	sh ./check_local_answers.sh
+	sh ./check_local_answers_mutations.sh
+
+.PHONY: check_deadline_init_order
+check_deadline_init_order:
+	sh ./check_deadline_init_order.sh
+	sh ./check_deadline_init_order_mutations.sh
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
@@ -472,14 +582,38 @@ test_cache_mark_bin: test_cache_mark.c sockproxy_cache_mark.h
 test_cache_mark: test_cache_mark_bin
 	./test_cache_mark_bin
 
-# Header-completion deadline resolution: 0 means the product default, never
-# "disabled". Standalone — includes only the pure sockproxy_hdr_deadline.h.
+# Header-completion deadline: 0 resolves to the product default, never to
+# "disabled"; the clock charges only the header block of the connection that
+# armed it (publication order, fd reuse, a generation change mid-read), and
+# a worker and the health pass share it without a data race (the TSan
+# build). Standalone — includes only the pure sockproxy_hdr_deadline.h.
 test_hdr_deadline: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h
-	$(CC) -Wall -Wextra -o $@ $< -I.
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-o $@ $< -I. -pthread
+
+test_hdr_deadline_tsan: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
 
 .PHONY: test_hdrdl
-test_hdrdl: test_hdr_deadline
+test_hdrdl: test_hdr_deadline test_hdr_deadline_tsan
 	./test_hdr_deadline
+	./test_hdr_deadline_tsan
+
+# llhttp settings shared by every connection are filled once: two threads
+# first-use them together and each parses a complete response and request
+# (ASan + UBSan), and the shared settings are not a data race (TSan).
+PONCE_SRCS = test_parser_once.c llhttp.c httpapi.c http.c
+test_parser_once: $(PONCE_SRCS) sockproxy_parser_once.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-o $@ $(PONCE_SRCS) -I. -pthread
+
+test_parser_once_tsan: $(PONCE_SRCS) sockproxy_parser_once.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $(PONCE_SRCS) -I. -pthread
+
+.PHONY: test_ponce
+test_ponce: test_parser_once test_parser_once_tsan
+	./test_parser_once
+	./test_parser_once_tsan
 
 # connectionLimit on a fullproxy listener: the accept-time ceiling. Standalone
 # — includes only the pure sockproxy_fe_limit.h.
@@ -511,6 +645,111 @@ test_pfe_clear: test_pfe_clear.c sockproxy_pfe_clear.h sockproxy.h
 test_pfec: test_pfe_clear
 	./test_pfe_clear
 
+# The lifetime of a pool and the grace period it is freed after
+# (sockproxy_pool.h, sockproxy_qsbr.h). Run under ASan + UBSan and under TSan.
+POOL_REF_SRCS = test_pool_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+test_pool_ref: $(POOL_REF_SRCS) sockproxy_pool.h sockproxy_qsbr.h sockproxy_fc.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wl,--wrap=calloc -o $@ $(POOL_REF_SRCS) -I. -lpthread
+
+test_pool_ref_tsan: $(POOL_REF_SRCS) sockproxy_pool.h sockproxy_qsbr.h sockproxy_fc.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -Wl,--wrap=calloc -o $@ $(POOL_REF_SRCS) -I. -lpthread
+
+.PHONY: test_poolref
+test_poolref: test_pool_ref test_pool_ref_tsan
+	./test_pool_ref
+	./test_pool_ref_tsan
+
+# An HTTP/2 stream holds the pool it was routed to until the REAL stream free
+# (sockproxy_h2.c, through proxy_h2_cleanup_session) gives it back. Linked like
+# test_h2_inject: --gc-sections keeps only what that teardown reaches.
+H2RREF_SRCS = test_h2_route_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+test_h2_route_ref: $(H2RREF_SRCS) sockproxy_h2_gc.o sockproxy_pool.h sockproxy_h2.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ $(H2RREF_SRCS) sockproxy_h2_gc.o -I. \
+		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2rref
+test_h2rref: test_h2_route_ref
+	./test_h2_route_ref
+
+# An HTTP/2 client connection's end records and logs why (sockproxy_h2.c).
+test_h2_end_log: test_h2_end_log.c sockproxy_h2_gc.o sockproxy.h sockproxy_h2.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ test_h2_end_log.c sockproxy_h2_gc.o -I. \
+		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2end
+test_h2end: test_h2_end_log
+	./test_h2_end_log
+
+# One HTTP/2 backend leg ending answers only the client streams it carries
+# and is detached from its client (sockproxy_h2.c). Linked like test_h2_inject.
+H2LEG_SRCS = test_h2_leg_end.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+test_h2_leg_end: $(H2LEG_SRCS) sockproxy_h2_gc.o sockproxy_pool.h sockproxy_h2.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ $(H2LEG_SRCS) sockproxy_h2_gc.o -I. \
+		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2leg
+test_h2leg: test_h2_leg_end
+	./test_h2_leg_end
+
+# Nothing reads an HTTP/2 stream after an answer that may have freed it. The
+# gateway object itself is built with ASan here: a read after the free inside
+# sockproxy_h2.c is what this test must see.
+sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
+	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) -DSP_DEBUG_ASSERTS \
+		-ffunction-sections -fdata-sections -c -o $@ $<
+
+# The shared HTTP/2 fixture (test_h2_fixture.h): the gateway object with ASan,
+# working fakes for the forward path, fake backends, link stand-ins for the
+# rest. It wraps calloc (allocation failure injection).
+H2FX_SRCS = test_h2_fixture.c test_h2_fixture_links.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h
+H2FX_LINK = $(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -I. -Wl,--wrap=calloc -Wl,--gc-sections
+
+test_h2_deny_free: test_h2_deny_free.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_deny_free.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2deny
+test_h2deny: test_h2_deny_free
+	./test_h2_deny_free
+
+# A request body forwarded to an HTTP/2 backend outlives its client stream.
+test_h2_body_source: test_h2_body_source.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_body_source.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2body
+test_h2body: test_h2_body_source
+	./test_h2_body_source
+
+# A half-closed HTTP/2 client is never held, and one of its legs ending leaves
+# no mark on it (sockproxy_hold.c). Linked with --gc-sections and the event
+# loop stubbed in the test.
+test_h2_hold: test_h2_hold.c sockproxy_hold.c sockproxy_hold.h sockproxy_hold_core.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ test_h2_hold.c sockproxy_hold.c log.c -I. \
+		-Wl,--gc-sections -lpthread
+
+.PHONY: test_h2hold
+test_h2hold: test_h2_hold
+	./test_h2_hold
+
+# An endpoint's force-close frees HTTP/1.1 pairs and hands every HTTP/2 entry
+# to its own worker (sockproxy_health.c). Linked with --gc-sections, the
+# teardown primitives recorded in the test.
+test_force_close: test_force_close.c sockproxy_health.c sockproxy_health.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
+		-ffunction-sections -fdata-sections -o $@ test_force_close.c log.c -I. \
+		-Wl,--gc-sections -lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_forceclose
+test_forceclose: test_force_close
+	./test_force_close
+
 # Phase 87-01 (FIX-1/2/3/4): P/D streaming-completion connection-leak unit.
 # Standalone — includes only the pure sockproxy_pd_leak.h helpers (no sockproxy.c
 # machinery). -fsanitize=address detects over-reads in the bounded detector and
@@ -525,8 +764,21 @@ test_pd_leak: test_pd_leak.c sockproxy_pd_leak.h
 # message-end terminator split across two reads — the Bug-A stall on the
 # sse_active==0 path that the single-packet FIX-4 scan missed. -fsanitize=address
 # guards the bounded window/tail copies.
-test_pd_complete: test_pd_complete.c sockproxy_pd_leak.h
-	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I. -DTEST_PD_COMPLETE
+test_pd_complete: test_pd_complete.c sockproxy_pd_leak.h sockproxy_resp_note.h
+	$(CC) -Wall -Wextra -fsanitize=address -pthread -o $@ $< -I. -DTEST_PD_COMPLETE
+
+# The finish evidence of a P/D decode stream (sockproxy_pd_terminal.c): what
+# proves a finished generation, what keeps the proof, what clears it.
+test_pd_finish: test_pd_finish.c sockproxy_pd_terminal.c sockproxy_pd_terminal.h jsmn.h
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -o $@ test_pd_finish.c sockproxy_pd_terminal.c -I.
+	./test_pd_finish
+
+# The decode leg's EOF under an open P/D stream (sp_pd_decode_stream_eof,
+# sockproxy_http.c, run from the source): finished -> complete, cut -> death.
+test_pd_eof_finish: sockproxy_http.c test_pd_eof_finish.py test_pd_eof_finish_mutations.py
+	python3 test_pd_eof_finish.py
+	python3 test_pd_eof_finish_mutations.py
 
 # Phase 90-02 (REQ-REG / contract §5): adversarial HTTP-response message-framing
 # regression units for the M1 response-leg parser. UNLIKE the header-only
@@ -548,8 +800,30 @@ test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
 test_admit_response: test_admit_response.c sockproxy_admit_response.h llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
 
-.PHONY: test_admit test_uc5
-test_uc5: test_admit test_stream test_uc3 test_l2_reflection
+# A started answer takes no new status line (sockproxy_answer.h): the framer's
+# in-message state at every cut, and the production senders and reaper finish
+# against a begun answer and its twin, a fresh one.
+test_answer_track: test_answer_track.c sockproxy_answer.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
+
+.PHONY: test_answer
+test_answer: test_answer_track
+	./test_answer_track
+	python3 test_answer_started.py
+	python3 test_eof_answer.py
+	python3 test_reap_framing.py
+	python3 test_reap_framing_mutations.py
+	python3 test_reap_request_record.py
+	python3 test_reap_stream_gauge.py
+	python3 test_reap_stream_gauge_mutations.py
+	python3 test_leg_ended_unanswered.py
+	python3 test_leg_ended_unanswered_mutations.py
+
+.PHONY: test_admit test_uc5 test_backend_failure_audit
+test_backend_failure_audit:
+	python3 test_backend_failure_audit.py
+
+test_uc5: test_admit test_stream test_uc3 test_l2_reflection test_backend_failure_audit
 
 test_admit: test_admit_response
 	./test_admit_response
@@ -615,6 +889,7 @@ test_pd_cache_aware: test_pd_cache_aware.c sockproxy_pd.c sockproxy_pd_trie.c
 test_pd_cache: test_pd_cache_aware
 	./test_pd_cache_aware
 	LLB_PD_MAX_INFLIGHT_PER_EP=4 ./test_pd_cache_aware cap
+	LLB_PD_DECODE_KV_WEIGHT=8 ./test_pd_cache_aware kv
 
 # Phase 6: KV-cache exact routing unit tests (CBOR encoding + hash parity)
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
@@ -630,8 +905,16 @@ test_epp_cfg: test_epp_cfg.c llb_dpapi.h sockproxy.h
 test_epp: test_epp_cfg
 	./test_epp_cfg
 
-test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h
-	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c -I.
+# A request with no usable Host on a listener whose pools name models: the
+# pool that names its model or a counted route refusal (proxy_setup_ep__),
+# with mutations.
+.PHONY: test_route_hostless
+test_route_hostless:
+	python3 test_route_hostless.py
+	python3 test_route_hostless.py --mutations
+
+test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c
+	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c -I. -lpthread
 
 # Conversation stickiness may not cross model pools on one VIP:port -- the
 # (pool, endpoint-in-pool) identity rule for ent->val.conv_map. Header-only.
@@ -735,6 +1018,36 @@ test_ka_leg: test_ka_leg.c sockproxy_ka_leg.h
 test_ka: test_ka_leg
 	./test_ka_leg
 
+# A request's header block is edited once and a body read never: the per-read
+# answer of the request framer (sockproxy_creq_block.h) and the header edits
+# (sockproxy_h1_hdr.h), driven by the real llhttp framer over reads cut the
+# way a socket cuts them. The test scores each body case against the pre-fix
+# rule as its own red twin. Address and undefined-behaviour sanitizers on.
+test_creq_block: test_creq_block.c sockproxy_creq_block.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -c -o test_creq_block.to $< -I.
+	$(CC) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_creq_block.to llhttp.c httpapi.c http.c -I.
+	rm -f test_creq_block.to
+
+.PHONY: test_creq
+test_creq: test_creq_block
+	./test_creq_block
+
+# The objective header's capture, the class headers of an admitted response
+# and the strip of a backend's X-Api-Key from its response head, on the
+# real framers under ASan and UBSan.
+test_obj_hint: test_obj_hint.c sockproxy_obj_hint.h sockproxy_creq_block.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -c -o test_obj_hint.to $< -I.
+	$(CC) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_obj_hint.to llhttp.c httpapi.c http.c -I.
+	rm -f test_obj_hint.to
+
+.PHONY: test_objhint
+test_objhint: test_obj_hint
+	./test_obj_hint
+
+test_llmd: test_llmd.c sockproxy_llmd.h sockproxy_llmd_fwd.h sockproxy_obj_hint.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h sockproxy_native_prio.h
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_llmd.c -I.
+	./test_llmd
+
 # Backend connect in two halves: the relay path issues the connect and
 # finishes the leg from the writable event instead of holding its worker for
 # the round trip. Header-only and standalone; the test measures the kept
@@ -800,26 +1113,43 @@ test_l7tr: test_l7trust
 # What a listener puts on the wire and what it attributes: the emitted header
 # ops, the origin recorded on the request, and the entry point an operator's
 # trusted ranges arrive through. Links the policy unit and stubs its callouts.
-test_l7origin: test_l7origin.c sockproxy_l7policy.o sockproxy_l7trust.h
-	$(CC) -Wall -Wextra -o $@ test_l7origin.c sockproxy_l7policy.o \
+test_l7origin: test_l7origin.c sockproxy_l7policy.o sockproxy_pool.o sockproxy_qsbr.o sockproxy_fc.o sockproxy_l7trust.h
+	$(CC) -Wall -Wextra -o $@ test_l7origin.c sockproxy_l7policy.o sockproxy_pool.o sockproxy_qsbr.o sockproxy_fc.o \
 		-I. -I../headers -lcrypto -lpthread
 
 .PHONY: test_l7or
 test_l7or: test_l7origin
 	./test_l7origin
 
+# Where an L7 FORWARD sends a request: the listener's own pool with the
+# route's members marked, selection over live health and weights, and a
+# policy replaced under the dispatch. ASan + UBSan, then TSan, the policy unit
+# compiled into the test.
+L7_ROUTE_SRCS = test_l7_route.c sockproxy_l7policy.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c
+test_l7_route: $(L7_ROUTE_SRCS) sockproxy_l7policy.h sockproxy_mcp_rr.h sockproxy_pool.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ $(L7_ROUTE_SRCS) \
+		-I. -I../headers -lcrypto -lpthread
+
+test_l7_route_tsan: $(L7_ROUTE_SRCS) sockproxy_l7policy.h sockproxy_mcp_rr.h sockproxy_pool.h sockproxy.h
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $(L7_ROUTE_SRCS) -I. -I../headers -lcrypto -lpthread
+
+.PHONY: test_l7route
+test_l7route: test_l7_route test_l7_route_tsan
+	./test_l7_route
+	./test_l7_route_tsan
+
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.
-test_notify_shard: test_notify_shard.c notify.c log.c notify.h
-	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c log.c -I. -lpthread
+test_notify_shard: test_notify_shard.c notify.c sockproxy_qsbr.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c sockproxy_qsbr.c log.c -I. -lpthread
 
 # The relay shards wait with epoll: dispatch contract + per-event cost vs idle fds.
-test_notify_epoll: test_notify_epoll.c notify.c log.c notify.h
-	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c log.c -I. -lpthread
+test_notify_epoll: test_notify_epoll.c notify.c sockproxy_qsbr.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_epoll.c notify.c sockproxy_qsbr.c log.c -I. -lpthread
 
 # Notifier throughput vs relay worker count (sizing LLB_PROXY_WORKERS); not a test.
-bench_notify_scale: bench_notify_scale.c notify.c log.c notify.h
-	$(CC) -O2 -Wall -Wextra -Werror -o $@ bench_notify_scale.c notify.c log.c -I. -lpthread
+bench_notify_scale: bench_notify_scale.c notify.c sockproxy_qsbr.c log.c notify.h
+	$(CC) -O2 -Wall -Wextra -Werror -o $@ bench_notify_scale.c notify.c sockproxy_qsbr.c log.c -I. -lpthread
 
 .PHONY: test_shard
 test_shard: test_notify_shard test_notify_epoll
@@ -867,7 +1197,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin
+	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
@@ -918,3 +1248,46 @@ test_cb_tsan:
 
 test_cb_mutation:
 	CC="$(CC)" python3 test_sockproxy_cb_concurrent.py --mutation-check
+
+# I18: only reservation/admission lifecycle regression, not the full C suite.
+.PHONY: test_i18
+test_i18: test_pd_reservation test_pd_admission test_pd_queue_generation test_pd_retry_lifecycle
+	./test_pd_reservation
+	./test_pd_retry_lifecycle
+	./test_pd_queue_generation
+	./test_pd_admission
+
+# GC fixture objects omit ASan global registration so unrelated dialect tables
+# do not retain the whole gateway. Heap/stack ASan and UBSan remain enabled.
+PD_RESV_TEST_FLAGS = $(CFLAGS) -g -fsanitize=address,undefined -fno-omit-frame-pointer --param asan-globals=0 -ffunction-sections -fdata-sections
+PD_RESV_TEST_OBJS = pd_resv_core_test.o pd_resv_http_test.o pd_resv_sg_test.o
+
+test_pd_reservation: test_pd_reservation.c $(PD_RESV_TEST_OBJS) sockproxy_pd_trie.c sockproxy_pd_terminal.c sockproxy_locktrace.c log.c
+	$(CC) $(PD_RESV_TEST_FLAGS) -Wl,--gc-sections -o $@ $^ -I. -lpthread -lnghttp2 -lssl -lcrypto
+
+pd_resv_core_test.o: sockproxy_pd.c sockproxy.h sockproxy_pd_reservation.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+pd_resv_http_test.o: sockproxy_http.c sockproxy.h sockproxy_pd_reservation.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+pd_resv_sg_test.o: sockproxy_pd_sglang.c sockproxy.h sockproxy_pd_reservation.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+
+# Header dependencies keep incremental builds from using the old reservation ABI.
+sockproxy_ep.o sockproxy_http.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd.o: sockproxy_pd_reservation.h
+
+test_pd_queue_generation: test_pd_queue_generation.c notify.c notify.h log.c sockproxy_qsbr.c
+	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -g -DNOTIFY_TEST -o $@ $< notify.c log.c sockproxy_qsbr.c -I. -lpthread
+
+# Deferred retry lifecycle: real production TUs, controlled service boundaries.
+pd_resv_vllm_test.o: sockproxy_pd_vllm.c sockproxy.h sockproxy_pd_reservation.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+
+PD_RETRY_WRAPS = -Wl,--wrap=malloc,--wrap=calloc,--wrap=write,--wrap=proxy_fdlist_link,--wrap=pd_resp_parser_init,--wrap=handle_on_message_complete
+test_pd_retry_lifecycle: test_pd_retry_lifecycle.c $(PD_RESV_TEST_OBJS) pd_resv_vllm_test.o pd_resv_dialect_test.o pd_resv_trt_test.o sockproxy_pd_trie.c sockproxy_pd_terminal.c sockproxy_locktrace.c log.c llhttp.c httpapi.c http.c
+	$(CC) $(PD_RESV_TEST_FLAGS) -Wl,--gc-sections $(PD_RETRY_WRAPS) -o $@ $^ -I. -lpthread -lnghttp2 -lssl -lcrypto
+
+pd_resv_dialect_test.o: sockproxy_pd_core.c sockproxy.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+
+pd_resv_trt_test.o: sockproxy_pd_trtllm.c sockproxy.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<

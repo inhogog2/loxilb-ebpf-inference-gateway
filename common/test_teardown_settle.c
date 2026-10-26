@@ -39,7 +39,9 @@ static int checks   = 0;
  * The PRE-FIX rule: every settle block in proxy_pdestroy was guarded by
  * `!is_listener`, so a listener teardown settled nothing at all, and no
  * shape ended a stream that was still open, so a client reset mid-stream
- * left the active-streams gauge counting it.
+ * left the active-streams gauge counting it, and a request its client left
+ * before any answer (P/D first, then any request on a rule that is not P/D)
+ * was owed no record at all.
  */
 static int
 prefix_owes_settle(int shape, const teardown_conn_t *c)
@@ -47,6 +49,8 @@ prefix_owes_settle(int shape, const teardown_conn_t *c)
   teardown_conn_t pre = *c;
 
   pre.sse_active = 0;              /* <- an open stream was never ended */
+  pre.pd_in_flight = 0;            /* <- a request left before its answer */
+  pre.req_framed = 0;              /* <- ... on a rule that is not P/D */
   if (shape == TEARDOWN_LISTENER)
     return 0;                      /* <- the defect */
   return teardown_conn_owes_settle(shape, &pre);
@@ -171,6 +175,55 @@ main(void)
       .sse_active = 1,
   };
 
+  /* A P/D request its client left in the prefill: no status was sent,
+   * nothing recorded it, no claim is held. Its abort record is owed. */
+  teardown_conn_t pd_left = {
+      .odir = 0, .ai_gw_mode = 1, .usage_reserved_toks = 0,
+      .usage_consumed = 0, .has_tenant = 1, .has_h2_session = 0,
+      .metric_ai_recorded = 0, .metric_response_status = 0,
+      .pd_in_flight = 1, .pd_rule = 1, .req_framed = 1,
+  };
+
+  /* The same request a reaper already answered and recorded (504). */
+  teardown_conn_t pd_left_recorded = pd_left;
+  pd_left_recorded.metric_ai_recorded = 1;
+  pd_left_recorded.metric_response_status = 504;
+  pd_left_recorded.usage_consumed = 1;
+
+  /* A whole request on a rule that is not P/D, its client gone before any
+   * answer: owed its abort record (the request record alone; no lifecycle
+   * family pairs with it). */
+  teardown_conn_t plain_left = {
+      .odir = 0, .ai_gw_mode = 1, .usage_reserved_toks = 0,
+      .usage_consumed = 0, .has_tenant = 1, .has_h2_session = 0,
+      .metric_ai_recorded = 0, .metric_response_status = 0,
+      .req_framed = 1,
+  };
+
+  /* The same connection with no whole request yet (still being read, or
+   * idle): nothing to record. */
+  teardown_conn_t plain_unread = plain_left;
+  plain_unread.req_framed = 0;
+
+  /* A P/D rule's whole request outside its prefill and decode (at the gate,
+   * queued, parked), its client gone: owed both records, aborted (9) at the
+   * lifecycle. */
+  teardown_conn_t pd_parked = pd_left;
+  pd_parked.pd_in_flight = 0;
+
+  /* The same, with no whole request yet: nothing. */
+  teardown_conn_t pd_unread = pd_parked;
+  pd_unread.req_framed = 0;
+
+  /* A half-close hold the gateway ended: its end, not the client's. */
+  teardown_conn_t plain_hold_expired = plain_left;
+  plain_hold_expired.hold_gw_ended = 1;
+
+  /* Its answers paired to the kernel (sockmap response): the status never
+   * reaches userspace, so status 0 is no proof the answer did not come. */
+  teardown_conn_t plain_resp_kernel = plain_left;
+  plain_resp_kernel.resp_kernel = 1;
+
   printf("teardown: the shape decides the walk set, not the settle\n");
 
   printf("\n TEARDOWN_CONN - the shape that always worked:\n");
@@ -184,6 +237,14 @@ main(void)
   check("admitted with no tenant", TEARDOWN_CONN, &no_tenant,   0, 0);
   check("stream still open",       TEARDOWN_CONN, &stream_open, 1, 1);
   check("stream open, backend leg",TEARDOWN_CONN, &stream_open_backend, 0, 0);
+  check("P/D left before its answer", TEARDOWN_CONN, &pd_left,  1, 1);
+  check("P/D left, already recorded", TEARDOWN_CONN, &pd_left_recorded, 0, 0);
+  check("not P/D, left before its answer", TEARDOWN_CONN, &plain_left, 1, 1);
+  check("not P/D, no whole request", TEARDOWN_CONN, &plain_unread, 0, 0);
+  check("P/D rule, parked or queued", TEARDOWN_CONN, &pd_parked, 1, 1);
+  check("P/D rule, no whole request", TEARDOWN_CONN, &pd_unread,  0, 0);
+  check("not P/D, hold the gateway ended", TEARDOWN_CONN, &plain_hold_expired, 0, 0);
+  check("not P/D, answers by the kernel", TEARDOWN_CONN, &plain_resp_kernel, 0, 0);
 
   printf("\n TEARDOWN_LISTENER - the same connections, rule going away:\n");
   check("h1 unspent claim",        TEARDOWN_LISTENER, &h1_claim,    1, 1);
@@ -199,6 +260,52 @@ main(void)
   check("admitted with no tenant", TEARDOWN_LISTENER, &no_tenant,   0, 0);
   check("stream still open",       TEARDOWN_LISTENER, &stream_open, 1, 1);
   check("stream open, backend leg",TEARDOWN_LISTENER, &stream_open_backend, 0, 0);
+  check("P/D left before its answer", TEARDOWN_LISTENER, &pd_left,  1, 1);
+  check("P/D left, already recorded", TEARDOWN_LISTENER, &pd_left_recorded, 0, 0);
+  check("not P/D, left before its answer", TEARDOWN_LISTENER, &plain_left, 1, 1);
+  check("not P/D, no whole request", TEARDOWN_LISTENER, &plain_unread, 0, 0);
+
+  printf("\n the abort record is owed only before any answer, on the client:\n");
+  {
+    teardown_conn_t answered = pd_left, leg = pd_left, h2 = pd_left;
+    teardown_conn_t p_answered = plain_left, p_leg = plain_left, p_h2 = plain_left;
+    teardown_conn_t p_recorded = plain_left, p_not_ai = plain_left;
+    answered.metric_response_status = 200;
+    leg.odir = 1;
+    h2.has_h2_session = 1;
+    p_answered.metric_response_status = 502;
+    p_leg.odir = 1;
+    p_h2.has_h2_session = 1;
+    p_recorded.metric_ai_recorded = 1;
+    p_not_ai.ai_gw_mode = 0;
+    checks++;
+    if (!teardown_owes_abort_record(&pd_left) || teardown_owes_abort_record(&answered) ||
+        teardown_owes_abort_record(&leg) || teardown_owes_abort_record(&h2) ||
+        !teardown_owes_abort_record(&pd_parked) || teardown_owes_abort_record(&pd_unread) ||
+        teardown_owes_abort_record(&pd_left_recorded)) {
+      printf("  [FAIL] teardown_owes_abort_record: on a P/D rule, owed in flight or once the "
+             "request is whole (gate, queue, park), no status, nothing recorded, HTTP/1.1\n");
+      failures++;
+    } else {
+      printf("  [ok]   P/D rule: owed in flight and at the gate, queued or parked, with no "
+             "status; not with a status, on a leg, on HTTP/2, before the request is whole, "
+             "or once recorded\n");
+    }
+    checks++;
+    if (!teardown_owes_abort_record(&plain_left) || teardown_owes_abort_record(&p_answered) ||
+        teardown_owes_abort_record(&p_leg) || teardown_owes_abort_record(&p_h2) ||
+        teardown_owes_abort_record(&p_recorded) || teardown_owes_abort_record(&p_not_ai) ||
+        teardown_owes_abort_record(&plain_unread) ||
+        teardown_owes_abort_record(&plain_hold_expired)) {
+      printf("  [FAIL] teardown_owes_abort_record: off P/D, owed only for a whole request "
+             "with no status, nothing recorded, AI gateway, HTTP/1.1, no gateway-ended hold\n");
+      failures++;
+    } else {
+      printf("  [ok]   off P/D: owed for a whole request with no status; not with a status, "
+             "on a leg, on HTTP/2, once recorded, off the AI gateway, before the request "
+             "is whole, or after the gateway ended its hold\n");
+    }
+  }
 
   printf("\n the walk set is the shape's ONLY business:\n");
   checks++;

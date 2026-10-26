@@ -51,6 +51,15 @@ typedef struct {
   int metric_ai_recorded;
   int metric_response_status;
   int sse_active;              /* a stream was started and never ended */
+  int pd_in_flight;            /* a P/D request still in its prefill or decode
+                                * (pd_reap_error_phase(pd_phase) >= 0) */
+  int pd_rule;                 /* the connection's rule is P/D */
+  int req_framed;              /* a whole request reached the gate on this
+                                * connection (metric_req_start_ns > 0) */
+  int hold_gw_ended;           /* a half-close hold the gateway ended (it
+                                * expired, or an operator released it) */
+  int resp_kernel;             /* the connection's answers go by the kernel
+                                * (sockmap response pairing): no status is seen */
 } teardown_conn_t;
 
 /* 2xx, matching proxy_status_is_2xx. Restated rather than included so this
@@ -86,6 +95,46 @@ teardown_owes_completion(const teardown_conn_t *c)
 {
   return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
          c->metric_response_status != 0;
+}
+
+/*
+ * A request that ended before any answer: no status was sent, nothing
+ * recorded it. Its record is owed here, status 0, named by how it ended
+ * (sockproxy_end_cause.h): the client leaving (client_abort_before_answer,
+ * cause client), or, off P/D, the backend leg ending under it (backend_died,
+ * cause engine).
+ *
+ * Owed by a P/D request in its prefill or decode, and by any request once it
+ * is whole at the gate: still at the gate, queued, parked. On a P/D rule the
+ * client leaving owes the P/D lifecycle's aborted (9) beside it, at any of
+ * those stages: the model is known from the gate, so the lifecycle record
+ * has what it needs, and a client giving up while parked is the signal that
+ * the queue is too long.
+ *
+ * Nothing in the status-0 test can be another request's: every answer, the
+ * backend's or the gateway's own, sets the status through the one latch, and
+ * a refusal, a reaper's answer, a park timeout and a prefill failure all send
+ * one. A request still being read never reached the gate, and the next one on
+ * a keep-alive connection re-arms only when it is whole. A hold the gateway
+ * ended (expired, released) is the gateway's end, not the client's: not this
+ * record. HTTP/2 is not walked for it (#415).
+ *
+ * A connection whose answers go by the kernel (sockmap response pairing, an
+ * api_key_auth rule's response-only mode) never shows userspace a status, so
+ * status 0 there proves nothing: an answered request would read as one that
+ * ended before any answer. Not recorded, as its answers are not.
+ */
+static inline int
+teardown_owes_abort_record(const teardown_conn_t *c)
+{
+  if (!c || c->odir != 0 || !c->ai_gw_mode || c->metric_ai_recorded ||
+      c->metric_response_status != 0 || c->has_h2_session || c->resp_kernel) {
+    return 0;
+  }
+  if (c->pd_rule && c->pd_in_flight) {
+    return 1;
+  }
+  return c->req_framed && !c->hold_gw_ended;
 }
 
 /*
@@ -157,7 +206,7 @@ teardown_conn_owes_settle(int shape, const teardown_conn_t *c)
 {
   (void)shape;   /* the shape decides the walk set, never the settle */
   return teardown_owes_resv_rel(c) || teardown_owes_completion(c) ||
-         teardown_owes_usage_missing(c) ||
+         teardown_owes_abort_record(c) || teardown_owes_usage_missing(c) ||
          teardown_owes_h2_collect(c) || teardown_owes_stream_end(c);
 }
 

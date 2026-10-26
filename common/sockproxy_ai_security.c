@@ -49,6 +49,7 @@ size_t
 ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
                                 nghttp2_nv *output, size_t output_cap,
                                 uint8_t policy, int jwt_capable,
+                                int strip_xauth_all,
                                 int strip_authz, int fwd_identity,
                                 const char *tenant, const char *user)
 {
@@ -70,6 +71,13 @@ ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
         (nv_name_is(nv, "x-auth-tenant", sizeof("x-auth-tenant") - 1) ||
          nv_name_is(nv, "x-auth-user", sizeof("x-auth-user") - 1)))
       continue;
+    /* A service with a network-identity binding that forwards identity
+     * owns the whole family: no client-sent X-Auth-* reaches its backend,
+     * whatever the member is called and whatever the rule's auth type. */
+    if (strip_xauth_all && nv->namelen >= sizeof("x-auth-") - 1 &&
+        strncasecmp((const char *)nv->name, "x-auth-",
+                    sizeof("x-auth-") - 1) == 0)
+      continue;
     /* Authorization is stripped only when the JWT arm decided this request
      * and the profile did not opt into passthrough: the gateway consumed
      * that credential, and replaying an access token hands every backend
@@ -85,7 +93,7 @@ ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
   /* Inject the VERIFIED identity (forward_identity profiles). The values
    * point at caller-owned storage — the stream's identity fields — which
    * outlives the submit; nghttp2 copies at submit time. */
-  if (jwt_capable && fwd_identity && tenant && tenant[0]) {
+  if ((jwt_capable || strip_xauth_all) && fwd_identity && tenant && tenant[0]) {
     if (written < output_cap) {
       output[written].name = (uint8_t *)"x-auth-tenant";
       output[written].value = (uint8_t *)tenant;
@@ -108,11 +116,38 @@ ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
 }
 
 size_t
+ai_security_h2_drop_native_priority(const nghttp2_nv *input, size_t input_len,
+                                    nghttp2_nv *output, size_t output_cap,
+                                    int *dropped)
+{
+  size_t written = 0;
+
+  if (dropped)
+    *dropped = 0;
+  if (!input || !output)
+    return 0;
+  for (size_t i = 0; i < input_len; i++) {
+    const nghttp2_nv *nv = &input[i];
+    /* The client's copy of the engine's priority header: the tenant band
+     * decides the order (sockproxy_native_prio.h has why). */
+    if (nv_name_is(nv, "x-vllm-priority", sizeof("x-vllm-priority") - 1)) {
+      if (dropped)
+        *dropped = 1;
+      continue;
+    }
+    if (written >= output_cap)
+      break;
+    output[written++] = *nv;
+  }
+  return written;
+}
+
+size_t
 ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                               nghttp2_nv *output, size_t output_cap,
                               uint8_t policy)
 {
   /* Legacy shape: the credential strip alone, no JWT hygiene. */
   return ai_security_h2_upstream_hygiene(input, input_len, output, output_cap,
-                                         policy, 0, 0, 0, NULL, NULL);
+                                         policy, 0, 0, 0, 0, NULL, NULL);
 }

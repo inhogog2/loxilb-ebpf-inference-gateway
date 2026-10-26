@@ -29,23 +29,121 @@
 #include "log.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_json.h"
+#include "sockproxy_ai_gw.h"   /* AI_TIER_* */
 #include "sockproxy_json_unescape.h"
 
 // ============================================================================
 // P0.2: JSON Prefix Extraction Functions
 // ============================================================================
-// Helper: Compare JSON token with string
+/* json_str_eq: does the RAW JSON string span [raw, raw + rawlen) -- the
+ * bytes between the quotes, escapes still present -- spell s? The span is
+ * compared DECODED, byte for byte against s: "service\u005ftier" is
+ * "service_tier" and "priorit\u0079" is "priority", as every JSON parser
+ * downstream reads them, so a spelling the gateway did not read can never
+ * reach an engine that does. A span with no escape compares as it is. An
+ * escape that is not JSON (a bad \u, a lone surrogate, an unknown letter)
+ * spells nothing: the body is not JSON then, and the parser downstream
+ * refuses it. Every key and every tier value the extractors below compare
+ * goes through here. */
+static int
+json_str_eq(const char *raw, size_t rawlen, const char *s, size_t slen)
+{
+  size_t ri = 0, si = 0;
+
+  if (!raw || !s)
+    return 0;
+  if (!memchr(raw, '\\', rawlen))
+    return rawlen == slen && memcmp(raw, s, slen) == 0;
+  while (ri < rawlen) {
+    unsigned char c = (unsigned char)raw[ri];
+    char dec[4];
+    size_t n = 1;
+
+    if (c != '\\') {
+      dec[0] = (char)c;
+      ri++;
+    } else {
+      if (ri + 1 >= rawlen)
+        return 0;
+      switch (raw[ri + 1]) {
+      case '"':  dec[0] = '"';  break;
+      case '\\': dec[0] = '\\'; break;
+      case '/':  dec[0] = '/';  break;
+      case 'b':  dec[0] = '\b'; break;
+      case 'f':  dec[0] = '\f'; break;
+      case 'n':  dec[0] = '\n'; break;
+      case 'r':  dec[0] = '\r'; break;
+      case 't':  dec[0] = '\t'; break;
+      case 'u': {
+        uint32_t cp;
+
+        if (ri + 6 > rawlen || kv_json__hex4(raw + ri + 2, &cp) != 0)
+          return 0;
+        ri += 6;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          uint32_t lo;
+
+          if (ri + 6 > rawlen || raw[ri] != '\\' || raw[ri + 1] != 'u' ||
+              kv_json__hex4(raw + ri + 2, &lo) != 0 ||
+              lo < 0xDC00 || lo > 0xDFFF)
+            return 0;
+          cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+          ri += 6;
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          return 0;
+        }
+        n = (size_t)kv_json__utf8_len(cp);
+        if (n == 0)
+          return 0;
+        (void)kv_json__utf8_emit(cp, dec);
+        goto compare;
+      }
+      default:
+        return 0;
+      }
+      ri += 2;
+    }
+compare:
+    if (si + n > slen || memcmp(dec, s + si, n) != 0)
+      return 0;
+    si += n;
+  }
+  return si == slen;
+}
+
+// Helper: Compare JSON token with string (decoded: an escaped spelling of
+// the key is the key, json_str_eq)
 static int jsoneq(const char *json, jsmntok_t *tok, const char *s)
 {
-  if (tok->type == JSMN_STRING && 
-      (int)strlen(s) == tok->end - tok->start &&
-      strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+  if (tok->type == JSMN_STRING &&
+      json_str_eq(json + tok->start, (size_t)(tok->end - tok->start),
+                  s, strlen(s))) {
     return 0;
   }
   return -1;
 }
 
-// Extract string value from token
+// Extract string value from token, DECODED: the escapes resolved as every
+// JSON parser downstream resolves them, so "m\u0031" is the model m1 that
+// the engine will serve and that allowed_models binds to, and an escaped
+// user id is the same session as its literal spelling. Bounded by out_size,
+// never ends mid-escape or mid-character (kv_json_unescape_copy). An
+// invalid escape stops the copy there: the body is not JSON.
+static int json_extract_string_decoded(const char *json, jsmntok_t *tok,
+                                       char *out, size_t out_size)
+{
+  int len = tok->end - tok->start;
+
+  if (!out || out_size == 0) return -1;
+  out[0] = '\0';
+  if (len > 0)
+    kv_json_unescape_copy(json + tok->start, (size_t)len, out, out_size);
+  return 0;
+}
+
+// Extract string value from token, RAW (the bytes as written, escapes kept).
+// The KV prefix extractor below copies its hash inputs this way; see the
+// note on the chat content there.
 static int json_extract_string(const char *json, jsmntok_t *tok, 
                                 char *out, size_t out_size)
 {
@@ -421,7 +519,7 @@ extract_user_id(const char *body, size_t len, char *out, size_t cap)
     if (tokens[i].type == JSMN_STRING &&
         jsoneq(body, &tokens[i], "user") == 0 &&
         tokens[i + 1].type == JSMN_STRING) {
-      json_extract_string(body, &tokens[i + 1], out, cap);
+      json_extract_string_decoded(body, &tokens[i + 1], out, cap);
       return (out[0] != '\0') ? 0 : -1;
     }
     /* Skip the key token (always 1) then skip the entire value subtree. */
@@ -455,7 +553,7 @@ extract_model_field(const char *body, size_t len, char *out, size_t cap)
     if (tokens[i].type == JSMN_STRING &&
         jsoneq(body, &tokens[i], "model") == 0 &&
         tokens[i + 1].type == JSMN_STRING) {
-      json_extract_string(body, &tokens[i + 1], out, cap);
+      json_extract_string_decoded(body, &tokens[i + 1], out, cap);
       return (out[0] != '\0') ? 0 : -1;
     }
     /* Skip the key token (always 1) then skip the entire value subtree. */
@@ -616,25 +714,33 @@ json_value_extent(const char *vs, const char *end)
   }
 }
 
-/* Locate the value of a DIRECT (depth-1) key of a JSON object with a single
- * string- and escape-aware depth walk. No token pool: unlike the jsmn-based
- * extractors above this handles bodies of any size, and like them it can
- * never be spoofed by key-shaped text inside string values (quotes there
- * are escaped) or inside nested objects (depth != 1).
- * Returns 0 with [*val_start, *val_end) set; -1 when the key is absent
- * (*root_close then points at the object's closing brace); -2 when the
- * input is not a complete JSON object. */
+/* Walk the DIRECT (depth-1) keys of a JSON object with a single string- and
+ * escape-aware depth walk, and hand the value of every occurrence of key to
+ * visit, in order. No token pool: unlike the jsmn-based extractors above
+ * this handles bodies of any size, and like them it can never be spoofed by
+ * key-shaped text inside string values (quotes there are escaped) or inside
+ * nested objects (depth != 1). Keys are compared decoded (json_str_eq): an
+ * escaped spelling of the key is the key, as every parser downstream reads
+ * it.
+ * visit is handed the raw bytes of the key between its quotes, [ks, ke),
+ * and the value, [vs, ve). It returns 0 to stop the walk there, non-zero
+ * to go on; it may rewrite the bytes of either span it was handed, as long
+ * as what it leaves is a key or a value of the same extent with no quote,
+ * brace, bracket or backslash in it.
+ * Returns 0 when visit stopped the walk; -1 when the object ended (*root_close
+ * then points at its closing brace); -2 when the input is not a complete
+ * JSON object. */
+typedef int (*json_top_visit_fn)(const char *ks, const char *ke,
+                                 const char *vs, const char *ve, void *ctx);
+
 static int
-json_top_find(const char *body, size_t len, const char *key, size_t klen,
-              const char **val_start, const char **val_end,
-              const char **root_close)
+json_top_walk(const char *body, size_t len, const char *key, size_t klen,
+              json_top_visit_fn visit, void *ctx, const char **root_close)
 {
   const char *p = body, *end = body + len;
-  const char *str_start = NULL;
+  const char *str_start = NULL, *key_s = NULL, *key_e = NULL;
   int depth = 0, instr = 0, esc = 0, expect_value = 0, key_matched = 0;
 
-  if (val_start) *val_start = NULL;
-  if (val_end) *val_end = NULL;
   if (root_close) *root_close = NULL;
   if (!body || len == 0)
     return -2;
@@ -652,8 +758,10 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
       if (c == '"') {
         instr = 0;
         if (depth == 1 && !expect_value) {
-          key_matched = ((size_t)(p - str_start) == klen &&
-                         memcmp(str_start, key, klen) == 0);
+          key_s = str_start;
+          key_e = p;
+          key_matched = json_str_eq(str_start, (size_t)(p - str_start),
+                                    key, klen);
         }
       }
       continue;
@@ -673,9 +781,9 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
         ve = json_value_extent(vs, end);
         if (!ve)
           return -2;
-        if (val_start) *val_start = vs;
-        if (val_end) *val_end = ve;
-        return 0;
+        if (!visit(key_s, key_e, vs, ve, ctx))
+          return 0;
+        key_matched = 0;
       }
       if (depth == 1)
         expect_value = 1;
@@ -703,6 +811,51 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
     }
   }
   return -2;
+}
+
+typedef struct {
+  const char *vs, *ve;
+} json_top_span_t;
+
+static int
+json_top_first(const char *ks, const char *ke, const char *vs, const char *ve,
+               void *ctx)
+{
+  json_top_span_t *sp = ctx;
+  (void)ks;
+  (void)ke;
+  sp->vs = vs;
+  sp->ve = ve;
+  return 0;
+}
+
+static int
+json_top_last(const char *ks, const char *ke, const char *vs, const char *ve,
+              void *ctx)
+{
+  json_top_span_t *sp = ctx;
+  (void)ks;
+  (void)ke;
+  sp->vs = vs;
+  sp->ve = ve;
+  return 1;
+}
+
+/* Locate the value of the first occurrence of a direct key (json_top_walk).
+ * Returns 0 with [*val_start, *val_end) set; -1 when the key is absent
+ * (*root_close then points at the object's closing brace); -2 when the
+ * input is not a complete JSON object. */
+static int
+json_top_find(const char *body, size_t len, const char *key, size_t klen,
+              const char **val_start, const char **val_end,
+              const char **root_close)
+{
+  json_top_span_t sp = { NULL, NULL };
+  int rc = json_top_walk(body, len, key, klen, json_top_first, &sp, root_close);
+
+  if (val_start) *val_start = rc == 0 ? sp.vs : NULL;
+  if (val_end) *val_end = rc == 0 ? sp.ve : NULL;
+  return rc;
 }
 
 int
@@ -876,13 +1029,134 @@ estimate_prompt_tokens(const char *body, size_t len)
   return (int)est;
 }
 
+// extract_service_tier reads the request's top-level "service_tier" as a
+// class hint. Only the three values that name a tier are a hint; "auto",
+// "default", "scale" and anything that is not a string are none. With the
+// key more than once, the last occurrence is the one read. Key and value
+// are compared decoded (json_str_eq): "service\u005ftier":"priorit\u0079"
+// is the priority hint, as the engine would read it.
+int
+extract_service_tier(const char *body, size_t len, size_t *off, size_t *vlen)
+{
+  const char *vs = NULL, *ve = NULL;
+  size_t n;
+  int tier = AI_TIER_NONE;
+
+  if (off) *off = 0;
+  if (vlen) *vlen = 0;
+  {
+    /* The last occurrence decides: a JSON parser that keeps the last of
+     * duplicate keys, as the engines' do, reads that one. */
+    json_top_span_t sp = { NULL, NULL };
+    if (json_top_walk(body, len, "service_tier", 12, json_top_last, &sp, NULL) != -1 ||
+        !sp.vs)
+      return AI_TIER_NONE;
+    vs = sp.vs;
+    ve = sp.ve;
+  }
+  if (!vs || !ve || ve <= vs + 2 || *vs != '"' || ve[-1] != '"')
+    return AI_TIER_NONE;
+  n = (size_t)(ve - vs) - 2;
+  if (json_str_eq(vs + 1, n, "flex", 4))
+    tier = AI_TIER_FLEX;
+  else if (json_str_eq(vs + 1, n, "priority", 8))
+    tier = AI_TIER_PRIORITY;
+  else if (json_str_eq(vs + 1, n, "fast", 4))
+    tier = AI_TIER_FAST;
+  if (tier != AI_TIER_NONE) {
+    if (off) *off = (size_t)(vs - body);
+    if (vlen) *vlen = (size_t)(ve - vs);
+  }
+  return tier;
+}
+
+void
+json_null_value(char *body, size_t body_len, size_t off, size_t vlen)
+{
+  if (!body || vlen < 4 || off > body_len || vlen > body_len - off)
+    return;
+  memcpy(body + off, "null", 4);
+  memset(body + off + 4, ' ', vlen - 4);
+}
+
+static int
+json_top_null(const char *ks, const char *ke, const char *vs, const char *ve,
+              void *ctx)
+{
+  int *n = ctx;
+  size_t vlen = (size_t)(ve - vs);
+
+  (void)ks;
+  (void)ke;
+  /* Shorter than "null" cannot be overwritten in place; it cannot name a
+   * tier either. */
+  if (vlen >= 4) {
+    memcpy((char *)(uintptr_t)vs, "null", 4);
+    memset((char *)(uintptr_t)vs + 4, ' ', vlen - 4);
+    (*n)++;
+  }
+  return 1;
+}
+
+int
+json_null_top_key(char *body, size_t body_len, const char *key, size_t klen)
+{
+  int n = 0;
+
+  if (!body || !key)
+    return 0;
+  (void)json_top_walk(body, body_len, key, klen, json_top_null, &n, NULL);
+  return n;
+}
+
+typedef struct {
+  const char *to;
+  size_t tolen;
+  int n;
+} json_top_rename_t;
+
+static int
+json_top_rename(const char *ks, const char *ke, const char *vs, const char *ve,
+                void *ctx)
+{
+  json_top_rename_t *r = ctx;
+  size_t klen = (size_t)(ke - ks);
+
+  (void)vs;
+  (void)ve;
+  /* The raw spelling is never shorter than the name it spells (an escape
+   * is longer than the byte it encodes), so a name of the same length as
+   * the decoded key always fits; the bytes past it, if any, were an
+   * escape, and become underscores: a plain name of the same extent. */
+  if (ks && klen >= r->tolen) {
+    memcpy((char *)(uintptr_t)ks, r->to, r->tolen);
+    memset((char *)(uintptr_t)ks + r->tolen, '_', klen - r->tolen);
+    r->n++;
+  }
+  return 1;
+}
+
+int
+json_rename_top_key(char *body, size_t body_len, const char *key, size_t klen,
+                    const char *to, size_t tolen)
+{
+  json_top_rename_t r = { to, tolen, 0 };
+
+  if (!body || !key || !to || tolen == 0 || tolen > klen)
+    return 0;
+  (void)json_top_walk(body, body_len, key, klen, json_top_rename, &r, NULL);
+  return r.n;
+}
+
+
 // AI Gateway pre-admission: read the request's declared completion ceiling.
 // max_completion_tokens (the current OpenAI chat name) wins over the legacy
 // max_tokens when both are present. Only a plain non-negative top-level
 // number counts — a negative value (llama.cpp uses -1 for "unlimited"), a
 // string, or a nested/spoofed occurrence reads as undeclared. Returns the
 // ceiling, or 0 when the request declares none: an undeclared ceiling
-// cannot be guessed, so the caller reserves the prompt estimate alone.
+// cannot be guessed, so the caller reserves the prompt estimate alone, or
+// with it the rule's default reservation when one is configured.
 int
 extract_max_tokens(const char *body, size_t len)
 {

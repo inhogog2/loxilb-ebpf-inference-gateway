@@ -449,6 +449,11 @@ main(void)
       { "mt-negative-unlimited", "{\"max_tokens\":-1}", 0 },
       { "mt-string-value", "{\"max_tokens\":\"256\"}", 0 },
       { "mt-float-value", "{\"max_tokens\":25.6}", 0 },
+      { "mt-exponent-value", "{\"max_tokens\":1e3}", 0 },
+      { "mt-object-value", "{\"max_tokens\":{\"n\":256}}", 0 },
+      { "mt-array-value", "{\"max_tokens\":[256]}", 0 },
+      { "mt-null-value", "{\"max_tokens\":null}", 0 },
+      { "mt-explicit-zero", "{\"max_tokens\":0}", 0 },
       { "mt-nested-spoof",
         "{\"opts\":{\"max_tokens\":512},\"stream\":true}", 0 },
       { "mt-string-embedded-spoof",
@@ -468,6 +473,228 @@ main(void)
         g_fails++;
       } else {
         printf("ok   %-38s max=%d\n", mt_vecs[vi].name, got);
+      }
+    }
+  }
+
+  /* The body's service_tier as a class hint, and its overwrite with null:
+   * where the value is, that the document keeps its length and every other
+   * byte, and what is not a hint. */
+  {
+    static const struct {
+      const char *name; const char *body; int want; const char *after;
+    } st_vecs[] = {
+      { "tier-flex", "{\"model\":\"m\",\"service_tier\":\"flex\"}", AI_TIER_FLEX,
+        "{\"model\":\"m\",\"service_tier\":null  }" },
+      /* The fast path, each side: a key and a value with no escape in them
+       * compare as bytes (json_str_eq's memchr, then memcmp), and a byte
+       * that differs is a miss on that path too. */
+      { "tier-plain-key-fast-path", "{\"service_tier\":\"priority\"}", AI_TIER_PRIORITY,
+        "{\"service_tier\":null      }" },
+      { "tier-plain-key-fast-path-miss", "{\"service_tiers\":\"priority\"}", AI_TIER_NONE, NULL },
+      { "tier-plain-value-fast-path-miss", "{\"service_tier\":\"priorities\"}", AI_TIER_NONE, NULL },
+      { "tier-priority-first-key", "{\"service_tier\":\"priority\",\"n\":1}", AI_TIER_PRIORITY,
+        "{\"service_tier\":null      ,\"n\":1}" },
+      { "tier-fast-whitespace", "{\"service_tier\" :\t \"fast\" ,\"n\":1}", AI_TIER_FAST,
+        "{\"service_tier\" :\t null   ,\"n\":1}" },
+      { "tier-auto-is-no-hint", "{\"service_tier\":\"auto\"}", AI_TIER_NONE, NULL },
+      { "tier-default-is-no-hint", "{\"service_tier\":\"default\"}", AI_TIER_NONE, NULL },
+      { "tier-case-differs", "{\"service_tier\":\"Flex\"}", AI_TIER_NONE, NULL },
+      { "tier-number", "{\"service_tier\":1}", AI_TIER_NONE, NULL },
+      { "tier-null", "{\"service_tier\":null}", AI_TIER_NONE, NULL },
+      { "tier-empty-string", "{\"service_tier\":\"\"}", AI_TIER_NONE, NULL },
+      { "tier-nested", "{\"opts\":{\"service_tier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      /* A nested key after a comma of its own object: the walk keeps the
+       * depth, not only the key / value alternation. */
+      { "tier-nested-after-a-comma", "{\"opts\":{\"a\":1,\"service_tier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      { "tier-nested-after-a-comma-left", "{\"opts\":{\"a\":1,\"service_tier\":\"fast\"},\"service_tier\":\"flex\"}",
+        AI_TIER_FLEX, "{\"opts\":{\"a\":1,\"service_tier\":\"fast\"},\"service_tier\":null  }" },
+      { "tier-in-a-message", "{\"messages\":[{\"content\":\"\\\"service_tier\\\":\\\"flex\\\"\"}]}",
+        AI_TIER_NONE, NULL },
+      { "tier-absent", "{\"model\":\"m\"}", AI_TIER_NONE, NULL },
+      /* Duplicate keys: the last one is read, as a parser that keeps the
+       * last duplicate reads it, and every one is nulled. */
+      { "tier-dup-last-decides", "{\"service_tier\":\"flex\",\"service_tier\":\"priority\"}",
+        AI_TIER_PRIORITY, "{\"service_tier\":null  ,\"service_tier\":null      }" },
+      { "tier-dup-three-all-nulled", "{\"service_tier\":\"fast\",\"n\":{\"service_tier\":\"x\"},\"service_tier\":\"auto\",\"service_tier\":\"flex\"}",
+        AI_TIER_FLEX, "{\"service_tier\":null  ,\"n\":{\"service_tier\":\"x\"},\"service_tier\":null  ,\"service_tier\":null  }" },
+      { "tier-dup-last-no-hint", "{\"service_tier\":\"priority\",\"service_tier\":\"auto\"}", AI_TIER_NONE, NULL },
+      { "tier-dup-last-short", "{\"service_tier\":\"flex\",\"service_tier\":1}", AI_TIER_NONE, NULL },
+      /* An escaped spelling of the key is the key, as the engine's parser
+       * reads it: read, and nulled with the literal spellings. The last
+       * occurrence decides whichever spelling it has. */
+      { "tier-escaped-key-is-read", "{\"service\\u005ftier\":\"priority\"}", AI_TIER_PRIORITY,
+        "{\"service\\u005ftier\":null      }" },
+      { "tier-escaped-after-literal-decides", "{\"service_tier\":\"flex\",\"service\\u005ftier\":\"priority\"}",
+        AI_TIER_PRIORITY, "{\"service_tier\":null  ,\"service\\u005ftier\":null      }" },
+      { "tier-literal-after-escaped-decides", "{\"service\\u005ftier\":\"priority\",\"service_tier\":\"flex\"}",
+        AI_TIER_FLEX, "{\"service\\u005ftier\":null      ,\"service_tier\":null  }" },
+      { "tier-escaped-every-byte", "{\"\\u0073\\u0065\\u0072\\u0076\\u0069\\u0063\\u0065\\u005f\\u0074\\u0069\\u0065\\u0072\":\"fast\"}",
+        AI_TIER_FAST, "{\"\\u0073\\u0065\\u0072\\u0076\\u0069\\u0063\\u0065\\u005f\\u0074\\u0069\\u0065\\u0072\":null  }" },
+      { "tier-escaped-key-nested-is-not-read", "{\"opts\":{\"service\\u005ftier\":\"flex\"}}", AI_TIER_NONE, NULL },
+      /* Decoded, it is another key; or it decodes to nothing (not JSON). */
+      { "tier-escaped-other-key", "{\"service\\u005ftie\\u0072s\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-key-prefix", "{\"service\\u005ftie\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-bad-hex", "{\"service\\u005gtier\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-cut", "{\"service\\u005\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-lone-surrogate", "{\"service\\ud800tier\":\"flex\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-unknown-letter", "{\"service\\xtier\":\"flex\"}", AI_TIER_NONE, NULL },
+      /* The value is read decoded too: "priorit\u0079" names the tier. */
+      { "tier-escaped-value-is-read", "{\"service_tier\":\"priorit\\u0079\"}", AI_TIER_PRIORITY,
+        "{\"service_tier\":null           }" },
+      { "tier-escaped-value-other", "{\"service_tier\":\"flex\\u0021\"}", AI_TIER_NONE, NULL },
+      { "tier-escaped-value-not-json", "{\"service_tier\":\"fle\\q\"}", AI_TIER_NONE, NULL },
+      { "tier-garbage", "not json", AI_TIER_NONE, NULL },
+    };
+    size_t vi;
+    for (vi = 0; vi < sizeof(st_vecs) / sizeof(st_vecs[0]); vi++) {
+      size_t len = strlen(st_vecs[vi].body), off = 99, vlen = 99;
+      char *buf = malloc(len);          /* exact size: the sanitizer sees a step outside */
+      int got, ok;
+      memcpy(buf, st_vecs[vi].body, len);
+      got = extract_service_tier(buf, len, &off, &vlen);
+      ok = got == st_vecs[vi].want;
+      if (got == AI_TIER_NONE) {
+        ok = ok && off == 0 && vlen == 0 && !memcmp(buf, st_vecs[vi].body, len);
+      } else {
+        ok = ok && off + vlen <= len && buf[off] == '"' && buf[off + vlen - 1] == '"';
+        /* what the proxy does with a consumed tier */
+        ok = ok && json_null_top_key(buf, len, "service_tier", 12) > 0;
+        ok = ok && st_vecs[vi].after && strlen(st_vecs[vi].after) == len &&
+             !memcmp(buf, st_vecs[vi].after, len);
+      }
+      g_cases++;
+      if (!ok) {
+        printf("FAIL %-38s tier=%d (want %d) off=%zu vlen=%zu -> %.*s\n",
+               st_vecs[vi].name, got, st_vecs[vi].want, off, vlen, (int)len, buf);
+        g_fails++;
+      } else {
+        printf("ok   %-38s tier=%d\n", st_vecs[vi].name, got);
+      }
+      free(buf);
+    }
+    /* Every top-level occurrence is overwritten, and only those. */
+    {
+      char b[] = "{\"service_tier\":\"flex\",\"service_tier\":\"priority\",\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}],\"service\\u005ftier\":\"fast\"}";
+      const char *want = "{\"service_tier\":null  ,\"service_tier\":null      ,\"service_tier\":2,\"x\":[{\"service_tier\":\"fast\"}],\"service\\u005ftier\":null  }";
+      int n = json_null_top_key(b, strlen(b), "service_tier", 12);
+      g_cases++;
+      if (n != 3 || strcmp(b, want)) { printf("FAIL null-top-key-every-occurrence n=%d -> %s\n", n, b); g_fails++; }
+      else printf("ok   null-top-key-every-occurrence\n");
+      g_cases++;
+      if (json_null_top_key(NULL, 4, "service_tier", 12) != 0 || json_null_top_key(b, 0, "service_tier", 12) != 0) {
+        printf("FAIL null-top-key-empty\n"); g_fails++;
+      } else printf("ok   null-top-key-empty\n");
+    }
+    /* An escaped key spelling reads the same for the jsmn extractor and
+     * the walk: "mod\u0065l" is "model" to every parser downstream, so it
+     * is the model the allowlist binds to. */
+    {
+      const char *b = "{\"mod\\u0065l\":\"m1\",\"n\":1}";
+      char m1[32] = "", m2[32] = "";
+      int r1 = extract_model_field(b, strlen(b), m1, sizeof(m1));
+      int r2 = extract_model_field_prefix(b, strlen(b), m2, sizeof(m2));
+      g_cases++;
+      if (r1 != 0 || strcmp(m1, "m1") || r2 != 0 || strcmp(m2, "m1")) {
+        printf("FAIL model-escaped-key r1=%d m1=%s r2=%d m2=%s\n", r1, m1, r2, m2); g_fails++;
+      } else printf("ok   model-escaped-key\n");
+    }
+    /* An escaped model VALUE reads decoded through both extractors too: the
+     * model the allowlist binds to is the one the engine will serve, and the
+     * one the routing extractor read. */
+    {
+      const char *b = "{\"model\":\"m\\u0031\\u002dx\",\"n\":1}";
+      char m1[32] = "", m2[32] = "";
+      int r1 = extract_model_field(b, strlen(b), m1, sizeof(m1));
+      int r2 = extract_model_field_prefix(b, strlen(b), m2, sizeof(m2));
+      g_cases++;
+      if (r1 != 0 || strcmp(m1, "m1-x") || r2 != 0 || strcmp(m2, "m1-x")) {
+        printf("FAIL model-escaped-value r1=%d m1=%s r2=%d m2=%s\n", r1, m1, r2, m2); g_fails++;
+      } else printf("ok   model-escaped-value\n");
+    }
+    /* The user id (session affinity) reads decoded: one session for both spellings. */
+    {
+      const char *b1 = "{\"user\":\"alice\"}", *b2 = "{\"user\":\"alic\\u0065\"}";
+      char u1[64] = "", u2[64] = "";
+      extract_user_id(b1, strlen(b1), u1, sizeof(u1));
+      extract_user_id(b2, strlen(b2), u2, sizeof(u2));
+      g_cases++;
+      if (strcmp(u1, "alice") || strcmp(u2, "alice")) {
+        printf("FAIL user-escaped-value u1=%s u2=%s\n", u1, u2); g_fails++;
+      } else printf("ok   user-escaped-value\n");
+    }
+    /* The overwrite refuses what does not fit: nothing is written. */
+    {
+      char b[] = "0123456789";
+      json_null_value(b, 10, 8, 4);     /* runs past the end */
+      json_null_value(b, 10, 11, 4);    /* starts past the end */
+      json_null_value(b, 10, 2, 3);     /* too short for null */
+      json_null_value(NULL, 10, 0, 4);
+      g_cases++;
+      if (memcmp(b, "0123456789", 10)) { printf("FAIL null-value-bounds -> %s\n", b); g_fails++; }
+      else printf("ok   null-value-bounds\n");
+      json_null_value(b, 10, 6, 4);     /* the last four bytes: fits exactly */
+      g_cases++;
+      if (memcmp(b, "012345null", 10)) { printf("FAIL null-value-exact-fit -> %s\n", b); g_fails++; }
+      else printf("ok   null-value-exact-fit\n");
+    }
+    /* A client-supplied engine priority: the top-level key is renamed in
+     * place, at the same length, whatever its value (a number, a string, a
+     * short one, a negative one); an escaped spelling is renamed too and
+     * the bytes of its escape become underscores; a nested one (inside
+     * messages or tool arguments) is no engine field and is left as sent;
+     * the body keeps its size. */
+    {
+      static const struct { const char *name, *body, *after; int n; } rn[] = {
+        { "prio-number", "{\"model\":\"m\",\"priority\":5}", "{\"model\":\"m\",\"_gw_prio\":5}", 1 },
+        { "prio-negative", "{\"priority\":-5,\"model\":\"m\"}", "{\"_gw_prio\":-5,\"model\":\"m\"}", 1 },
+        { "prio-string", "{\"priority\":\"high\"}", "{\"_gw_prio\":\"high\"}", 1 },
+        { "prio-spaced", "{ \"priority\" : 0 , \"x\":1}", "{ \"_gw_prio\" : 0 , \"x\":1}", 1 },
+        { "prio-escaped-key", "{\"priorit\\u0079\":7}", "{\"_gw_prio_____\":7}", 1 },
+        { "prio-twice", "{\"priority\":1,\"priority\":2}", "{\"_gw_prio\":1,\"_gw_prio\":2}", 2 },
+        { "prio-nested-untouched", "{\"messages\":[{\"priority\":9,\"content\":\"priority\"}],\"tool\":{\"priority\":1}}", NULL, 0 },
+        { "prio-in-string-untouched", "{\"content\":\"\\\"priority\\\":3\"}", NULL, 0 },
+        { "prio-absent", "{\"model\":\"m\",\"max_tokens\":4}", NULL, 0 },
+        { "prio-not-json", "priority", NULL, 0 },
+      };
+      size_t ri;
+      for (ri = 0; ri < sizeof(rn) / sizeof(rn[0]); ri++) {
+        size_t len = strlen(rn[ri].body);
+        char *buf = malloc(len);          /* exact size: the sanitizer sees a step outside */
+        int n, ok;
+        memcpy(buf, rn[ri].body, len);
+        n = json_rename_top_key(buf, len, "priority", 8, "_gw_prio", 8);
+        ok = n == rn[ri].n;
+        if (rn[ri].after)
+          ok = ok && strlen(rn[ri].after) == len && !memcmp(buf, rn[ri].after, len);
+        else
+          ok = ok && !memcmp(buf, rn[ri].body, len);
+        g_cases++;
+        if (!ok) { printf("FAIL %-38s n=%d -> %.*s\n", rn[ri].name, n, (int)len, buf); g_fails++; }
+        else printf("ok   %-38s n=%d\n", rn[ri].name, n);
+        free(buf);
+      }
+      /* A name longer than the key, an empty one, no body: nothing is written. */
+      {
+        char b[] = "{\"priority\":1}";
+        g_cases++;
+        if (json_rename_top_key(b, strlen(b), "priority", 8, "a_longer_name", 13) != 0 ||
+            json_rename_top_key(b, strlen(b), "priority", 8, "", 0) != 0 ||
+            json_rename_top_key(NULL, 14, "priority", 8, "_gw_prio", 8) != 0 ||
+            json_rename_top_key(b, 0, "priority", 8, "_gw_prio", 8) != 0 ||
+            strcmp(b, "{\"priority\":1}")) {
+          printf("FAIL prio-rename-bounds -> %s\n", b); g_fails++;
+        } else printf("ok   prio-rename-bounds\n");
+      }
+      /* The tier null and the rename share one walk: both apply to one body. */
+      {
+        char b[] = "{\"service_tier\":\"flex\",\"priority\":3,\"messages\":[{\"priority\":1}]}";
+        const char *want = "{\"service_tier\":null  ,\"_gw_prio\":3,\"messages\":[{\"priority\":1}]}";
+        int a = json_null_top_key(b, strlen(b), "service_tier", 12);
+        int c = json_rename_top_key(b, strlen(b), "priority", 8, "_gw_prio", 8);
+        g_cases++;
+        if (a != 1 || c != 1 || strcmp(b, want)) { printf("FAIL prio-with-tier a=%d c=%d -> %s\n", a, c, b); g_fails++; }
+        else printf("ok   prio-with-tier\n");
       }
     }
   }

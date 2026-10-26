@@ -32,6 +32,7 @@
 #include "uthash.h"
 #include "notify.h"
 #include "sockproxy.h"
+#include "sockproxy_pd_reservation.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_h2_load.h"   /* bounded-load units follow a moved pick */
 #include "sockproxy_metrics.h"
@@ -51,6 +52,7 @@
 #define SP_MCP_PROXY_SELECTOR
 #include "sockproxy_mcp_rr.h"
 #include "sockproxy_ep.h"       /* own header */
+#include "sockproxy_ai_admit.h" /* AI_GW_STAGE_* of a local refusal */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 
 #define XXH_STATIC_LINKING_ONLY
@@ -862,6 +864,26 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
                        "no endpoint named by the endpoint picker is usable");
     return frc == EPP_STAGE_LADDER ? EPP_PIN_LADDER : EPP_PIN_ERR;
   }
+/* The model a request routes by, with or without a Host:
+ *   0. the admission gate's body-first resolution. On enforcing services this
+ *      is the model authorization was checked against; routing by anything
+ *      else re-opens the authorize-A-serve-B split the gate's conflict rule
+ *      closes.
+ *   1. the X-Model header (fast path, set during header parsing)
+ *   2. the JSON body "model" field (extract_llm_prefix)
+ *   3. "" (wildcard, backward compatible)
+ * The same value llb_ai_validate_key checks AllowedModels against. */
+static const char *
+sp_route_model(const proxy_fd_ent_t *pfe)
+{
+  if (pfe && pfe->effective_model[0] != '\0') {
+    return pfe->effective_model;
+  } else if (pfe && pfe->x_model_header[0] != '\0') {
+    return pfe->x_model_header;
+  } else if (pfe && pfe->prefix_key.model[0] != '\0') {
+    return pfe->prefix_key.model;
+  }
+  return "";
 }
 
 int
@@ -938,31 +960,44 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                   host_str ? host_str : "(null)", request_path ? request_path : "(null)");
 #endif
 #endif
+        // Criterion A/C: the model, resolved once for both branches.
+        const char *effective_model = sp_route_model(pfe);
+
         if (host_str == NULL) {
-          tepval = node->val.ephash;
+          /* No usable Host (ROUTE-01): never "the first pool" on a listener
+           * whose pools name models. After ROUTE-01's fix no HTTP request
+           * reaches here on such a listener; route_host_missing says one
+           * did. */
+          int hl = sp_route_hostless(node, effective_model, &tepval);
+
+          if (hl != SP_HOSTLESS_FIRST) {
+            atomic_fetch_add(&global_stats.route_host_missing, 1);
+          }
+          if (hl == SP_HOSTLESS_REFUSE && pfe) {
+            char response_buf[512];
+            int named = effective_model[0] != '\0';
+            const char *code = named ? "model_unavailable" : "no_route";
+
+            snprintf(response_buf, sizeof(response_buf),
+                     "HTTP/1.1 503 Service Unavailable\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Connection: close\r\n"
+                     "\r\n"
+                     "{\"error\":\"%s\",\"model\":\"%s\","
+                     "\"detail\":\"no Host, and %s\"}\r\n",
+                     code, effective_model,
+                     named ? "no backend pool for this model" : "no model to route by");
+            sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, code,
+                                  response_buf, strlen(response_buf));
+            log_info("[MODEL_ROUTING] 503 sent: no Host, model='%s' names no pool on fd=%d",
+                     effective_model, pfe->fd);
+            pfe->lb_err_body_sent = 1;
+            return -1;
+          }
         } else {
           // Strip port from hostname before lookup (e.g., "example.com:9090" → "example.com")
           char host_only[256];
           strip_port_from_hostname(host_str, host_only, sizeof(host_only));
-
-          // Criterion A: Determine effective model name with priority:
-          //   1. X-Model HTTP header (fast path — set during header parsing)
-          //   2. JSON body "model" field (set by extract_llm_prefix during body parsing)
-          //   3. "" (empty string — wildcard, backward compatible)
-          // Criterion C: same effective_model is the value that llb_ai_validate_key
-          // ( CGO bridge) would receive for AllowedModels checking.
-          const char *effective_model = "";
-          if (pfe && pfe->effective_model[0] != '\0') {
-            // Priority 0: the admission gate's body-first resolution. On
-            // enforcing services this is the model authorization was
-            // checked against; routing by anything else re-opens the
-            // authorize-A-serve-B split the gate's conflict rule closes.
-            effective_model = pfe->effective_model;
-          } else if (pfe && pfe->x_model_header[0] != '\0') {
-            effective_model = pfe->x_model_header;       // Priority 1: X-Model header
-          } else if (pfe && pfe->prefix_key.model[0] != '\0') {
-            effective_model = pfe->prefix_key.model;     // Priority 2: JSON body "model"
-          }
 
           // L7 content-routing discriminator + dispatch — the H1
           // seam. Runs AFTER the AI-GW auth/QUOTA gate (handle_on_message_complete,
@@ -972,7 +1007,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           // L7_DISPATCH_FALLTHROUGH, so the model path below runs byte-for-byte
           // unchanged (Pitfall 5). The SAME shared helper is invoked at the
           // H2 seam (sockproxy_h2.c) — parity.
-          if (node && node->has_l7_policy) {
+          if (node && l7_policy_on(node)) {
             proxy_epval_t *l7_tepval = NULL;
             int l7_rc = l7_route_dispatch(pfe, node, &l7_tepval);
             if (l7_rc == L7_DISPATCH_TERMINATED) {
@@ -992,7 +1027,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "\r\n"
                       "{\"error\":\"no_route\","
                       "\"detail\":\"L7 FORWARD resolved no backend pool\"}\r\n";
-                  proxy_send_local_response(pfe, l7_no_pool_resp, strlen(l7_no_pool_resp));
+                  sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "no_route",
+                                        l7_no_pool_resp, strlen(l7_no_pool_resp));
                   pfe->lb_err_body_sent = 1;
                 }
                 return -1;
@@ -1019,7 +1055,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                        "{\"error\":\"model_unavailable\",\"model\":\"%s\","
                        "\"detail\":\"no backend pool for this model\"}\r\n",
                        effective_model);
-              proxy_send_local_response(pfe, response_buf, strlen(response_buf));
+              sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "model_unavailable",
+                                    response_buf, strlen(response_buf));
               log_info("[MODEL_ROUTING] 503 sent for model='%s' on fd=%d",
                        effective_model, pfe->fd);
               pfe->lb_err_body_sent = 1;
@@ -1037,14 +1074,15 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                   "\r\n"
                   "{\"error\":\"no_route\","
                   "\"detail\":\"no routing rule matched the request path\"}\r\n";
-              proxy_send_local_response(pfe, no_route_resp, strlen(no_route_resp));
+              sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "no_route",
+                                  no_route_resp, strlen(no_route_resp));
               log_info("[PROXY_NO_ROUTE] 503 sent: no prefix match for path='%s' on fd=%d",
                        request_path ? request_path : "", pfe->fd);
               pfe->lb_err_body_sent = 1;
               return -1;
             }
             // Non-HTTP path (raw TCP, no pfe): keep backward-compat fallback
-            tepval = node->val.ephash;
+            tepval = sp_pool_first(node);
             if (!tepval) {
               /* Production fix: all rules deleted for this VIP:port but listener
                * kept open.  Return HTTP 503 so callers get a clean error instead
@@ -1057,7 +1095,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                     "\r\n"
                     "{\"error\":\"no_rules\","
                     "\"detail\":\"all routing rules have been removed for this service\"}\r\n";
-                proxy_send_local_response(pfe, no_rule_resp, strlen(no_rule_resp));
+                sp_send_local_refusal(pfe, AI_GW_STAGE_ROUTE, 503, "no_rules",
+                                    no_rule_resp, strlen(no_rule_resp));
                 log_info("[PROXY_NO_RULES] 503 sent on fd=%d (empty ephash)", pfe->fd);
               } else {
                 log_error("Default endpoint (ephash) is NULL!");
@@ -1093,13 +1132,29 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
-        if (tepval->mcp_stateless && pfe) {
+        /* A FORWARD route's members (l7_route_pool): selected here, and none
+         * of the pool's own modes below runs for the request. */
+        int l7_subset = sp_route_subset(pfe, tepval);
+        if (pfe && (tepval->mcp_stateless || l7_subset)) {
           algorithm_selection=sp_mcp_request_select(tepval,pfe);
+          if (algorithm_selection<0 && l7_subset) {
+            static const char subset_down[] =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"no_healthy_backend\","
+                "\"detail\":\"every endpoint of the route is down or circuit-broken\"}\r\n";
+            fc_permit_release(&pfe->fc);
+            pfe->lb_err_body_sent=1;
+            sp_send_local_outage(pfe,503,subset_down,sizeof(subset_down)-1);
+            return -1;
+          }
           if (algorithm_selection<0) {
             static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             fc_permit_release(&pfe->fc);
             pfe->lb_err_body_sent=1;
-            proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
+            sp_send_local_outage(pfe,503,unavailable,sizeof(unavailable)-1);
             return -1;
           }
         }
@@ -1138,6 +1193,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
 #ifdef HAVE_DP_GPU_ROUTING
         // Check selection algorithm
+        if (!l7_subset)
         switch (tepval->select) {
           case PROXY_SEL_CHWBL:
             {              
@@ -1150,7 +1206,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: application/json\r\nConnection: close\r\n\r\n"
                       "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
-                  proxy_send_local_response(pfe, bad_salt, sizeof(bad_salt) - 1);
+                  sp_send_local_refusal(pfe, AI_GW_STAGE_FRAMING, 400, "invalid_cache_salt",
+                                        bad_salt, sizeof(bad_salt) - 1);
                   return -1;
                 }
                 if (policy_rc == 0)
@@ -1219,7 +1276,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: application/json\r\nConnection: close\r\n\r\n"
                       "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
-                  proxy_send_local_response(pfe, bad_salt, sizeof(bad_salt) - 1);
+                  sp_send_local_refusal(pfe, AI_GW_STAGE_FRAMING, 400, "invalid_cache_salt",
+                                        bad_salt, sizeof(bad_salt) - 1);
                   return -1;
                 }
                 if (policy_rc == 0)
@@ -1259,7 +1317,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         }
 #else
         // P3: WRR support (without HAVE_DP_GPU_ROUTING flag)
-        if (tepval->select == PROXY_SEL_WRR) {
+        if (!l7_subset && tepval->select == PROXY_SEL_WRR) {
           if (!tepval->mcp_stateless) algorithm_selection = wrr_select_endpoint(tepval);
           if (algorithm_selection < 0) {
             log_error("P3: WRR selection failed, falling back to round-robin");
@@ -1275,7 +1333,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 #endif /* HAVE_DP_GPU_ROUTING */
 
         /* US-PD804: 3-tier P/D selection (replaces first-healthy stub) */
-        if (tepval->pd_disagg_enabled && tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0) {
+        if (!l7_subset &&
+            tepval->pd_disagg_enabled && tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0) {
           int pd_prefill = -1, pd_decode = -1;
 
           /* KV-T15 /.3: seed the exclusion mask with health/CB state so the
@@ -1300,7 +1359,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
            * falling to any-healthy/normal mode (which would BYPASS the cap). This
            * shed happens BEFORE the active_conns increment below, so a shed never
            * perturbs the load counters. */
-          int pf_rc = pd_select_prefill(tepval, pfe, &pd_prefill, pd_excl);
+          int pf_rc = pd_reserve_prefill(tepval, pfe, &pd_prefill, pd_excl, 1);
           /* bounded backpressured admission. PARKED means the request
            * was already ENQUEUED onto a per-EP FIFO inside pd_select_prefill (it
            * held + stamped park_start_ts there). Do NOT connect, do NOT 429, do NOT
@@ -1310,7 +1369,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           if (pf_rc == PD_PREFILL_PARKED) {
             /* The enqueue + park_start_ts stamp already happened in the selector;
              * mark epv so a later teardown ( max-park reap) can find the EP. */
-            if (pfe && !pfe->epv) pfe->epv = tepval;
+            if (pfe && !pfe->epv) sp_pool_hold(&pfe->epv, tepval);
             return PD_SETUP_PARKED;
           }
           if (pf_rc == PD_PREFILL_NO_CAPACITY) {
@@ -1323,13 +1382,16 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\r\n"
                 "{\"error\":\"pd_overloaded\","
                 "\"detail\":\"all prefill endpoints at in-flight capacity\"}\r\n";
-              proxy_send_local_response(pfe, pd_429_resp, strlen(pd_429_resp));
+              sp_send_local_refusal(pfe, AI_GW_STAGE_CAPACITY, 429, "pd_overloaded",
+                                    pd_429_resp, strlen(pd_429_resp));
               pfe->lb_err_body_sent = 1;
             }
             return -1;
           }
           if (pf_rc != 0 ||
               pd_select_decode(tepval, pfe, &pd_decode) != 0) {
+            if (pf_rc == 0)
+              pd_load_put(tepval, pd_prefill);
             /* RES-02: Fallback to any healthy EP in normal (non-P/D) mode */
             int fallback_ep = -1;
             if (pd_select_any_healthy(tepval, &fallback_ep) == 0) {
@@ -1354,7 +1416,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\","
                 "\"detail\":\"no healthy prefill or decode endpoint\"}\r\n";
-              proxy_send_local_response(pfe, pd_503_resp, strlen(pd_503_resp));
+              sp_send_local_outage(pfe, 503, pd_503_resp, strlen(pd_503_resp));
               pfe->lb_err_body_sent = 1;
               /* A decode hint the Tier-0 lookup may have written is not a
                * unit (none was taken); see the role-gate exit below. */
@@ -1365,23 +1427,44 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
           /* Capacity admission, role level: one prefill unit and one decode
            * unit for this request, each a CAS under its own ceiling, taken
-           * BEFORE the load counters move so a refusal leaves them untouched. */
-          if (pfe &&
-              (sp_fc_h1_gate_role(pfe, tepval, pd_prefill, FC_ROLE_PREFILL, 0) != 0 ||
-               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE, 0) != 0)) {
+           * BEFORE the load counters move so a refusal leaves them untouched.
+           * The legacy count above passes a request the role ceiling may
+           * still hold full (another request holds the unit and is not yet
+           * counted, or the legacy cap is above the ceiling): the request
+           * then waits at the gate, as at every other ceiling. */
+          int fc_pd = pfe ? sp_fc_h1_gate_pd_roles(pfe, tepval, pd_prefill, pd_decode) : 0;
+          if (fc_pd != 0) {
             /* The decode pick pd_select_decode (or the Tier-0 hint before it)
              * wrote into the connection is not held yet: the units are taken
              * below, after the gate. Left in place, pd_cleanup — on this
-             * teardown, on a park reap, or on the next request of a kept
-             * connection — would hand back a decode unit this request never
-             * took, stealing it from the request that holds it. */
+             * teardown, on a park reap, on the next request of a kept
+             * connection, or on the dispatch its wake drives again — would
+             * hand back a decode unit this request never took, stealing it
+             * from the request that holds it. The prefill reservation the
+             * selector took is returned here on every exit: a parked request
+             * selects, and reserves, again when its wake drives it. */
+            pd_load_put(tepval, pd_prefill);
             pfe->pd_decode_ep_idx = -1;
             pfe->pd_prefill_ep_idx = -1;
+            if (fc_pd == SP_FC_H1_QUEUED)
+              return PD_SETUP_PARKED;    /* waits at the gate: the caller suspends the client */
+            if (fc_pd == SP_FC_H1_KEPT) {
+              /* The pool hold a prefill park took goes with this request:
+               * the connection's next request may route to another pool,
+               * and pd_cleanup counts against the pool the hold names. */
+              sp_pool_hold(&pfe->epv, NULL);
+              return PD_SETUP_KEPT;      /* refused, answered, connection kept */
+            }
             return -1;
           }
-          /* INTG-06: Increment active_conns for selected EPs */
-          atomic_fetch_add(&tepval->pd_ep_loads[pd_prefill].active_conns, 1);
-          atomic_fetch_add(&tepval->pd_ep_loads[pd_decode].active_conns, 1);
+          /* P was reserved by the selector, before connection/rewrite work. */
+          if (!pd_load_try_reserve(tepval, pd_decode, 0)) {
+            pd_load_put(tepval, pd_prefill);
+            pfe->pd_decode_ep_idx = -1;
+            return -1;
+          }
+          pd_load_commit(tepval, &pfe->pd_prefill_load_token, pd_prefill);
+          pd_load_commit(tepval, &pfe->pd_decode_load_token, pd_decode);
 
           algorithm_selection = pd_prefill;
           if (pfe) {
@@ -1389,7 +1472,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             pfe->pd_decode_ep_idx = pd_decode;
             /* Bug1-fix: set epv now so pd_cleanup() can decrement active_conns
              * if the prefill TCP connect fails before epv is set at line ~9102 */
-            if (!pfe->epv) pfe->epv = tepval;
+            if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
           }
 
           /* INTG-04: Store session AFTER both EPs known.
@@ -1406,7 +1489,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
 
           log_info("US-PD804: P/D EP selected — prefill=EP%d decode=EP%d", pd_prefill, pd_decode);
-        } else if (tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE && pfe) {
+        } else if (!l7_subset && tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE && pfe) {
           /* single-role Tier-1.5 KV-exact selection — the
            * SIBLING of the P/D block above, structurally parallel and textually
            * independent (at kv_exact_mode == 1 this branch is provably never
@@ -1467,7 +1550,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             /* Bug1-fix idiom (P/D block above): set epv now so pd_cleanup()
              * can decrement even if the backend TCP connect fails before epv
              * is normally set. */
-            if (!pfe->epv) pfe->epv = tepval;
+            if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
             log_debug("[KV_SR] fd=%d single-role Tier-1.5 HIT -> EP%d",
                      pfe->fd, kv_sr_ep);
           }
@@ -1504,7 +1587,7 @@ pd_fallback_normal:
                                              tepval) == 0 &&
                 ns_bound >= 0 && ns_bound < tepval->n_eps &&
                 tepval->eps[ns_bound].inv == 0 &&
-                is_endpoint_healthy(tepval, ns_bound)) {
+                is_endpoint_healthy(tepval, ns_bound) && sp_route_allows(pfe, ns_bound)) {
               nso.learned_ep = ns_bound;
               nso.learned_ok = 1;
             } else {
@@ -1513,7 +1596,7 @@ pd_fallback_normal:
                * below picks a healthy one; the hash re-pins once it heals. */
               int h = (int)(session_key_hash(ns_session_key) %
                             (uint32_t)tepval->n_eps);
-              if (is_endpoint_healthy(tepval, h)) {
+              if (is_endpoint_healthy(tepval, h) && sp_route_allows(pfe, h)) {
                 nso.hash_ep = h;
                 nso.hash_ok = 1;
               }
@@ -1585,7 +1668,7 @@ pd_fallback_normal:
                   "\r\n"
                   "{\"error\":\"no_healthy_backend\","
                   "\"detail\":\"all backend endpoints down or circuit-broken\"}\r\n";
-              proxy_send_local_response(pfe, lb_all_down_503, strlen(lb_all_down_503));
+              sp_send_local_outage(pfe, 503, lb_all_down_503, strlen(lb_all_down_503));
               pfe->lb_err_body_sent = 1;
             }
             return -1;  // No active endpoints available
@@ -1594,6 +1677,10 @@ pd_fallback_normal:
           // Use algorithm-selected endpoint
           sel = algorithm_selection;
         }
+        /* The pool's own selector takes its bounded-load unit; the route's
+         * does not, and the connection gives one back at its teardown. */
+        if (l7_subset && h2_load_units_active(tepval))
+          chwbl_inc_runtime(tepval, sel);
 
         /* Capacity admission, endpoint level: the pick above is a preference,
          * the unit is the decision. A pick over its ceiling moves to another
@@ -1641,11 +1728,15 @@ pd_fallback_normal:
           }
         }
 
-        if (tepval->mcp_stateless && !sp_mcp_reserve_probe(tepval,sel)) {
+        /* The selector only looked at the breaker; the pick takes its
+         * half-open probe here, or is refused. */
+        if ((tepval->mcp_stateless || l7_subset) && !sp_mcp_reserve_probe(tepval,sel)) {
+          if (l7_subset && h2_load_units_active(tepval))
+            chwbl_dec_runtime(tepval, sel);
           static const char unavailable[]="HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
           fc_permit_release(&pfe->fc);
           pfe->lb_err_body_sent=1;
-          proxy_send_local_response(pfe,unavailable,sizeof(unavailable)-1);
+          sp_send_local_outage(pfe,503,unavailable,sizeof(unavailable)-1);
           return -1;
         }
         epip = tepval->eps[sel].xip;
@@ -1747,20 +1838,14 @@ pd_fallback_normal:
            * than returning an error immediately, try every remaining healthy
            * prefill EP while recording TCP failures in the circuit breaker.
            * A 503 is sent only when all prefill EPs are exhausted. */
-          if (tepval->pd_disagg_enabled && pfe) {
+          /* A route's request took no P/D pair (it selects plainly). */
+          if (tepval->pd_disagg_enabled && pfe && pfe->pd_prefill_load_token &&
+              !sp_route_subset(pfe, tepval)) {
             /* Undo active_conns for the original failed EP pair so the
              * counters remain consistent regardless of retry outcome. */
-            int fc_orig_decode = pfe->pd_decode_ep_idx;
-            {
-              uint32_t cur_sel = atomic_load(&tepval->pd_ep_loads[sel].active_conns);
-              if (cur_sel > 0)
-                atomic_fetch_sub(&tepval->pd_ep_loads[sel].active_conns, 1);
-            }
-            if (fc_orig_decode >= 0 && fc_orig_decode < MAX_PROXY_EP) {
-              uint32_t cur_odc = atomic_load(&tepval->pd_ep_loads[fc_orig_decode].active_conns);
-              if (cur_odc > 0)
-                atomic_fetch_sub(&tepval->pd_ep_loads[fc_orig_decode].active_conns, 1);
-            }
+            pd_load_release(tepval, &pfe->pd_prefill_load_token);
+            pd_load_release(tepval, &pfe->pd_decode_load_token);
+            pfe->pd_prefill_ep_idx = pfe->pd_decode_ep_idx = -1;
 
             uint32_t pd_excluded = 1u << (unsigned)sel;  /* exclude original EP */
 
@@ -1769,13 +1854,16 @@ pd_fallback_normal:
               /* Reset decode hint so pd_select_prefill/pd_select_decode pick
                * a fresh pair unconstrained by the now-evicted session. */
               pfe->pd_decode_ep_idx = -1;
-              if (pd_select_prefill(tepval, pfe, &fc_prefill, pd_excluded) != 0)
+              if (pd_reserve_prefill(tepval, pfe, &fc_prefill, pd_excluded, 0) != 0)
                 break;  /* no more healthy prefill candidates */
-              if (pd_select_decode(tepval, pfe, &fc_decode) != 0)
-                break;  /* no decode EP available */
-
-              atomic_fetch_add(&tepval->pd_ep_loads[fc_prefill].active_conns, 1);
-              atomic_fetch_add(&tepval->pd_ep_loads[fc_decode].active_conns, 1);
+              pd_load_commit(tepval, &pfe->pd_prefill_load_token, fc_prefill);
+              if (pd_select_decode(tepval, pfe, &fc_decode) != 0 ||
+                  !pd_load_try_reserve(tepval, fc_decode, 0)) {
+                pd_load_release(tepval, &pfe->pd_prefill_load_token);
+                pfe->pd_decode_ep_idx = -1;
+                break;
+              }
+              pd_load_commit(tepval, &pfe->pd_decode_load_token, fc_decode);
 
               int fc_fd = proxy_setup_ep_connect(
                   tepval->eps[fc_prefill].xip,
@@ -1801,17 +1889,9 @@ pd_fallback_normal:
                 atomic_fetch_add(&global_stats.pd_connect_failover, 1);
                 goto pd_failover_ok;
               }
-              /* This candidate also unreachable — clean up and try next */
-              {
-                uint32_t cur_fcp = atomic_load(&tepval->pd_ep_loads[fc_prefill].active_conns);
-                if (cur_fcp > 0)
-                  atomic_fetch_sub(&tepval->pd_ep_loads[fc_prefill].active_conns, 1);
-              }
-              {
-                uint32_t cur_fcd = atomic_load(&tepval->pd_ep_loads[fc_decode].active_conns);
-                if (cur_fcd > 0)
-                  atomic_fetch_sub(&tepval->pd_ep_loads[fc_decode].active_conns, 1);
-              }
+              /* Release each candidate once before trying another one. */
+              pd_load_release(tepval, &pfe->pd_prefill_load_token);
+              pd_load_release(tepval, &pfe->pd_decode_load_token);
               circuit_breaker_record_failure(tepval, fc_prefill);
               pd_excluded |= 1u << (unsigned)fc_prefill;
             }
@@ -1825,7 +1905,7 @@ pd_fallback_normal:
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\","
                 "\"detail\":\"all prefill endpoints unreachable\"}\r\n";
-              proxy_send_local_response(pfe, pd_503, strlen(pd_503)); }
+              sp_send_local_outage(pfe, 503, pd_503, strlen(pd_503)); }
             /* Clear EP indices so pd_cleanup() skips double-decrement */
             pfe->pd_prefill_ep_idx = -1;
             pfe->pd_decode_ep_idx  = -1;
@@ -1858,8 +1938,7 @@ pd_fallback_normal:
                     (sel + 1 + a) % tepval->n_eps :
                     (tepval->ep_sel + a) % tepval->n_eps;
                 if (c < 0 || c >= 32) continue;
-                if (tepval->mcp_stateless && pfe->mcp_route_active &&
-                    !(pfe->mcp_route_mask & (UINT32_C(1)<<c))) continue;
+                if (!sp_route_allows(pfe, c)) continue;
                 if (nx_excluded & (1u << (unsigned)c)) continue;
                 if (tepval->mcp_stateless ? !sp_mcp_candidate(tepval,c) :
                     !is_endpoint_healthy(tepval,c)) continue;
@@ -1910,7 +1989,7 @@ pd_fallback_normal:
                 atomic_fetch_add(&tepval->pd_ep_loads[nx_sel].active_conns, 1);
                 pfe->kv_sr_load_held = 1;
                 pfe->kv_sr_ep_idx = nx_sel;
-                if (!pfe->epv) pfe->epv = tepval;
+                if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
               }
               ep_sel->ep_cfds[0].ep_cfd = nx_fd;
               sel = nx_sel;
@@ -1999,7 +2078,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         return 0;
       } else if (node->val.proxy_mode == PROXY_MODE_ALL) {
         int ep = 0;
-        tepval = node->val.ephash;
+        tepval = sp_pool_first(node);
         if (tepval == NULL) break;
 
         /* PROXY_MODE_ALL is dedicated to N2 / non-L7 protocols only and is never
@@ -2017,7 +2096,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         // backend (the cookie pin is purely additive — miss->rehash).
         if (tepval->select == PROXY_SEL_STICKY ||
             (tepval->select == PROXY_SEL_RR && tepval->session_header_enabled) ||
-            (node->has_l7_policy && pfe && l7_cookie_persist_active(pfe, node))) {
+            (l7_policy_on(node) && pfe && l7_cookie_persist_active(pfe, node))) {
           /* Sized by the conv key contract, not by hand: an id longer than
            * this is not truncated on the way into conv_map, it is MERGED
            * with whatever else shares its prefix. */
@@ -2036,7 +2115,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
            * arbitrary backend). Nothing is read from / written to proxy_fd_ent
  * state — the cookie value IS the binding, so this works
            * identically on an HA peer that never saw the original request. */
-          if (node->has_l7_policy && pfe &&
+          if (l7_policy_on(node) && pfe &&
               l7_cookie_persist_active(pfe, node)) {
             char presented[LB_COOKIE_TOKEN_MAX];
             if (l7_cookie_read_presented(pfe, presented, sizeof(presented)) == 0) {
@@ -2315,7 +2394,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                   "\r\n"
                   "{\"error\":\"service_unavailable\","
                   "\"detail\":\"all backend endpoints unreachable\"}\r\n";
-              proxy_send_local_response(pfe, err_503, strlen(err_503));
+              sp_send_local_outage(pfe, 503, err_503, strlen(err_503));
             }
             return -1;
           }
@@ -2408,7 +2487,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
               "\r\n"
               "{\"error\":\"service_unavailable\","
               "\"detail\":\"all backend endpoints unreachable\"}\r\n";
-          proxy_send_local_response(pfe, err_503, strlen(err_503));
+          sp_send_local_outage(pfe, 503, err_503, strlen(err_503));
         }
         if (sel) {
           ep_sel->n_eps = sel;
@@ -2487,16 +2566,10 @@ proxy_conversation_cleanup_thread(void *arg)
      * POSIX rwlock recursion is undefined behaviour — so we MUST release
      * PROXY_LOCK() before calling pd_session_evict().
      *
-     * Safety of victim pointer stability across PROXY_UNLOCK() is the
-     * load-bearing property — RESEARCH Pitfall 8 / Assumption A2. All HASH_DEL
-     * of node->val.ephash must be performed under PROXY_LOCK() so that the
-     * cleanup thread is the only writer between gather and the post-unlock
-     * evict loop. Audit grep:
-     *   grep -n "HASH_DEL.*ephash\|free.*proxy_epval_t" loxilb-ebpf/common/sockproxy*.c
-     * The result must show every site is reached only under PROXY_LOCK() by
-     * its caller (today: proxy_delete_entry() in sockproxy_conn.c). When you
-     * add a new ephash mutator, you MUST verify this invariant — otherwise
-     * the two-pass refactor below is UAF-vulnerable. */
+     * The victims are used after PROXY_UNLOCK(): each is gathered with a
+     * reference taken under the lock (sockproxy_pool.h), so a rule deleted
+     * between the gather and the evict keeps its pool until the reference
+     * is given back after the evict. */
     #define PROXY_PD_EVICT_GATHER_N 64
     proxy_epval_t *victims_stack[PROXY_PD_EVICT_GATHER_N];
     proxy_epval_t **victims = victims_stack;
@@ -2600,6 +2673,7 @@ proxy_conversation_cleanup_thread(void *arg)
                 victims = heap;
               }
             }
+            sp_pool_get(tepval);
             victims[n_v++] = tepval;
           }
           skip_pd_gather:
@@ -2622,10 +2696,10 @@ proxy_conversation_cleanup_thread(void *arg)
     /* Pri-1 fully released — pd_session_evict() can safely re-acquire Pri-1
      * rdlock via pd_session_resolve_service_key(). Pri-1 alone is never a
      * hierarchy violation per sockproxy_internal.h:89-100. The gathered
-     * tepval pointers remain stable because all ephash mutators take
-     * PROXY_LOCK() (RESEARCH Assumption A2 / Pitfall 8). */
+     * pools are held by the references taken at the gather. */
     for (size_t i = 0; i < n_v; i++) {
       pd_session_evict(victims[i]);
+      sp_pool_put(victims[i]);
     }
     if (victims != victims_stack) free(victims);
     #undef PROXY_PD_EVICT_GATHER_N
